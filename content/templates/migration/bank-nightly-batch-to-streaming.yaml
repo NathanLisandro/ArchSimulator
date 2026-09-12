@@ -1,0 +1,354 @@
+id: bank-migration-nightly-batch
+type: MIGRATION
+company: banco-digital
+levels: [SENIOR, STAFF]
+competencies: [legacy, eda, databases, system-design, communication]
+tools: [SQL, METRICS]
+parameters:
+  batchHours: { range: [4, 9], step: 1 }
+  windowHours: { range: [3, 4], step: 1 }
+  linesPerNight: { range: [8000000, 42000000], step: 1000000 }
+  teamSize: { range: [4, 8], step: 1 }
+  pressure:
+    group:
+      - { pressure: "a janela estourou três vezes no último mês e a agenda de recebíveis atrasou, com lojistas reclamando de antecipação indisponível pela manhã", deadline: "o comitê quer previsibilidade antes do fechamento do trimestre" }
+      - { pressure: "a auditoria apontou que uma divergência de conciliação ficou 38 horas sem detecção porque o batch falhou em silêncio", deadline: "o plano de ação com o regulador vence em 90 dias" }
+      - { pressure: "o volume vai dobrar com a entrada do banco como subadquirente, e o batch já ocupa {{batchHours}}h de uma janela de {{windowHours}}h", deadline: "a migração do produto novo está contratada para daqui a 2 trimestres" }
+derived:
+  overrunHours: "max(batchHours - windowHours, 1)"
+  linesPerSecondIfStreamed: "round(linesPerNight / 86400)"
+narrative:
+  title: "Migração: conciliação D+1 de batch noturno para processamento contínuo"
+  symptom: |
+    A conciliação com a CIP roda como **batch noturno em uma stored procedure de 2.400 linhas** (PL/pgSQL), disparada
+    às 01:00 com janela até as 0{{windowHours}}:00. Hoje ela leva **{{batchHours}} horas** processando
+    ~{{linesPerNight|number}} linhas por noite — {{overrunHours}}h além da janela.
+
+    {{pressure}} — e {{deadline}}.
+
+    Desenhe a **estratégia de migração**: como sair daqui, em que ordem, com qual plano de rollout e como provar que o
+    resultado novo é igual ao antigo.
+  businessContext: |
+    A conciliação é obrigação regulatória: cruza o arquivo da CIP com `ledger_entries` (2,1 bi de linhas) e grava em
+    `reconciliation_items` (480 milhões). Divergência não resolvida em D+1 vira apontamento de auditoria. A squad tem
+    {{teamSize}} pessoas e mantém o batch atual em produção enquanto migra. Ninguém no time atual escreveu a procedure
+    original; existe documentação parcial e 140 testes de regressão que cobrem o resultado final, não as etapas.
+  hints:
+    - "Migração de legado crítico raramente é 'reescrever e trocar'."
+    - "Como você prova que o novo dá o mesmo resultado que o velho?"
+    - "Se distribuído ao longo do dia, são só {{linesPerSecondIfStreamed}} linhas por segundo."
+artifacts:
+  - id: legacy-procedure
+    title: "Trecho da procedure atual (sp_reconcile_daily)"
+    kind: SQL
+    language: sql
+    content: |
+      CREATE OR REPLACE PROCEDURE sp_reconcile_daily(p_batch_date date)
+      LANGUAGE plpgsql AS $$
+      DECLARE
+          r_item   RECORD;
+          v_ledger bigint;
+          v_count  bigint := 0;
+      BEGIN
+          -- carrega o arquivo da CIP inteiro em memoria de trabalho
+          FOR r_item IN
+              SELECT * FROM cip_staging WHERE batch_date = p_batch_date ORDER BY cip_file_line
+          LOOP
+              -- uma consulta por linha do arquivo (sem indice util em reference_id ate 2024)
+              SELECT id INTO v_ledger
+                FROM ledger_entries
+               WHERE reference_id = r_item.reference_id
+                 AND created_at >= p_batch_date - INTERVAL '5 days';
+
+              IF v_ledger IS NULL THEN
+                  INSERT INTO reconciliation_items (batch_id, cip_file_line, reference_id, amount_cents, status)
+                  VALUES (r_item.batch_id, r_item.cip_file_line, r_item.reference_id, r_item.amount_cents, 'UNMATCHED');
+              ELSE
+                  UPDATE reconciliation_items
+                     SET matched_ledger_id = v_ledger, status = 'MATCHED', processed_at = now()
+                   WHERE reference_id = r_item.reference_id;
+              END IF;
+
+              v_count := v_count + 1;
+              -- commit a cada 100 mil linhas: transacao gigante entre os commits
+              IF v_count % 100000 = 0 THEN
+                  COMMIT;
+              END IF;
+          END LOOP;
+
+          -- recalcula a agenda de recebiveis do dia inteiro, do zero
+          DELETE FROM receivables_schedule WHERE settlement_date = p_batch_date + 1;
+          INSERT INTO receivables_schedule (merchant_account_id, settlement_date, arrangement, gross_cents, net_cents, status)
+          SELECT merchant_account_id, p_batch_date + 1, arrangement, SUM(gross_cents), SUM(net_cents), 'SCHEDULED'
+            FROM ledger_entries l
+            JOIN merchants m ON m.account_id = l.account_id
+           WHERE l.created_at::date = p_batch_date
+           GROUP BY merchant_account_id, arrangement;
+
+          COMMIT;
+      END;
+      $$;
+checkpoints:
+  - id: strategy
+    question: "Qual estratégia de migração para um legado crítico e mal documentado?"
+    options:
+      - id: strangler
+        label: "Strangler fig: o novo caminho absorve fatias do escopo, com o antigo rodando em paralelo"
+        verdict: GOOD
+        feedback: "Certo. Com {{teamSize}} pessoas, procedure de 2.400 linhas que ninguém escreveu e obrigação regulatória diária, fatiar é a única forma de aprender o comportamento real sem apostar tudo em um corte."
+      - id: big-bang
+        label: "Reescrever inteiro e trocar em uma janela"
+        verdict: BAD
+        feedback: "Big bang em legado crítico mal documentado é como se perde a conciliação de um dia — que é apontamento de auditoria. Sem paralelo, você descobre as regras não documentadas em produção, à noite."
+      - id: lift-and-shift
+        label: "Mover a procedure para uma instância maior e otimizar depois"
+        verdict: RISKY
+        feedback: "Compra semanas e pode fazer sentido como contenção imediata. Mas com o volume dobrando não resolve, e o custo de manter a procedure cresce: trate como medida ponte, não como estratégia."
+  - id: parity
+    question: "Como provar que o processamento novo produz o mesmo resultado do antigo?"
+    options:
+      - id: shadow-compare
+        label: "Rodar os dois em paralelo (shadow) sobre os mesmos dados e comparar os resultados diariamente"
+        verdict: GOOD
+        feedback: "Exato: o antigo continua sendo a verdade enquanto o novo roda em sombra. A comparação diária vira o teste de regressão que a documentação não dá — e as divergências revelam as regras não escritas."
+      - id: unit-tests
+        label: "Escrever testes unitários do novo componente"
+        verdict: RISKY
+        feedback: "Necessário, mas insuficiente: os testes verificam o que você entendeu da regra, e o problema é justamente o que ninguém entendeu. Só a comparação com o comportamento real do legado fecha essa lacuna."
+      - id: sampling
+        label: "Conferir uma amostra manualmente no primeiro dia"
+        verdict: BAD
+        feedback: "Amostra manual não pega caso de borda em {{linesPerNight|number}} linhas. E é justamente na borda (estorno, valor divergente, linha duplicada no arquivo) que a procedure tem regra implícita."
+  - id: cutover
+    question: "O shadow roda há 6 semanas com divergência abaixo de 0,001%. Como faz o corte?"
+    options:
+      - id: gradual-flag
+        label: "Feature flag por fatia (arranjo, adquirente, faixa de lojista), aumentando aos poucos, com rollback pronto"
+        verdict: GOOD
+        feedback: "Sim: corte gradual limita o raio de explosão e mantém o antigo pronto para reassumir. Cada fatia que estabiliza por alguns dias vira confiança medida, não confiança declarada."
+      - id: switch-all
+        label: "Trocar 100% de uma vez, já que a divergência é mínima"
+        verdict: RISKY
+        feedback: "0,001% de {{linesPerNight|number}} linhas ainda são centenas de itens por noite. Corte gradual custa pouco e evita descobrir a diferença toda no mesmo dia."
+      - id: keep-both
+        label: "Manter os dois para sempre, comparando todo dia"
+        verdict: BAD
+        feedback: "Manter dois caminhos indefinidamente dobra o custo de manutenção e cria a dúvida permanente de qual é a verdade. Defina a data de desligamento do antigo como parte do plano."
+solutionPaths:
+  - id: strangler-streaming
+    name: "Strangler para processamento contínuo por eventos"
+    summary: "Consumir os lançamentos ao longo do dia (CDC/outbox), conciliar continuamente e reduzir o batch a uma verificação de fechamento, cortando por fatias com flag e shadow."
+    pros: ["Distribui {{linesPerSecondIfStreamed}} linhas/s ao longo do dia em vez de concentrar na janela", "Detecta divergência em minutos, não em D+1", "Elimina a janela como restrição"]
+    cons: ["Arquivo da CIP continua chegando uma vez por dia: parte do fechamento segue em lote", "Mais peças para operar", "Migração longa, com dois caminhos convivendo por meses"]
+    bestWhen: "a janela é a restrição e o volume vai crescer — o caso aqui"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia incremental"
+          weight: 20
+          evidence:
+            - { type: choice, field: strategy, anyOf: [STRANGLER] }
+            - { type: keyword, field: plan, anyOf: ["fatia", "incremental", "por partes", "strangler", "aos poucos"], min: 1 }
+          missing: "Declare a estratégia incremental (strangler) e como o escopo é fatiado."
+          present: "Estratégia incremental declarada."
+        - id: parity
+          name: "Prova de paridade"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["shadow", "paralelo", "sombra", "compara", "dual-run", "dual run"], min: 1 }
+            - { type: keyword, field: plan, anyOf: ["divergência", "divergencia", "diferença", "diferenca", "relatório", "relatorio", "métrica", "metrica"], min: 1 }
+          missing: "Descreva a execução em paralelo e como as divergências são medidas e tratadas diariamente."
+          present: "Paridade provada por execução em sombra."
+        - id: rollout
+          name: "Rollout com rollback"
+          weight: 20
+          evidence:
+            - { type: choice, field: rolloutStrategy, anyOf: [FEATURE_FLAG] }
+            - { type: keyword, field: plan, anyOf: ["rollback", "voltar", "desligar", "reverter"], min: 1 }
+          missing: "Corte por feature flag, fatia a fatia, com rollback explícito para o caminho antigo."
+          present: "Rollout gradual com rollback."
+        - id: boundary
+          name: "Fronteira do que continua em lote"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["arquivo", "cip", "fechamento", "lote", "batch de fechamento", "d+1"], min: 1 }
+          missing: "O arquivo da CIP chega uma vez por dia: explicite o que passa a ser contínuo e o que continua em lote no fechamento."
+          present: "Fronteira entre contínuo e lote definida."
+        - id: retirement
+          name: "Desligamento do legado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["desligar", "remover", "aposentar", "data", "prazo", "sunset"], min: 1 }
+          missing: "Migração sem data de desligamento do antigo vira dois sistemas para sempre: defina o critério e a data."
+          present: "Desligamento planejado."
+  - id: rewrite-chunked-job
+    name: "Reescrever o job com processamento em lotes curtos"
+    summary: "Manter o modelo de batch, mas reescrever a procedure como job paralelo em lotes curtos, com checkpoint e idempotência, dentro da janela."
+    pros: ["Mudança menor, mais rápida de entregar", "Não altera o modelo mental do time", "Resolve a janela no curto prazo"]
+    cons: ["Continua concentrando a carga na janela", "Não melhora o tempo de detecção de divergência", "Volume dobrando volta a apertar"]
+    bestWhen: "o prazo é curto, o time é pequeno e o volume não vai crescer tanto quanto o previsto"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [REWRITE] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: chunking
+          name: "Lotes, paralelismo e checkpoint"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["chunk", "lote", "checkpoint", "paralel", "partição", "particao"], min: 2 }
+          missing: "Descreva o tamanho do lote, o paralelismo e o checkpoint que permite reiniciar do ponto certo."
+          present: "Lotes, paralelismo e checkpoint descritos."
+        - id: set-based
+          name: "Fim do laço linha a linha"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["conjunto", "set-based", "join", "em massa", "bulk", "sem cursor", "laço", "laco"], min: 1 }
+          missing: "O laço com uma consulta por linha é o custo central: proponha processamento por conjunto (join em lote) no lugar do cursor."
+          present: "Processamento por conjunto proposto."
+        - id: parity
+          name: "Prova de paridade"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["shadow", "paralelo", "compara", "regressão", "regressao"], min: 1 }
+          missing: "Mesmo reescrevendo no mesmo modelo, prove a paridade com execução comparada antes do corte."
+          present: "Paridade provada."
+        - id: horizon
+          name: "Horizonte assumido"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["volume", "dobrar", "próximo", "proximo", "limite", "quando"], min: 1 }
+          missing: "Com o volume dobrando, diga por quanto tempo essa solução resolve e o que vem depois."
+          present: "Horizonte assumido."
+  - id: offload-and-optimize
+    name: "Tirar o batch do primário e otimizar antes de migrar"
+    summary: "Mover a conciliação para instância dedicada/réplica, corrigir os índices e o padrão de acesso, e só depois decidir o destino final."
+    pros: ["Alívio rápido sem reescrever regra", "Elimina o impacto no online (dívida conhecida)", "Compra tempo para desenhar o destino com calma"]
+    cons: ["Não reduz o tempo total de processamento por si só", "Adia a decisão estrutural", "Custo de mais uma instância"]
+    bestWhen: "o problema imediato é o impacto no online e falta clareza sobre o destino final"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [OFFLOAD] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: isolation
+          name: "Isolamento do primário"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["réplica", "replica", "instância dedicada", "instancia dedicada", "isolar", "primário", "primario"], min: 1 }
+          missing: "Descreva como a conciliação sai do primário e como as escritas voltam (fila, outbox, janela curta)."
+          present: "Isolamento descrito."
+        - id: access-pattern
+          name: "Padrão de acesso corrigido"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["índice", "indice", "reference_id", "join", "em massa", "cursor"], min: 1 }
+          missing: "O laço consulta `ledger_entries` por `reference_id` linha a linha: trate índice e padrão de acesso."
+          present: "Padrão de acesso corrigido."
+        - id: next-step
+          name: "Decisão do destino"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["depois", "destino", "decisão", "decisao", "avaliar", "prazo", "critério", "criterio"], min: 1 }
+          missing: "Comprar tempo só vale com data para decidir o destino: defina o critério e o prazo."
+          present: "Decisão do destino agendada."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: strategy
+      label: "Estratégia de migração"
+      type: SELECT
+      required: true
+      options:
+        - { value: STRANGLER, label: "Strangler fig (fatias com o legado em paralelo)" }
+        - { value: REWRITE, label: "Reescrita do job no mesmo modelo" }
+        - { value: OFFLOAD, label: "Isolar e otimizar antes de decidir" }
+        - { value: BIG_BANG, label: "Reescrever e trocar de uma vez" }
+    - id: rolloutStrategy
+      label: "Estratégia de rollout"
+      type: SELECT
+      required: true
+      options:
+        - { value: FEATURE_FLAG, label: "Feature flag por fatia, com rollback" }
+        - { value: DUAL_WRITE, label: "Escrita dupla nos dois caminhos" }
+        - { value: WINDOW_CUTOVER, label: "Corte em janela de manutenção" }
+    - id: solutionPath
+      label: "Destino"
+      type: SELECT
+      required: true
+      options:
+        - { value: strangler-streaming, label: "Processamento contínuo por eventos" }
+        - { value: rewrite-chunked-job, label: "Job em lotes curtos" }
+        - { value: offload-and-optimize, label: "Isolar e otimizar" }
+    - id: plan
+      label: "Plano de migração"
+      type: MARKDOWN
+      required: true
+      help: "Fatias, prova de paridade, rollout, rollback, fronteira do que segue em lote e desligamento do legado."
+reference: |
+  ## Diagnóstico do legado
+  A procedure tem três problemas somados:
+  1. **Laço linha a linha** com uma consulta a `ledger_entries` por linha do arquivo — {{linesPerNight|number}} consultas por noite.
+  2. **Transações gigantes** entre commits de 100 mil linhas, segurando locks por minutos (é a origem dos incidentes de escrita travada).
+  3. **Recálculo completo** da agenda do dia: `DELETE` + `INSERT ... SELECT` sobre toda a janela, mesmo quando 99% não mudou.
+
+  Distribuído ao longo do dia, o volume é de apenas **{{linesPerSecondIfStreamed}} linhas por segundo** — a carga não é o
+  problema; a concentração na janela é.
+
+  ## Estratégia: strangler em quatro fatias
+  O legado continua rodando e sendo a verdade até cada fatia estabilizar.
+
+  **Fatia 1 — Agenda de recebíveis (4 semanas).** O recálculo completo vira atualização incremental por evento
+  (`LedgerEntryCreated` via outbox/CDC). É a fatia com maior impacto de negócio e menor risco regulatório: a conciliação
+  não muda. Sai do caminho crítico da janela o passo mais caro.
+
+  **Fatia 2 — Casamento contínuo (6 semanas).** O que dá para casar durante o dia (lançamentos internos com referência
+  conhecida) passa a ser conciliado continuamente. O batch da madrugada passa a tratar só o que sobrou.
+
+  **Fatia 3 — Fechamento com o arquivo da CIP (6 semanas).** O arquivo chega uma vez por dia e **continua em lote** —
+  essa é a fronteira honesta: processamento contínuo não elimina o fechamento, reduz o escopo dele. Reescrito com
+  processamento por conjunto (`JOIN` em lote sobre `cip_staging`), lotes de 5.000 linhas e checkpoint por lote.
+
+  **Fatia 4 — Desligamento (2 semanas).** Procedure removida, com o código arquivado e a documentação do comportamento
+  extraída das divergências observadas.
+
+  ## Prova de paridade (obrigatória em todas as fatias)
+  Execução em **sombra**: o caminho novo roda sobre os mesmos dados, grava em tabelas espelho e um job compara os
+  resultados todo dia, publicando: total de itens, itens só no antigo, só no novo, e diferença de valor. Critério de
+  promoção: **14 dias consecutivos com divergência zero em valor** e apenas divergências explicadas em quantidade.
+  Cada divergência vira teste de regressão — é assim que a regra não documentada vira documentação.
+
+  ## Rollout e rollback
+  Feature flag por **arranjo de pagamento** e por **faixa de lojista**: 1% → 10% → 50% → 100%, com pelo menos 5 dias em
+  cada degrau. Rollback é desligar a flag: o caminho antigo nunca foi removido e continua processando tudo em sombra até
+  o degrau de 100% completar 30 dias.
+
+  ## Contenção imediata (primeira semana, em paralelo)
+  - `idle_in_transaction_session_timeout` e `lock_timeout` no role do batch, para que estourar a janela não trave mais o online.
+  - Commit por lote de 5.000 em vez de 100.000 — mudança de uma linha, elimina a transação gigante.
+  - Alarme de "janela estourada" às 0{{windowHours}}:30, em vez de descobrir pela reclamação do lojista.
+
+  ## O que muda para o negócio
+  Detecção de divergência cai de D+1 para minutos. A agenda de recebíveis fica disponível ao longo do dia, não só de
+  manhã. O risco regulatório diminui porque a conciliação deixa de depender de uma janela única — mas o fechamento
+  diário com a CIP **continua existindo**, e é ele que permanece como evidência para a auditoria.
+
+  ## Riscos assumidos
+  - Dois caminhos convivendo por ~4 meses: custo de manutenção dobrado nesse período, com data de fim definida.
+  - CDC/outbox no `core-db` adiciona carga de escrita (~3% medidos em homologação).
+  - Time de {{teamSize}} pessoas mantendo o legado enquanto migra: as fatias foram dimensionadas para uma pessoa por vez,
+    não para o time inteiro.
+scenario:
+  kind: none
+recommendation:
+  default: strangler-streaming
+  rules:
+    - { param: batchHours, op: "<=", value: 5, path: rewrite-chunked-job, reason: "com {{batchHours}}h de execução o estouro da janela ainda é pequeno; reescrever o job em lotes curtos resolve o prazo imediato sem colocar quatro meses de migração no caminho de uma squad de {{teamSize}} pessoas" }

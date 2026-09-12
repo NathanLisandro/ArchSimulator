@@ -1,0 +1,156 @@
+.md {
+  font-size: var(--step-0);
+  line-height: 1.62;
+  color: var(--graphite);
+}
+
+.md > *:first-child {
+  margin-top: 0;
+}
+
+.md__p {
+  margin: 0 0 0.85em;
+  max-width: 68ch;
+}
+
+.md__h {
+  margin: 1.5em 0 0.5em;
+  line-height: 1.22;
+}
+
+.md__h--1 {
+  font-size: var(--step-2);
+}
+
+.md__h--2 {
+  font-size: var(--step-1);
+}
+
+.md__h--3,
+.md__h--4,
+.md__h--5,
+.md__h--6 {
+  font-size: var(--step-0);
+  color: var(--graphite-soft);
+}
+
+.md__list {
+  margin: 0 0 0.9em;
+  padding-left: 1.25rem;
+  max-width: 68ch;
+}
+
+.md__list li {
+  margin-bottom: 0.28em;
+}
+
+.md__quote {
+  margin: 0 0 0.9em;
+  padding: 0.4rem 0 0.4rem 0.9rem;
+  border-left: 2px solid var(--signal);
+  color: var(--graphite-soft);
+}
+
+.md__quote p:last-child {
+  margin-bottom: 0;
+}
+
+.md__rule {
+  border: none;
+  border-top: 1px solid var(--paper-line);
+  margin: 1.6em 0;
+}
+
+.md__code {
+  margin: 0 0 1em;
+  padding: 0.7rem 0.85rem;
+  background: var(--ink-800);
+  color: var(--ink-text);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  font-size: var(--step--2);
+  line-height: 1.5;
+}
+
+.md__code code {
+  font-size: inherit;
+}
+
+.md__inline-code {
+  padding: 0.08em 0.3em;
+  background: var(--paper-sunken);
+  border-radius: 2px;
+  font-size: 0.88em;
+}
+
+.md__table-wrap {
+  overflow-x: auto;
+  margin: 0 0 1em;
+}
+
+.md__table {
+  border-collapse: collapse;
+  font-size: var(--step--1);
+  min-width: 100%;
+}
+
+.md__table th {
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 1.5px solid var(--graphite-faint);
+  padding: 0.35rem 0.7rem 0.35rem 0;
+  white-space: nowrap;
+}
+
+.md__table td {
+  border-bottom: 1px solid var(--paper-line);
+  padding: 0.35rem 0.7rem 0.35rem 0;
+  vertical-align: top;
+}
+
+/* dentro do console escuro o markdown inverte */
+.md--ink {
+  color: var(--ink-text);
+}
+
+.md--ink .md__inline-code {
+  background: rgba(215, 227, 236, 0.12);
+}
+
+.md--ink .md__code {
+  background: var(--ink-900);
+  border: 1px solid var(--ink-line);
+}
+
+.md--ink .md__h {
+  color: var(--ink-text);
+}
+
+.md--ink .md__table th {
+  border-color: var(--ink-faint);
+}
+
+.md--ink .md__table td {
+  border-color: var(--ink-line);
+}
+
+.mermaid-figure {
+  margin: 0 0 1em;
+  padding: 0.9rem;
+  background: var(--paper-raised);
+  border: 1px solid var(--paper-line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+.mermaid-figure__canvas svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.mermaid-figure__error {
+  margin-top: 0.5rem;
+  font-family: var(--font-data);
+  font-size: var(--step--2);
+  color: #97241f;
+}

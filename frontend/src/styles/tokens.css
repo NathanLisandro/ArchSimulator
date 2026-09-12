@@ -1,0 +1,82 @@
+/*
+ * ArchSim tem dois registros visuais, e a diferença entre eles carrega informação:
+ *
+ *   CONSOLE (ink)  — o que a máquina diz: logs, métricas, traces, SQL, infraestrutura.
+ *                    Fundo profundo, densidade alta, tipografia monoespaçada.
+ *   PAPEL (paper)  — o que a pessoa lê e escreve: briefing, checkpoints, ADR, post-mortem.
+ *                    Fundo claro, medida de leitura confortável, tipografia proporcional.
+ *
+ * Regra tipográfica: se está em monoespaçado, foi a máquina que escreveu.
+ * Regra cromática: âmbar e vermelho são severidade, nunca decoração.
+ */
+
+:root {
+  /* ---- console (ink) */
+  --ink-900: #0b131b;
+  --ink-800: #101a24;
+  --ink-700: #16232f;
+  --ink-600: #1d2e3d;
+  --ink-500: #27404f;
+  --ink-line: #24394a;
+  --ink-text: #d7e3ec;
+  --ink-dim: #8ba3b6;
+  --ink-faint: #5d7385;
+
+  /* ---- papel */
+  --paper: #f1f4f3;
+  --paper-raised: #ffffff;
+  --paper-sunken: #e6eae9;
+  --paper-line: #d2d9d8;
+  --graphite: #172028;
+  --graphite-soft: #46545f;
+  --graphite-faint: #7b8891;
+
+  /* ---- sinal: só aparece quando significa alguma coisa */
+  --signal: #1f9e95;
+  --signal-deep: #147a73;
+  --signal-wash: #dff0ee;
+  --warn: #d9912a;
+  --warn-wash: #fbeed6;
+  --crit: #c8403a;
+  --crit-wash: #f8e0de;
+  --ok: #3f8f5c;
+
+  /* ---- tipografia */
+  --font-ui: 'Archivo', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-data: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --step--2: 0.6875rem;
+  --step--1: 0.8125rem;
+  --step-0: 0.9375rem;
+  --step-1: 1.125rem;
+  --step-2: 1.4375rem;
+  --step-3: 1.875rem;
+  --step-4: 2.5rem;
+  --step-5: 3.25rem;
+
+  /* ---- espaço e forma */
+  --gap-1: 0.25rem;
+  --gap-2: 0.5rem;
+  --gap-3: 0.75rem;
+  --gap-4: 1rem;
+  --gap-5: 1.5rem;
+  --gap-6: 2rem;
+  --gap-7: 3rem;
+
+  --radius: 3px;
+  --radius-lg: 5px;
+  --bar-height: 52px;
+
+  --shadow-raised: 0 1px 2px rgba(23, 32, 40, 0.08), 0 8px 24px -16px rgba(23, 32, 40, 0.3);
+  --shadow-ink: 0 12px 32px -18px rgba(0, 0, 0, 0.8);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

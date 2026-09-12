@@ -1,0 +1,5 @@
+package dev.archsim.domain.user;
+
+public record UserId(String value) {
+    public UserId { if (value == null || value.isBlank()) throw new IllegalArgumentException("UserId required"); }
+}

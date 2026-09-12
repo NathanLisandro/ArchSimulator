@@ -1,0 +1,124 @@
+id: cloud-devops
+name: Cloud, DevOps e liderança técnica
+description: AWS, Kubernetes, IaC, custo, segurança e comunicação de decisões.
+cards:
+  - id: az-vs-region
+    front: "Qual a diferença entre **AZ** e **região**, e o que isso muda no desenho?"
+    back: |
+      AZ é um datacenter isolado dentro da região, com latência de poucos milissegundos entre AZs. Multi-AZ protege de
+      falha de datacenter e é barato em latência; multi-região protege de falha regional e custa latência alta e
+      consistência difícil. A maioria dos sistemas precisa de multi-AZ, não de multi-região.
+    competencies: [cloud]
+  - id: rds-failover
+    front: "O que acontece em um failover Multi-AZ do RDS?"
+    back: |
+      A instância standby assume e o DNS é repontado: 60 a 120 segundos de indisponibilidade, com **todas as conexões
+      derrubadas**. Por isso a aplicação precisa de pool que reconecta, retry idempotente e a janela precisa ser
+      combinada — não é uma operação transparente.
+    competencies: [cloud, databases]
+  - id: spot
+    front: "Quando usar instâncias **spot**?"
+    back: |
+      Em carga tolerante a interrupção com aviso de 2 minutos: processamento em lote, workers de fila com checkpoint,
+      ambientes de teste. Nunca para estado que não pode migrar, nem para a única réplica de um serviço crítico.
+      Economia típica de 60–90% em troca de disciplina de arquitetura.
+    competencies: [cloud]
+  - id: serverless-tradeoff
+    front: "Qual o principal trade-off de **serverless**?"
+    back: |
+      Escala e custo por uso em troca de cold start, limites de execução e acoplamento ao fornecedor. E, em carga
+      constante e alta, sai **mais caro** que container: serverless brilha em tráfego irregular ou baixo, não em
+      throughput estável.
+    competencies: [cloud]
+  - id: cost-drivers
+    front: "Quais são os custos que mais surpreendem em AWS?"
+    back: |
+      Transferência de dados (entre AZs, saída para a internet, NAT gateway), armazenamento que ninguém apaga,
+      instâncias ociosas em ambientes de teste e IOPS provisionado acima do necessário. Computação costuma ser o que
+      todo mundo olha e raramente é a maior surpresa.
+    competencies: [cloud, capacity]
+  - id: cdn-edge
+    front: "O que faz sentido colocar na **borda** (CDN)?"
+    back: |
+      Conteúdo estático, imagens, respostas cacheáveis por rota e regras de segurança (WAF, antibot, rate limit por IP).
+      Ganho duplo: latência para o usuário e carga que nem chega à origem. Quanto maior o cache hit ratio na borda,
+      menor a sua conta de computação.
+    competencies: [edge, cloud]
+  - id: k8s-requests-limits
+    front: "Qual a diferença entre `requests` e `limits` no Kubernetes?"
+    back: |
+      `requests` é o que o escalonador reserva (define onde o pod cabe); `limits` é o teto. CPU acima do limite gera
+      **throttling**; memória acima gera **OOMKill**. Erro comum: limite de memória apertado que mata o pod no primeiro
+      pico de GC, criando incidente que parece memory leak.
+    competencies: [kubernetes]
+  - id: k8s-hpa
+    front: "Por que autoscaling por CPU pode não funcionar?"
+    back: |
+      Porque o gargalo pode não ser CPU: um serviço esperando banco ou dependência fica com CPU baixa e latência alta, e
+      o HPA não escala. Escale por métrica que reflita a dor (requisições em fila, latência, lag do consumidor) — e
+      lembre que escalar quem satura o banco piora o incidente.
+    competencies: [kubernetes, sre]
+  - id: iac-drift
+    front: "O que é **drift** em infraestrutura como código?"
+    back: |
+      Diferença entre o estado declarado e o real, criada por mudança manual no console. O próximo `apply` desfaz a
+      correção de madrugada ou falha de forma confusa. Defesas: acesso de escrita restrito, detecção de drift no
+      pipeline e a regra cultural de que emergência vira código no dia seguinte.
+    competencies: [iac]
+  - id: blue-green-canary
+    front: "Blue-green ou canário?"
+    back: |
+      **Blue-green:** dois ambientes completos, troca instantânea, rollback imediato, custo de manter dois. Bom quando a
+      mudança é arriscada e o estado é compatível.
+      **Canário:** fração do tráfego na versão nova, com métricas comparadas. Detecta problema com raio menor, mas exige
+      observabilidade boa e convivência das duas versões (contrato e schema compatíveis).
+    competencies: [sre, iac]
+  - id: expand-contract
+    front: "Como mudar o schema sem downtime?"
+    back: |
+      **Expand/contract:** primeiro adiciona (coluna nova opcional, escrita dupla), depois migra os leitores, depois
+      remove o antigo — cada passo compatível com a versão anterior em produção. Migração que renomeia coluna em um
+      único deploy só funciona se você aceitar janela de indisponibilidade.
+    competencies: [legacy, databases]
+  - id: strangler
+    front: "Quando usar o padrão **strangler fig**?"
+    back: |
+      Em legado crítico e mal documentado: o novo caminho absorve fatias do escopo com o antigo rodando em paralelo, e
+      cada fatia só é promovida quando prova paridade. É mais lento que reescrever, e é o que evita descobrir regra não
+      documentada em produção, de madrugada, sem quem escreveu.
+    competencies: [legacy]
+  - id: shadow-run
+    front: "O que é execução em **sombra** e por que ela vale mais que testes na migração?"
+    back: |
+      O caminho novo processa os mesmos dados em paralelo, grava em tabelas espelho e um job compara os resultados todo
+      dia. Testes verificam o que você entendeu da regra; a sombra verifica o comportamento real do legado — inclusive o
+      que ninguém documentou. Cada divergência vira teste de regressão.
+    competencies: [legacy]
+  - id: secrets
+    front: "Onde **não** guardar segredo?"
+    back: |
+      Em repositório, em variável de ambiente de imagem pública, em log, em ConfigMap e em ticket. Use cofre (Secrets
+      Manager, Vault) com rotação e acesso por identidade da carga de trabalho, não por credencial estática compartilhada.
+      Segredo vazado em log é o incidente de segurança mais comum e mais banal.
+    competencies: [security]
+  - id: least-privilege
+    front: "O que **menor privilégio** significa na prática em nuvem?"
+    back: |
+      Papel por carga de trabalho, com permissão para os recursos específicos que ela usa, e nada além — inclusive no
+      banco (role por serviço com limite de conexões). O teste: se o serviço for comprometido, o que o atacante alcança?
+      Se a resposta é "tudo", não há menor privilégio.
+    competencies: [security, cloud]
+  - id: design-doc-audience
+    front: "Para quem se escreve um **design doc**?"
+    back: |
+      Para quem vai revisar a decisão agora e para quem vai manter o sistema em dois anos. Isso muda o conteúdo:
+      restrições e alternativas descartadas importam mais que detalhe de implementação, que o código conta melhor.
+      Se o documento só faz sentido para quem já participou das conversas, ele ainda não está pronto.
+    competencies: [system-design, communication]
+  - id: status-update
+    front: "O que um **status update** de incidente precisa dizer?"
+    back: |
+      Impacto (quem está afetado e como), o que já se sabe, o que está sendo feito e quando vem a próxima atualização.
+      Sem jargão e sem promessa de prazo que você não controla. Silêncio durante incidente é preenchido por especulação,
+      e especulação escala mais rápido que fato.
+    competencies: [communication, incident]

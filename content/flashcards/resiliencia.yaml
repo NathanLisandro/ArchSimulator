@@ -1,0 +1,83 @@
+id: resiliencia
+name: Resiliência
+description: Timeout, retry, circuit breaker, bulkhead, degradação e falhas parciais.
+cards:
+  - id: timeout-first
+    front: "Qual o primeiro mecanismo de resiliência a configurar?"
+    back: |
+      **Timeout.** Sem ele, nenhum outro funciona: a thread fica presa, o pool esgota e o circuit breaker nunca chega a
+      abrir. Timeout deve ser menor que o do chamador acima e derivado do p99 da dependência, não de um número redondo.
+    competencies: [characteristics, sre]
+  - id: circuit-breaker
+    front: "Como funciona um **circuit breaker** e qual o erro comum?"
+    back: |
+      Fechado deixa passar; ao exceder a taxa de falha, abre e responde erro rápido; depois de um tempo vai a half-open e
+      deixa passar algumas chamadas de teste. Erro comum: um breaker global para todas as dependências, de modo que uma
+      integração lenta derruba chamadas saudáveis. Um breaker **por dependência**.
+    competencies: [characteristics]
+  - id: bulkhead
+    front: "O que é **bulkhead** e por que ele salva sistemas compartilhados?"
+    back: |
+      Separar recursos (pool de threads, pool de conexões, role no banco) por fluxo, para que a saturação de um não
+      consuma o que os outros precisam. É o que evita que o extrato lento derrube a autorização de cartão que usa o
+      mesmo banco.
+    competencies: [characteristics]
+  - id: backoff-jitter
+    front: "Por que retry precisa de **jitter**?"
+    back: |
+      Sem jitter, todos os clientes que falharam no mesmo instante tentam de novo no mesmo instante: ondas sincronizadas
+      que mantêm a dependência caída. Backoff exponencial com jitter aleatório espalha as tentativas no tempo.
+    competencies: [characteristics, sre]
+  - id: retry-safety
+    front: "Quando **não** fazer retry?"
+    back: |
+      Em erro de negócio (4xx, validação), em operação não idempotente sem chave de idempotência, e quando a resposta é
+      ambígua (timeout em uma cobrança) sem consulta prévia de status. Retry cego em cobrança é como se cobra duas vezes.
+    competencies: [characteristics]
+  - id: graceful-degradation
+    front: "O que é **degradação graciosa** na prática?"
+    back: |
+      Decidir antes o que some primeiro: recomendação vira lista fixa, frete estimado vira faixa, extrato mostra 7 dias
+      em vez de 90. A alternativa não planejada é a página inteira caindo porque uma chamada opcional falhou.
+    competencies: [characteristics]
+  - id: load-shedding
+    front: "Quando **recusar** tráfego é a decisão certa?"
+    back: |
+      Quando aceitar mais trabalho só aumenta a fila e todo mundo passa a receber erro depois de esperar. Recusar cedo
+      (429, com mensagem clara) preserva quem já está sendo atendido. Priorize por criticidade: pagamento antes de busca.
+    competencies: [sre, characteristics]
+  - id: idempotent-consumer
+    front: "Como tornar um consumidor de eventos idempotente?"
+    back: |
+      Guarde o identificador do evento processado com restrição de unicidade e verifique antes de aplicar o efeito, ou
+      torne a operação naturalmente idempotente (`SET status = 'PAGO'` em vez de `saldo = saldo + x`). Sem isso, "ao
+      menos uma vez" vira dado duplicado.
+    competencies: [eda]
+  - id: partial-failure
+    front: "Qual a diferença entre falha total e **falha parcial**?"
+    back: |
+      Falha total é fácil: você percebe. Falha parcial (uma AZ lenta, 5% de erro, uma partição travada) é o modo de
+      falha real de sistema distribuído, e é onde timeout, breaker e alarme por percentil fazem diferença. Teste
+      degradação, não só queda.
+    competencies: [characteristics, sre]
+  - id: timeout-budget
+    front: "O que é **orçamento de timeout** em uma cadeia de chamadas?"
+    back: |
+      O tempo total disponível é distribuído entre os saltos: se o cliente espera 3s, e há três serviços na cadeia, cada
+      um precisa de timeout menor que o restante do orçamento, descontando o já consumido. Timeouts iguais em todos os
+      níveis garantem que o de fora sempre estoure primeiro, desperdiçando o trabalho de baixo.
+    competencies: [characteristics]
+  - id: health-check
+    front: "Liveness e readiness: qual a diferença e o erro clássico?"
+    back: |
+      **Liveness:** o processo está vivo? Falhou, reinicia. **Readiness:** pode receber tráfego agora?
+      Erro clássico: liveness que checa dependências externas — o banco fica lento, o Kubernetes reinicia todos os pods,
+      e o warm-up piora o incidente. Dependência externa vai em readiness, no máximo.
+    competencies: [kubernetes, sre]
+  - id: chaos
+    front: "Para que serve engenharia do caos se você já tem testes?"
+    back: |
+      Testes verificam o que você previu. O caos verifica o comportamento sob falhas que ninguém escreveu: latência
+      injetada, perda de pacote, queda de instância. O valor está em descobrir a dependência que você não sabia que era
+      crítica — de preferência em horário comercial, não às 3 da manhã.
+    competencies: [sre]

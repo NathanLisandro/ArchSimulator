@@ -1,0 +1,17 @@
+# Catálogo de tipos de recurso usados em company.infra.resources. Métricas são as que o console de Infra expõe.
+# Custo é aproximado (us-east-1, on-demand) só para pontuar estimativas em capacity planning.
+provider: aws
+types:
+  - { id: aws.alb, name: "Application Load Balancer", metrics: [request_count, target_5xx, elb_5xx, target_response_time, healthy_hosts], costPerHour: 0.0225 }
+  - { id: aws.eks, name: "EKS cluster", metrics: [pods_running, pods_pending, node_cpu, node_memory, oom_kills, restarts], costPerHour: 0.10 }
+  - { id: aws.rds.postgres, name: "RDS PostgreSQL", metrics: [cpu_utilization, read_iops, write_iops, read_latency, write_latency, burst_balance, active_connections, replica_lag, freeable_memory, disk_queue_depth], costPerHour: 4.80 }
+  - { id: aws.rds.oracle, name: "RDS Oracle", metrics: [cpu_utilization, read_iops, write_iops, read_latency, active_sessions, burst_balance], costPerHour: 6.10 }
+  - { id: aws.elasticache.redis, name: "ElastiCache Redis", metrics: [cpu_utilization, engine_cpu, memory_usage, evictions, cache_hit_rate, current_connections, replication_lag], costPerHour: 0.68 }
+  - { id: aws.msk, name: "MSK (Kafka)", metrics: [bytes_in, bytes_out, consumer_lag, under_replicated_partitions, request_latency, disk_used], costPerHour: 1.14 }
+  - { id: aws.sqs, name: "SQS", metrics: [messages_visible, messages_not_visible, age_of_oldest_message, dlq_messages, sent, received], costPerHour: 0.0 }
+  - { id: aws.dynamodb, name: "DynamoDB", metrics: [consumed_rcu, consumed_wcu, throttled_requests, latency], costPerHour: 0.0 }
+  - { id: aws.s3, name: "S3", metrics: [requests, 4xx, 5xx, first_byte_latency], costPerHour: 0.0 }
+  - { id: aws.lambda, name: "Lambda", metrics: [invocations, errors, duration, throttles, concurrent_executions, cold_starts], costPerHour: 0.0 }
+  - { id: aws.nat, name: "NAT Gateway", metrics: [bytes_out, active_connections, error_port_allocation], costPerHour: 0.045 }
+  - { id: aws.cloudfront, name: "CloudFront", metrics: [requests, cache_hit_rate, 5xx_rate, origin_latency], costPerHour: 0.0 }
+  - { id: external, name: "Parceiro externo", metrics: [latency, error_rate, timeouts], costPerHour: 0.0 }

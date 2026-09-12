@@ -1,0 +1,214 @@
+.study__summary {
+  margin: 0 0 var(--gap-4);
+  font-size: var(--step-0);
+  color: var(--graphite-soft);
+}
+
+.study__decks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: var(--gap-4);
+}
+
+.deck {
+  display: flex;
+  flex-direction: column;
+  padding: var(--gap-4);
+  background: var(--paper-raised);
+  border: 1px solid var(--paper-line);
+  border-left: 3px solid var(--paper-line);
+  border-radius: var(--radius);
+}
+
+.deck--due {
+  border-left-color: var(--signal);
+}
+
+.deck__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gap-2);
+  margin-bottom: 0.3rem;
+}
+
+.deck__name {
+  font-size: var(--step-0);
+}
+
+.deck__count {
+  margin-left: auto;
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.deck__description {
+  font-size: var(--step--1);
+  color: var(--graphite-soft);
+  margin-bottom: var(--gap-3);
+  flex: 1;
+}
+
+.deck__stats {
+  display: flex;
+  gap: var(--gap-4);
+  margin: 0 0 var(--gap-3);
+  padding-bottom: var(--gap-3);
+  border-bottom: 1px solid var(--paper-sunken);
+}
+
+.deck__stats div {
+  display: flex;
+  flex-direction: column;
+}
+
+.deck__stats dt {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.deck__stats dd {
+  margin: 0;
+  font-size: var(--step--1);
+  font-weight: 600;
+}
+
+.deck__due-count {
+  color: var(--signal-deep);
+}
+
+.deck button {
+  align-self: flex-start;
+}
+
+/* ------------------------------------------------------------------ revisão */
+
+.study__session-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  margin-bottom: var(--gap-5);
+}
+
+.study__remaining {
+  margin-left: auto;
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.card {
+  max-width: 44rem;
+  margin: 0 auto;
+  background: var(--paper-raised);
+  border: 1px solid var(--paper-line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+  overflow: hidden;
+}
+
+.card__face {
+  padding: var(--gap-5);
+}
+
+.card__face--front {
+  font-size: var(--step-1);
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.card__face--front .md__p {
+  font-size: var(--step-1);
+  max-width: none;
+}
+
+.card__face--back {
+  background: var(--paper);
+  animation: revealIn 180ms ease-out;
+}
+
+@keyframes revealIn {
+  from {
+    opacity: 0;
+  }
+}
+
+.card__reveal {
+  display: block;
+  width: 100%;
+  padding: var(--gap-4);
+  border: none;
+  background: var(--paper-sunken);
+  font-size: var(--step--1);
+  color: var(--graphite-soft);
+  cursor: pointer;
+}
+
+.card__reveal:hover {
+  background: var(--signal-wash);
+  color: var(--signal-deep);
+}
+
+.card__grades {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border-top: 1px solid var(--paper-line);
+}
+
+.card__grade {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 0.6rem 0.4rem;
+  border: none;
+  border-right: 1px solid var(--paper-line);
+  background: var(--paper-raised);
+  cursor: pointer;
+}
+
+.card__grade:last-child {
+  border-right: none;
+}
+
+.card__grade:hover {
+  background: var(--paper-sunken);
+}
+
+.card__grade-label {
+  font-size: var(--step--1);
+  font-weight: 600;
+}
+
+.card__grade-hint {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.card__grade--again .card__grade-label { color: var(--crit); }
+.card__grade--hard .card__grade-label { color: #8a5610; }
+.card__grade--good .card__grade-label { color: var(--ok); }
+.card__grade--easy .card__grade-label { color: var(--signal-deep); }
+
+.card__meta {
+  padding: 0.4rem var(--gap-5);
+  border-top: 1px solid var(--paper-line);
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+  margin: 0;
+}
+
+.study__last {
+  margin: var(--gap-4) auto 0;
+  max-width: 44rem;
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+  text-align: center;
+}
+
+.study__done-actions {
+  display: flex;
+  justify-content: center;
+}
+
+@media (max-width: 560px) {
+  .card__grades {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

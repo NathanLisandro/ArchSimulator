@@ -1,0 +1,80 @@
+id: mensageria
+name: Mensageria e streaming
+description: Kafka, filas, ordenação, consumer groups, DLQ e garantias de entrega.
+cards:
+  - id: queue-vs-log
+    front: "Qual a diferença entre uma **fila** (SQS) e um **log** (Kafka)?"
+    back: |
+      Fila: mensagem consumida some; um consumidor por mensagem; sem histórico.
+      Log: mensagens ficam por retenção; vários grupos leem a mesma partição de forma independente; é possível reprocessar
+      do começo. Use fila para trabalho a fazer, log para fatos que vários interessados precisam observar.
+    competencies: [kafka, eda]
+  - id: partition-key
+    front: "O que a **chave da mensagem** determina no Kafka?"
+    back: |
+      A partição, e portanto a **ordem**: mensagens com a mesma chave vão para a mesma partição e são lidas em ordem.
+      Ordem é garantida por partição, nunca globalmente. Escolher a chave é escolher a unidade de ordenação — e o risco
+      de hot partition.
+    competencies: [kafka]
+  - id: consumer-group
+    front: "Como o Kafka distribui trabalho em um **consumer group**?"
+    back: |
+      Cada partição é atribuída a no máximo um consumidor do grupo. Logo, o paralelismo máximo é o número de partições:
+      20 pods com 12 partições deixam 8 pods ociosos. Aumentar partições aumenta paralelismo, mas nunca diminui sem
+      recriar o tópico.
+    competencies: [kafka]
+  - id: rebalance
+    front: "O que acontece durante um **rebalance** e como reduzir o impacto?"
+    back: |
+      As partições são redistribuídas e o consumo pausa. Reduza com `cooperative-sticky`, `session.timeout` adequado,
+      processamento que não estoure `max.poll.interval.ms` e commit de offset em lotes curtos. Rebalance frequente
+      costuma ser sintoma de processamento lento dentro do poll, não de configuração.
+    competencies: [kafka]
+  - id: offset-commit
+    front: "Commit de offset antes ou depois de processar?"
+    back: |
+      **Depois** de processar: commit antes gera "no máximo uma vez" (perde mensagem em falha). Commitar depois dá
+      "ao menos uma vez", com reprocessamento possível — daí a exigência de idempotência no consumidor.
+    competencies: [kafka]
+  - id: dlq
+    front: "Qual o risco de uma **DLQ** bem configurada?"
+    back: |
+      Crescer em silêncio. DLQ sem alerta e sem dono é perda de dado com etapa extra. Toda DLQ precisa de: alarme por
+      quantidade e por idade da mensagem mais antiga, runbook de reprocessamento e alguém responsável.
+    competencies: [eda, sre]
+  - id: consumer-lag
+    front: "O que o **consumer lag** mede e quando ele engana?"
+    back: |
+      Mede quantas mensagens faltam consumir por partição. Engana quando o lag total está baixo mas uma partição está
+      travada (hot key), ou quando o produtor caiu: lag zero pode significar "nada chegando", não "tudo em dia".
+      Acompanhe lag por partição e taxa de produção juntos.
+    competencies: [kafka, observability]
+  - id: schema-registry
+    front: "Para que serve um **schema registry**?"
+    back: |
+      Versionar o contrato do evento e impedir publicação incompatível. Compatibilidade **backward** permite o consumidor
+      antigo ler o evento novo (campos novos opcionais); **forward**, o contrário. Sem registry, o contrato vira acordo
+      verbal que quebra em produção.
+    competencies: [kafka, microservices]
+  - id: event-types
+    front: "Evento de **fato**, de **notificação** ou com **estado completo**?"
+    back: |
+      - **Notificação:** "pedido mudou", consumidor busca o detalhe. Baixo acoplamento de dados, mais chamadas de volta.
+      - **Estado completo (event-carried state transfer):** o evento traz tudo. Menos chamadas, mais acoplamento ao schema.
+      - **Event sourcing:** a sequência de eventos **é** o estado.
+      Escolher errado aqui é o que faz microserviço virar monólito distribuído.
+    competencies: [eda, ddd]
+  - id: ordering-need
+    front: "Você realmente precisa de ordem?"
+    back: |
+      Boa parte dos fluxos não precisa: se o processamento é idempotente e comutativo (aplicar A depois B dá o mesmo que
+      B depois A), ordem deixa de ser requisito — e você ganha paralelismo. Exigir ordem global é a decisão mais cara
+      que se toma em mensageria.
+    competencies: [eda, kafka]
+  - id: retry-storm
+    front: "Por que **retry em camadas** é perigoso?"
+    back: |
+      Tentativas se multiplicam: 3 no cliente HTTP × 5 na fila = até 15 chamadas por operação. Sobre uma dependência já
+      degradada, o próprio retry impede a recuperação. Regra: retry em **uma** camada, com backoff exponencial, jitter e
+      orçamento (nunca mais que ~10% do tráfego).
+    competencies: [eda, sre]

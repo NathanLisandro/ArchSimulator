@@ -1,0 +1,338 @@
+id: bank-incident-pix-retry-storm
+type: INCIDENT
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, microservices, eda, sre, observability, communication]
+tools: [LOGS, METRICS, TRACES, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [4000, 12000], step: 500 }
+  onsetMinutesAgo: { range: [15, 45], step: 5 }
+  spiLatency: { range: [2500, 9000], step: 500 }
+  failureRate: { range: [12, 68], step: 2 }
+  trigger:
+    group:
+      - { triggerDescription: "o SPI do BCB entrou em degradação (janela de manutenção não comunicada), respondendo em {{spiLatency}}ms em vez de 300ms", triggerSource: "SPI (BCB)" }
+      - { triggerDescription: "o link de saída pelo NAT gateway de uma AZ saturou, e as chamadas mTLS ao SPI passaram a levar {{spiLatency}}ms", triggerSource: "NAT gateway" }
+      - { triggerDescription: "o certificado mTLS de um dos pods do pix-gateway expirou e as chamadas passam a falhar após o handshake, com {{spiLatency}}ms de timeout", triggerSource: "pix-gateway" }
+derived:
+  p99Before: "round(p99 / 30)"
+  retriesPerSecond: "round(failureRate * 47)"
+narrative:
+  title: "PIX falhando: {{failureRate}}% de erro e p99 em {{p99}}ms"
+  symptom: |
+    **{{onsetLabel}}** — o `pix-api` está com **{{failureRate}}% de erro** em `POST /pix/transactions` e p99 de
+    **{{p99}}ms** (baseline ~{{p99Before}}ms). O RPS de saída do `pix-gateway` **triplicou** sem que o tráfego de
+    entrada tenha mudado.
+
+    O painel do `fraud-scoring` mostra fila crescente; o `notification-service` acumula mensagens. Nenhum deploy do
+    pix-api hoje.
+  businessContext: |
+    O PIX tem SLA regulatório de disponibilidade de 99,9% mensal e liquidação em até 10 segundos. Falha em PIX em
+    horário comercial é incidente reportável ao BCB (Resolução 4.893) e vira notícia. O caminho crítico é síncrono:
+    `pix-api` → `fraud-scoring` → `pix-gateway` → SPI.
+  hints:
+    - "Tráfego de saída triplicar com entrada estável é assinatura de retry."
+    - "Veja a política de retry no caminho: quantas camadas tentam de novo, e quantas vezes cada uma."
+    - "Um trace mostra quantas tentativas cabem dentro de um único request do cliente."
+checkpoints:
+  - id: in-vs-out
+    question: "O RPS de entrada está estável, mas o de saída triplicou. O que isso indica?"
+    options:
+      - id: retries
+        label: "Retries: cada request de entrada está gerando várias chamadas de saída"
+        verdict: GOOD
+        feedback: "Exato. Com {{retriesPerSecond}} retries/s sobre uma dependência já degradada, o próprio retry vira a carga que impede a recuperação. Olhe quantas camadas do caminho tentam de novo."
+      - id: more-traffic
+        label: "Aumento real de tráfego de clientes"
+        verdict: BAD
+        feedback: "O RPS de entrada do pix-api está estável — se fosse tráfego real, ele teria subido junto. O excesso nasce dentro do sistema."
+      - id: scale-out
+        label: "Escalar o pix-gateway para absorver o volume de saída"
+        verdict: BAD
+        feedback: "Escalar quem gera retry multiplica a pressão sobre {{triggerSource}}, que já está em {{spiLatency}}ms. Você transforma uma degradação em uma negação de serviço contra a dependência."
+  - id: retry-layers
+    question: "Você encontrou retry em três camadas: cliente HTTP (3x), fila de reprocessamento (5x) e job de varredura. O problema?"
+    options:
+      - id: multiplication
+        label: "As tentativas se multiplicam: 3 × 5 = até 15 chamadas por transação original"
+        verdict: GOOD
+        feedback: "Certo. Retry aninhado multiplica, não soma. Com {{failureRate}}% de falha, cada transação vira até 15 chamadas ao SPI — e o SPI degradado nunca sai do buraco."
+      - id: not-enough-retries
+        label: "Faltam retries: aumentar para garantir entrega"
+        verdict: BAD
+        feedback: "Mais retry contra uma dependência saturada é o oposto do necessário. O caminho é reduzir tentativas, adicionar backoff exponencial com jitter e abrir circuit breaker."
+      - id: timeout-too-low
+        label: "O timeout está baixo demais: aumentar para 30s"
+        verdict: RISKY
+        feedback: "Timeout maior segura threads e conexões por mais tempo e empurra a saturação para dentro do pix-api. Se ajustar timeout, ajuste para baixo, junto com backoff."
+  - id: protect
+    question: "Qual a primeira ação para quebrar o ciclo?"
+    options:
+      - id: circuit-breaker
+        label: "Abrir o circuit breaker para {{triggerSource}} e aplicar backoff exponencial com jitter"
+        verdict: GOOD
+        feedback: "Sim: para de bater na dependência caída, devolve erro rápido e deixa o SPI respirar. O PIX continua degradado, mas de forma controlada — e você deixa de ser a causa da não-recuperação."
+      - id: queue-everything
+        label: "Enfileirar todas as transações para processar depois"
+        verdict: RISKY
+        feedback: "PIX tem liquidação esperada em segundos; enfileirar sem avisar cria promessa falsa ao cliente. Como decisão explícita e comunicada pode valer, mas não é neutra."
+      - id: disable-fraud
+        label: "Desligar o antifraude para reduzir a latência do caminho"
+        verdict: BAD
+        feedback: "Desligar antifraude em um banco é risco de fraude e descumprimento regulatório — e o gargalo não é ele: é {{triggerSource}} em {{spiLatency}}ms."
+mitigations:
+  - id: open-circuit-breaker
+    label: "Abrir o circuit breaker para {{triggerSource}}"
+    description: "Para de tentar por 60s, devolve erro rápido e testa em half-open"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "Ciclo quebrado: os retries caem de {{retriesPerSecond}}/s para quase zero, a fila do pix-gateway drena e o p99 volta a ~{{p99Before}}ms para o que não depende do SPI. As transações que precisam do SPI seguem falhando rápido, com mensagem clara."
+    feedbackWhenBlind: "Funcionou, mas você abriu o breaker sem antes confirmar onde estava a falha. Se o problema fosse interno (um pod com certificado vencido, por exemplo), o breaker teria escondido o sintoma sem resolver nada."
+  - id: reduce-retries
+    label: "Reduzir os retries de 3x para 1x e aplicar backoff com jitter"
+    description: "Muda a configuração do cliente HTTP e da fila de reprocessamento"
+    verdict: GOOD
+    effect: PARTIAL
+    feedback: "Reduz muito a amplificação e é a correção certa de médio prazo. Sozinha demora a fazer efeito: a fila de reprocessamento já acumulada continua drenando com a política antiga."
+  - id: scale-gateway
+    label: "Triplicar as réplicas do pix-gateway"
+    description: "Escala horizontal"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Você acabou de triplicar a carga sobre {{triggerSource}}, que já está em {{spiLatency}}ms. A taxa de erro sobe, o SPI degrada mais e o banco entra na lista de quem está causando o problema."
+  - id: disable-fraud
+    label: "Desligar o fraud-scoring do caminho síncrono"
+    description: "Feature flag que pula o antifraude"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Risco inaceitável: abre janela de fraude em PIX e viola o requisito regulatório de antifraude, sem tocar no gargalo real."
+  - id: shed-load
+    label: "Load shedding: recusar 40% das iniciações com mensagem clara"
+    description: "Devolve 503 com orientação para tentar em alguns minutos"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Protege quem já está na fila e evita timeout silencioso, ao custo de recusar clientes de propósito. Decisão defensável em pico, desde que comunicada — e que a mensagem não sugira erro do cliente."
+stakeholders:
+  - id: cto
+    from: "Marina (CTO)"
+    afterSeconds: 180
+    text: "PIX falhando aparece no Twitter em minutos. Preciso de uma frase para o comitê de crise agora."
+  - id: regulatory
+    from: "Diego (Compliance)"
+    afterSeconds: 600
+    text: "Se passar de 30 minutos com indisponibilidade parcial de PIX, temos comunicação obrigatória ao BCB. Qual a previsão?"
+  - id: partner
+    from: "Ana (Relacionamento SPI)"
+    afterSeconds: 1080
+    text: "Abri chamado com o BCB. Eles confirmam degradação no SPI e pedem que reduzamos o volume de tentativas."
+    expectsUpdate: false
+solutionPaths:
+  - id: breaker-and-backoff
+    name: "Circuit breaker + backoff, depois corrigir a política de retry"
+    summary: "Parar a amplificação agora com breaker aberto e, em seguida, consolidar retry em uma única camada com backoff exponencial e jitter."
+    pros: ["Quebra o ciclo em segundos", "Protege a dependência e o próprio sistema", "Ataca a causa da não-recuperação"]
+    cons: ["PIX segue indisponível enquanto o SPI estiver degradado", "Exige comunicação clara ao cliente"]
+    bestWhen: "a dependência externa está degradada e o seu sistema está ampliando o problema — exatamente o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz e amplificação"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [RETRY_STORM] }
+            - { type: keyword, field: postMortem, anyOf: ["amplifica", "multiplica", "retry aninhado", "3x", "15 chamadas", "camadas"], min: 1 }
+          missing: "A causa raiz tem duas partes: {{triggerDescription}} e a amplificação por retry em três camadas (até 15 chamadas por transação)."
+          present: "Causa raiz e amplificação identificadas."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: TRACE_VIEW }
+          missing: "Mostre o descolamento entre RPS de entrada e de saída nas métricas e as tentativas repetidas em um trace."
+          present: "Amplificação comprovada por métrica e trace."
+        - id: mitigation
+          name: "Mitigação que quebra o ciclo"
+          weight: 25
+          evidence:
+            - { type: mitigation, id: open-circuit-breaker, informed: true }
+          missing: "Faltou parar a amplificação: abrir o breaker para a dependência degradada, depois de confirmar onde está a falha."
+          present: "Ciclo de retry interrompido."
+        - id: communication
+          name: "Comunicação e prazo regulatório"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "PIX indisponível tem prazo de comunicação ao BCB: dois status updates, o primeiro em até 7 minutos."
+          present: "Comunicação no ritmo do prazo regulatório."
+        - id: postmortem
+          name: "Post-mortem e prevenção"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+            - { type: keyword, field: postMortem, anyOf: ["jitter", "backoff", "orçamento de retry", "retry budget", "uma camada", "bulkhead"], min: 1 }
+          missing: "As ações precisam incluir retry em uma única camada, backoff exponencial com jitter e orçamento de retry."
+          present: "Prevenção específica definida."
+  - id: shed-and-communicate
+    name: "Load shedding com comunicação explícita"
+    summary: "Recusar parte das iniciações de propósito, com mensagem clara, preservando as que já estão em curso."
+    pros: ["Mantém previsibilidade para quem entra", "Evita timeout silencioso", "Reduz pressão sobre a dependência"]
+    cons: ["Recusa clientes deliberadamente", "Não corrige a amplificação por si só"]
+    bestWhen: "o pico é grande, a dependência não volta logo e é preferível recusar cedo a falhar depois de 10 segundos"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [RETRY_STORM] }
+          missing: "A causa raiz é a amplificação por retry sobre {{triggerSource}} degradado."
+          present: "Causa raiz correta."
+        - id: mitigation
+          name: "Shedding aplicado"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique de fato a contenção (shedding ou redução de retries), não apenas descreva."
+          present: "Contenção aplicada."
+        - id: message
+          name: "Mensagem ao cliente"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["mensagem", "comunicação ao cliente", "aviso", "503", "orientação"], min: 1 }
+          missing: "Recusar de propósito exige mensagem que não sugira erro do cliente e oriente o que fazer."
+          present: "Mensagem ao cliente definida."
+        - id: communication
+          name: "Comunicação interna"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "Faltaram status updates no ritmo do prazo regulatório."
+          present: "Stakeholders informados."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem."
+          present: "Post-mortem estruturado."
+  - id: async-fallback
+    name: "Degradar para assíncrono com promessa explícita"
+    summary: "Aceitar a iniciação, responder 'em processamento' e liquidar quando o SPI voltar, com notificação ao cliente."
+    pros: ["Não perde a intenção do cliente", "Absorve o pico"]
+    cons: ["PIX é esperado em segundos: promessa de assíncrono precisa ser explícita", "Exige idempotência e conciliação cuidadosas", "Risco de fila enorme quando a dependência voltar"]
+    bestWhen: "existe fluxo assíncrono já testado e a janela de indisponibilidade é curta e conhecida"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [RETRY_STORM] }
+          missing: "A causa raiz é a amplificação por retry."
+          present: "Causa raiz correta."
+        - id: idempotency
+          name: "Idempotência e conciliação"
+          weight: 30
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["idempot", "end_to_end_id", "chave de idempotência", "conciliação", "conciliacao", "duplicid"], min: 1 }
+          missing: "Retomar depois exige idempotência por end_to_end_id e conciliação: sem isso, a fila drenada vira transação duplicada."
+          present: "Idempotência tratada."
+        - id: expectation
+          name: "Promessa ao cliente"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["notificação", "notificacao", "em processamento", "expectativa", "prazo ao cliente"], min: 1 }
+          missing: "Mudar de síncrono para assíncrono muda a promessa ao cliente: descreva a comunicação e a notificação de conclusão."
+          present: "Promessa ao cliente explicitada."
+        - id: control
+          name: "Controle da retomada"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["vazão", "vazao", "rate", "gradual", "drenar", "ramp"], min: 1 }
+          missing: "Quando o SPI voltar, a fila acumulada pode derrubá-lo de novo: descreva a retomada com vazão controlada."
+          present: "Retomada controlada."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem."
+          present: "Post-mortem estruturado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: RETRY_STORM, label: "Dependência degradada amplificada por retry em cascata" }
+        - { value: THIRD_PARTY, label: "Apenas lentidão do terceiro, sem amplificação" }
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool (causa primária)" }
+        - { value: N_PLUS_ONE, label: "N+1 no caminho do PIX" }
+        - { value: TRAFFIC_SPIKE, label: "Pico real de tráfego de clientes" }
+    - id: amplificationFactor
+      label: "Quantas chamadas ao SPI uma transação pode gerar"
+      type: SELECT
+      required: true
+      options:
+        - { value: "1", label: "1 (sem retry)" }
+        - { value: "3", label: "3 (só o cliente HTTP)" }
+        - { value: "15", label: "Até 15 (retry aninhado em três camadas)" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: breaker-and-backoff, label: "Circuit breaker + backoff" }
+        - { value: shed-and-communicate, label: "Load shedding comunicado" }
+        - { value: async-fallback, label: "Degradar para assíncrono" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até a abertura do circuit breaker: {{failureRate}}% de erro em `POST /pix/transactions`, p99 de
+  {{p99}}ms (baseline {{p99Before}}ms) e ~{{retriesPerSecond}} tentativas por segundo saindo para o SPI. Indisponibilidade
+  parcial de PIX em horário comercial, com prazo de comunicação ao BCB correndo.
+
+  ## Linha do tempo
+  - **{{onsetLabel}}** — {{triggerDescription}}.
+  - **+ 2min** — primeiras falhas; os retries do cliente HTTP entram em ação (3x por chamada).
+  - **+ 5min** — a fila de reprocessamento começa a reenviar (5x), e o job de varredura soma mais tentativas.
+  - **+ 8min** — RPS de saída do pix-gateway triplica com entrada estável; o SPI, já degradado, piora.
+  - **+ ~20min** — circuit breaker aberto para {{triggerSource}}; tentativas caem a quase zero; fila drena.
+
+  ## Causa raiz
+  Retry storm. O gatilho foi externo ({{triggerSource}}), mas o incidente foi **ampliado e mantido** por retries
+  aninhados: cliente HTTP (3x) × fila de reprocessamento (5x) = até 15 chamadas por transação, sem backoff nem jitter.
+  Quando todos tentam de novo ao mesmo tempo, a dependência não tem janela para se recuperar.
+
+  ## Ações
+  1. **Imediata:** circuit breaker por dependência, com half-open e limite de chamadas de teste.
+  2. **Política de retry (esta semana):** retry em **uma** camada apenas, com backoff exponencial e jitter; orçamento de retry (nunca mais de 10% do tráfego).
+  3. **Detecção (esta semana):** alerta sobre a razão RPS de saída / RPS de entrada por dependência — sobe antes da taxa de erro.
+  4. **Isolamento (este mês):** bulkhead entre o caminho PIX e o resto do pix-api, para que a degradação do SPI não consuma todos os threads.
+  5. **Contrato (este trimestre):** com o time de relacionamento, acordar canal de aviso de janela de manutenção do SPI.
+
+  Blameless: cada camada de retry foi adicionada por um motivo legítimo, em momentos diferentes. Faltava alguém olhando
+  a composição do caminho inteiro — e um alerta que mostrasse a amplificação antes do impacto.
+scenario:
+  kind: incident
+  params:
+    rootCause: RETRY_STORM
+    service: pix-api
+    datastore: core-db
+    endpoint: "POST /pix/transactions"
+    partner: "{{triggerSource}}"
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: breaker-and-backoff
+  rules:
+    - { param: failureRate, op: ">=", value: 55, path: shed-and-communicate, reason: "com {{failureRate}}% de falha o breaker sozinho deixa muita gente esperando para receber erro; recusar cedo, com mensagem clara, é mais honesto com o cliente" }

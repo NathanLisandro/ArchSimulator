@@ -1,0 +1,227 @@
+id: bank-tradeoff-outbox-vs-2pc
+type: TRADE_OFF
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [eda, microservices, characteristics, adr]
+tools: []
+parameters:
+  tps: { range: [400, 2600], step: 100 }
+  duplicatesPerDay: { range: [40, 900], step: 10 }
+  teamSize: { range: [4, 9], step: 1 }
+  context:
+    group:
+      - { consumer: "notification-service", consequence: "o cliente recebe o push de 'PIX recebido' mesmo quando a transação falhou no commit, e o suporte abre ticket de 'dinheiro que não chegou'" }
+      - { consumer: "fraud-scoring", consequence: "o antifraude pontua transações que não existiram, sujando as features do modelo e elevando o falso positivo" }
+      - { consumer: "receivables-api", consequence: "a agenda do lojista registra recebíveis fantasma que somem no dia seguinte, gerando contestação" }
+derived:
+  eventsPerDay: "tps * 86400"
+  incidentCost: "duplicatesPerDay * 12"
+narrative:
+  title: "Escolha forçada: outbox ou commit em duas fases no PIX"
+  symptom: |
+    O `pix-api` grava a transação no `core-db` **e** publica o evento `PixSettled` no Kafka. Hoje são duas operações
+    separadas, sem coordenação: quando a publicação falha, o evento se perde; quando o commit falha depois da
+    publicação, o evento existe sem a transação.
+
+    Resultado medido no último mês: **{{duplicatesPerDay}} divergências por dia** entre o ledger e o que os consumidores
+    processaram. {{consequence}}
+
+    A arquitetura decidiu que isso precisa acabar. Duas propostas estão na mesa e você tem de escolher **uma** e defender:
+    **transactional outbox** ou **commit em duas fases (XA) entre PostgreSQL e Kafka**.
+  businessContext: |
+    Volume: {{tps}} TPS no pico, ~{{eventsPerDay|compact}} eventos por dia. O `core-db` é RDS PostgreSQL; o broker é
+    MSK (Kafka). O consumidor mais afetado hoje é o `{{consumer}}`. A squad tem {{teamSize}} pessoas e opera o próprio
+    on-call. O PIX tem SLA regulatório de liquidação em até 10 segundos.
+  hints:
+    - "Pergunte o que cada opção custa em latência no caminho crítico, não só em garantias no papel."
+    - "Garantia de entrega e ausência de duplicata são problemas diferentes."
+    - "Quem vai operar a solução às 3 da manhã faz parte do trade-off."
+checkpoints:
+  - id: guarantee
+    question: "Qual garantia você realmente precisa aqui?"
+    options:
+      - id: at-least-once
+        label: "Entrega ao menos uma vez, com consumidores idempotentes"
+        verdict: GOOD
+        feedback: "Certo: o problema é evento perdido e evento fantasma, não duplicata — duplicata o consumidor resolve com idempotência por `end_to_end_id`. Buscar exactly-once distribuído custa muito mais do que o problema justifica."
+      - id: exactly-once
+        label: "Exatamente uma vez, fim a fim"
+        verdict: RISKY
+        feedback: "Exactly-once fim a fim entre banco e broker exige coordenação distribuída e, na prática, ainda depende de idempotência no consumidor. Você paga latência e complexidade para chegar ao mesmo lugar: entrega garantida + idempotência."
+      - id: best-effort
+        label: "O que temos hoje basta; melhorar o monitoramento"
+        verdict: BAD
+        feedback: "Com {{duplicatesPerDay}} divergências por dia em um produto regulado, monitorar melhor só documenta o problema. {{consequence}}"
+  - id: latency
+    question: "O que cada opção faz com a latência do caminho crítico do PIX?"
+    options:
+      - id: outbox-async
+        label: "Outbox mantém a latência: uma transação local; a publicação sai depois, fora do request"
+        verdict: GOOD
+        feedback: "Exato. O `pix-api` grava transação e evento na mesma transação local; o relay publica depois. O caminho crítico continua com um commit — importante com SLA de 10s e {{tps}} TPS."
+      - id: xa-cost
+        label: "2PC é equivalente: só adiciona alguns milissegundos"
+        verdict: BAD
+        feedback: "2PC adiciona pelo menos dois round-trips de coordenação por transação e, pior, mantém locks abertos durante a fase de preparo. Com {{tps}} TPS isso vira contenção no core-db, que já é compartilhado com cartão e ledger."
+      - id: not-relevant
+        label: "Latência não importa: o que importa é a garantia"
+        verdict: BAD
+        feedback: "Em PIX a latência é requisito regulatório (liquidação em até 10s) e de produto. Uma garantia que quebra o SLA não é uma solução melhor, é outro incidente."
+  - id: failure-mode
+    question: "O coordenador do 2PC cai entre o prepare e o commit. O que acontece?"
+    options:
+      - id: in-doubt
+        label: "Transações ficam 'em dúvida', segurando locks até intervenção manual"
+        verdict: GOOD
+        feedback: "Esse é o modo de falha que decide a discussão: transações in-doubt seguram locks no core-db e exigem resolução manual. Com {{teamSize}} pessoas no on-call, isso é um risco operacional grande."
+      - id: auto-rollback
+        label: "Tudo faz rollback automaticamente"
+        verdict: BAD
+        feedback: "Não há rollback automático seguro: depois do prepare, o participante não pode decidir sozinho sem violar a garantia. É justamente isso que cria as transações in-doubt."
+      - id: kafka-handles
+        label: "O Kafka resolve com o produtor transacional"
+        verdict: RISKY
+        feedback: "As transações do Kafka garantem atomicidade **dentro** do Kafka, não entre Kafka e PostgreSQL. Elas ajudam no fluxo consome-processa-produz, que é outro problema."
+solutionPaths:
+  - id: outbox
+    name: "Transactional outbox"
+    summary: "Gravar o evento em uma tabela `outbox` na mesma transação da escrita de negócio; um relay lê e publica no Kafka, com consumidores idempotentes."
+    pros: ["Uma transação local: latência preservada", "Sem coordenador distribuído nem transações in-doubt", "Reprocessamento simples: a tabela é o log", "Operável por uma squad pequena"]
+    cons: ["Entrega ao menos uma vez: exige idempotência no consumidor", "Mais uma tabela e um relay para operar e monitorar", "Ordem por chave precisa de cuidado na publicação"]
+    bestWhen: "o consumidor pode ser idempotente e a latência do caminho crítico importa — o caso do PIX"
+    rubric:
+      criteria:
+        - id: choice
+          name: "Escolha declarada"
+          weight: 10
+          evidence:
+            - { type: choice, field: solutionPath, anyOf: [outbox] }
+          missing: "Declare a escolha no campo estruturado."
+          present: "Escolha declarada."
+        - id: latency
+          name: "Argumento de latência"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["latência", "latencia", "caminho crítico", "caminho critico", "transação local", "transacao local", "commit"], min: 1 }
+          missing: "O argumento mais forte do outbox aqui é a latência: uma transação local contra dois round-trips de coordenação com {{tps}} TPS."
+          present: "Impacto na latência argumentado."
+        - id: idempotency
+          name: "Idempotência assumida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["idempot", "end_to_end_id", "chave", "deduplic"], min: 1 }
+          missing: "Outbox entrega ao menos uma vez: assuma explicitamente a idempotência no consumidor (por `end_to_end_id`) como parte do desenho."
+          present: "Idempotência assumida explicitamente."
+        - id: operations
+          name: "Operação do relay"
+          weight: 20
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["relay", "poller", "cdc", "debezium", "lag", "monitor", "limpeza", "retenção", "retencao"], min: 1 }
+          missing: "A parte que dá trabalho é o relay: diga como publica (poller ou CDC), como monitora o lag e como limpa a tabela."
+          present: "Operação do relay descrita."
+        - id: honesty
+          name: "Custo reconhecido"
+          weight: 20
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["ordem", "duplicat", "custo", "desvantagem", "em troca", "não resolve", "nao resolve"], min: 1 }
+          missing: "Uma defesa honesta reconhece o que se perde: duplicatas possíveis, ordem por chave e mais uma peça no on-call."
+          present: "Custo da escolha reconhecido."
+  - id: two-phase-commit
+    name: "Commit em duas fases (XA)"
+    summary: "Coordenar PostgreSQL e Kafka em uma transação distribuída, com prepare e commit em ambos."
+    pros: ["Atomicidade aparente entre banco e broker", "Modelo mental simples para quem escreve o código"]
+    cons: ["Dois round-trips e locks abertos durante o prepare", "Transações in-doubt exigem intervenção manual", "Kafka não tem suporte XA de primeira classe", "Operação pesada para uma squad de {{teamSize}} pessoas"]
+    bestWhen: "os dois participantes são bancos relacionais com suporte XA maduro, o volume é baixo e a latência não é crítica"
+    rubric:
+      criteria:
+        - id: choice
+          name: "Escolha declarada"
+          weight: 10
+          evidence:
+            - { type: choice, field: solutionPath, anyOf: [two-phase-commit] }
+          missing: "Declare a escolha no campo estruturado."
+          present: "Escolha declarada."
+        - id: in-doubt
+          name: "Transações in-doubt enfrentadas"
+          weight: 30
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["in-doubt", "em dúvida", "em duvida", "coordenador", "heurístic", "heuristic", "resolução manual", "resolucao manual"], min: 1 }
+          missing: "Defender 2PC exige responder ao pior modo de falha: coordenador cai entre prepare e commit, transações ficam in-doubt segurando locks. Quem resolve, e como?"
+          present: "Modo de falha do coordenador enfrentado."
+        - id: latency
+          name: "Custo de latência assumido"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["latência", "latencia", "round-trip", "lock", "throughput", "contenção", "contencao"], min: 1 }
+          missing: "Com {{tps}} TPS, os round-trips de coordenação e os locks do prepare têm custo: assuma o número."
+          present: "Custo de latência assumido."
+        - id: kafka-xa
+          name: "Suporte real do Kafka"
+          weight: 20
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["xa", "não suporta", "nao suporta", "adapter", "limitação", "limitacao", "transação do kafka", "transacao do kafka"], min: 1 }
+          missing: "Kafka não é um participante XA de primeira classe: explique como pretende coordená-lo ou por que a limitação é aceitável."
+          present: "Limitação do broker reconhecida."
+        - id: operations
+          name: "Operação"
+          weight: 15
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["on-call", "runbook", "operação", "operacao", "monitor", "recuperação", "recuperacao"], min: 1 }
+          missing: "Quem opera às 3 da manhã faz parte do trade-off: descreva runbook e monitoramento das transações pendentes."
+          present: "Operação considerada."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Sua escolha"
+      type: SELECT
+      required: true
+      options:
+        - { value: outbox, label: "Transactional outbox" }
+        - { value: two-phase-commit, label: "Commit em duas fases (XA)" }
+    - id: deliveryGuarantee
+      label: "Garantia de entrega assumida"
+      type: SELECT
+      required: true
+      options:
+        - { value: at-least-once, label: "Ao menos uma vez + idempotência no consumidor" }
+        - { value: exactly-once, label: "Exatamente uma vez" }
+        - { value: at-most-once, label: "No máximo uma vez" }
+    - id: justification
+      label: "Justificativa"
+      type: MARKDOWN
+      required: true
+      help: "Defenda a escolha com números do cenário, reconheça o custo e descreva o pior modo de falha."
+reference: |
+  ## Escolha: transactional outbox
+
+  ### Por que
+  O problema aqui é **evento perdido e evento fantasma**, não duplicata. Duplicata tem solução barata e local:
+  idempotência no consumidor por `end_to_end_id` — o `{{consumer}}` já recebe essa chave.
+
+  Com {{tps}} TPS no pico e SLA de liquidação em 10s, a latência do caminho crítico é requisito. Outbox mantém **uma
+  transação local**: a mesma que grava em `pix_transactions` grava a linha na `outbox`. Publicar depois, fora do request,
+  não atrasa o cliente. 2PC adiciona pelo menos dois round-trips de coordenação por transação e mantém locks abertos
+  durante o prepare, no `core-db` que já sustenta cartão e ledger.
+
+  ### O pior modo de falha de cada opção
+  - **Outbox:** o relay para. Consequência: atraso na publicação, medido pelo lag da tabela; nada se perde, nada fica
+    travado, e a recuperação é retomar o relay. Alerta em "linha mais antiga não publicada > 60s".
+  - **2PC:** o coordenador cai entre prepare e commit. Consequência: transações **in-doubt** segurando locks no core-db
+    até alguém resolver manualmente. Com uma squad de {{teamSize}} pessoas, isso é uma classe nova de incidente às 3 da manhã.
+
+  ### O que se perde com o outbox, assumido conscientemente
+  - **Entrega ao menos uma vez:** o consumidor precisa ser idempotente. É trabalho real, mas local e testável.
+  - **Ordem:** garantida por chave (particionar por `account_id`), não globalmente.
+  - **Mais uma peça:** tabela `outbox` + relay (poller com `FOR UPDATE SKIP LOCKED`, ou CDC via Debezium quando o volume
+    justificar), com monitoramento de lag e política de limpeza das linhas publicadas.
+
+  ### Quando a resposta seria outra
+  Se os dois participantes fossem bancos relacionais com XA maduro, o volume fosse baixo e a operação já tivesse
+  coordenador transacional em produção, 2PC seria defensável. Com Kafka como participante — que não é XA de primeira
+  classe — e {{tps}} TPS, não é.
+scenario:
+  kind: none
+recommendation:
+  default: outbox
+  rules: []

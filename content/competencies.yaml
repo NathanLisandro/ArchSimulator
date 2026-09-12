@@ -1,0 +1,46 @@
+# Taxonomia de competências, derivada do currículo do MBA em Arquitetura Full Cycle.
+# Templates declaram `competencies: [...]`; flashcards e progresso agregam por competência.
+modules:
+  - id: ai-era
+    name: "Arquitetura na era da IA"
+    competencies:
+      - { id: rag, name: "RAG e bancos vetoriais" }
+      - { id: llm-cost, name: "Custo e caching de tokens" }
+      - { id: llm-security, name: "Segurança em apps com LLM" }
+  - id: solution-architecture
+    name: "Arquitetura de Soluções"
+    competencies:
+      - { id: system-design, name: "System Design e Design Docs (C4, SAD)" }
+      - { id: databases, name: "Bancos de dados: ACID, isolamento, índices, internals" }
+      - { id: nosql, name: "NoSQL: documento, key-value, Redis" }
+      - { id: kafka, name: "Kafka: partições, consumer groups, idempotência, schema registry" }
+      - { id: cloud, name: "Cloud: VPC, AZ, spot, serverless, custo" }
+      - { id: edge, name: "Edge: CDN, WAF, cache na borda" }
+      - { id: security, name: "Segurança em aplicações enterprise" }
+  - id: software-architecture
+    name: "Arquitetura de Software"
+    competencies:
+      - { id: characteristics, name: "Características arquiteturais e trade-offs" }
+      - { id: caching, name: "Caching e invalidação" }
+      - { id: concurrency, name: "Concorrência, stateless vs stateful" }
+      - { id: adr, name: "ADRs e comunicação de decisões" }
+      - { id: ddd, name: "DDD: subdomínios, bounded contexts, agregados, context mapping" }
+      - { id: solid, name: "SOLID e padrões de projeto" }
+      - { id: clean-arch, name: "Hexagonal e Clean Architecture" }
+      - { id: microservices, name: "Microserviços e comunicação" }
+      - { id: eda, name: "Event-driven: eventos, saga, CQRS, event sourcing, outbox" }
+      - { id: legacy, name: "Modernização de legado" }
+  - id: devops-sre
+    name: "DevOps e SRE"
+    competencies:
+      - { id: kubernetes, name: "Containers e Kubernetes" }
+      - { id: sre, name: "SRE: SLO, error budget, MTTD/MTTR/MTBF" }
+      - { id: iac, name: "Infra as Code" }
+      - { id: observability, name: "Observabilidade: logs, métricas, traces, OTel" }
+      - { id: incident, name: "Resposta a incidentes e post-mortem" }
+      - { id: capacity, name: "Capacity planning e performance" }
+  - id: soft-skills
+    name: "Soft Skills"
+    competencies:
+      - { id: communication, name: "Comunicação com stakeholders" }
+      - { id: leadership, name: "Liderança técnica" }

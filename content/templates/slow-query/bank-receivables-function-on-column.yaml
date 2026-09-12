@@ -1,0 +1,243 @@
+id: bank-slow-query-receivables-function
+type: SLOW_QUERY
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [databases, observability]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [3500, 9000], step: 100 }
+  sinceHoursAgo: { range: [3, 12] }
+  merchants: { range: [180000, 420000], step: 10000 }
+  author: { choice: ["squad Recebíveis", "squad Crédito", "um freelancer da consultoria de dados"] }
+derived:
+  p99Before: "round(p99 / 30)"
+  rowsPerDay: "round(merchants * 3.4)"
+narrative:
+  title: "Agenda de recebíveis: consulta do lojista em {{p99}}ms"
+  symptom: |
+    Desde {{sinceLabel}} o endpoint `GET /receivables/schedule?merchant={id}&from=&to=` do **receivables-api** está em
+    **{{p99}}ms no p99** (baseline ~{{p99Before}}ms). O produto de antecipação depende dessa consulta para calcular
+    o valor antecipável, e a taxa de conversão da tela de antecipação caiu 35% na última hora.
+
+    Houve um deploy do receivables-api às {{sinceLabel}} (release 2026.37.2, {{author}}) com a descrição
+    "ajuste no filtro de data da agenda para considerar o fuso do lojista".
+  businessContext: |
+    `receivables_schedule` tem 310 milhões de linhas ({{merchants|number}} lojistas, ~{{rowsPerDay|number}} linhas novas por dia).
+    A antecipação responde por 22% da receita; cada minuto da tela lenta custa dinheiro de verdade.
+  hints:
+    - "O que mudou no deploy? Compare a query antes e depois em pg_stat_statements."
+    - "Função aplicada sobre a coluna indexada (ex.: DATE(settlement_date), timezone) impede o uso do índice."
+checkpoints:
+  - id: what-changed
+    question: "Latência subiu junto com um deploy. O que você faz primeiro?"
+    options:
+      - id: diff-queries
+        label: "Comparar as queries do receivables-api em pg_stat_statements antes/depois do deploy"
+        verdict: GOOD
+        feedback: "Certo: quando há uma mudança correlacionada no tempo, o diff é o caminho mais curto. Uma query nova aparece com mean_exec_time de {{p99}}ms; a antiga, com ~{{p99Before}}ms, parou de ser chamada."
+      - id: rollback-now
+        label: "Rollback imediato do deploy e investigar depois"
+        verdict: RISKY
+        feedback: "Rollback é uma mitigação legítima quando o impacto é alto — e aqui é (conversão −35%). Mas faça com a evidência mínima: confirme em 2 minutos, via pg_stat_statements, que a query nova é a lenta, para não reverter uma release que corrigia o bug de fuso e ainda ficar sem diagnóstico."
+      - id: add-replicas
+        label: "Adicionar réplicas de leitura para absorver a carga"
+        verdict: BAD
+        feedback: "A réplica executa o mesmo plano: uma query que faz Seq Scan em 310 milhões de linhas continua custando {{p99}}ms em qualquer nó. Escalar antes de diagnosticar só multiplica o custo."
+  - id: plan-reading
+    question: "O EXPLAIN mostra Seq Scan em receivables_schedule com `Filter: (date(settlement_date AT TIME ZONE ...) >= ...)`. O que isso indica?"
+    options:
+      - id: non-sargable
+        label: "A função sobre a coluna torna o predicado não-sargável: o índice idx_recv_merchant_date não pode ser usado para o range"
+        verdict: GOOD
+        feedback: "Exato. O planner não consegue usar um índice b-tree sobre settlement_date quando o predicado compara uma função do valor. Reescrever o predicado para `settlement_date >= $from AND settlement_date < $to + 1` (com o ajuste de fuso aplicado ao parâmetro, não à coluna) devolve o Index Scan."
+      - id: need-index-on-date
+        label: "Falta um índice em settlement_date"
+        verdict: BAD
+        feedback: "O índice existe (idx_recv_settlement_date e idx_recv_merchant_date). O problema é que a função aplicada na coluna impede o uso de qualquer índice b-tree sobre ela. Um índice novo em 310 milhões de linhas não mudaria nada."
+      - id: stats-stale
+        label: "As estatísticas da tabela estão desatualizadas; rodar ANALYZE"
+        verdict: RISKY
+        feedback: "ANALYZE não custa nada e vale rodar, mas o plano não muda: com função sobre a coluna o índice é inutilizável independentemente das estatísticas. Foque no predicado."
+solutionPaths:
+  - id: sargable-rewrite
+    name: "Reescrever o predicado para ser sargável"
+    summary: "Aplicar a conversão de fuso ao parâmetro e comparar a coluna crua com um intervalo semiaberto."
+    pros: ["Corrige a causa raiz", "Deploy pequeno", "Mantém a correção de fuso"]
+    cons: ["Exige teste de borda (meia-noite, horário de verão)", "Precisa de review de quem escreveu a versão anterior"]
+    bestWhen: "a função pode ser movida da coluna para o parâmetro sem mudar a semântica — como aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "A causa raiz é o predicado não-sargável (função/timezone aplicada sobre settlement_date) introduzido na release 2026.37.2."
+          present: "Causa raiz correta: predicado não-sargável."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+            - { type: investigation, kind: EXPLAIN, target: receivables_schedule }
+          missing: "Comprove com pg_stat_statements (query nova vs antiga) e EXPLAIN (Seq Scan com Filter em função da coluna)."
+          present: "Evidência completa."
+        - id: rewrite
+          name: "Reescrita sargável"
+          weight: 30
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)settlement_date\\s*>=" }
+            - { type: regex, field: proposedSql, pattern: "(?is)settlement_date\\s*<" }
+          missing: "A reescrita precisa comparar `settlement_date` diretamente com um intervalo (>= from AND < to), aplicando fuso ao parâmetro."
+          present: "Predicado reescrito como intervalo sargável."
+        - id: rollout
+          name: "Rollout e validação"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [explain, index scan, p99, validar, teste], min: 1 }
+            - { type: keyword, field: explanation, anyOf: [rollback, feature flag, canário, canary, mitigação], min: 1 }
+          missing: "Descreva a mitigação imediata (rollback/flag) e como valida (EXPLAIN com Index Scan, p99 de volta a ~{{p99Before}}ms)."
+          present: "Rollout seguro e validação descritos."
+  - id: expression-index
+    name: "Índice de expressão"
+    summary: "Criar um índice sobre a mesma expressão usada no predicado (ex.: date(settlement_date AT TIME ZONE 'America/Sao_Paulo'))."
+    pros: ["Não muda a query", "Funciona quando a semântica exige a expressão"]
+    cons: ["Índice extra de ~7 GB em 310 milhões de linhas", "Expressão precisa ser IMMUTABLE (timezone não é)", "Acopla o índice a um detalhe da query"]
+    bestWhen: "a expressão é imutável e usada por várias queries — o que não vale para conversão de fuso"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "A causa raiz é o predicado não-sargável."
+          present: "Causa raiz correta."
+        - id: immutability
+          name: "Viabilidade da expressão"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [immutable, imutável, imutavel, timezone, fuso], min: 1 }
+          missing: "Índice de expressão exige função IMMUTABLE; `AT TIME ZONE` com fuso nomeado não é. Você precisaria fixar o offset ou mudar a abordagem."
+          present: "Restrição de imutabilidade considerada."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: EXPLAIN, target: receivables_schedule }
+          missing: "Falta o EXPLAIN comprovando o Seq Scan."
+          present: "EXPLAIN coletado."
+        - id: ddl
+          name: "DDL do índice"
+          weight: 20
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)create\\s+index.*concurrently.*receivables_schedule" }
+          missing: "O índice precisa ser criado com CONCURRENTLY em receivables_schedule."
+          present: "DDL correta."
+  - id: rollback-and-fix
+    name: "Rollback + correção na próxima release"
+    summary: "Reverter a release 2026.37.2 imediatamente e corrigir o filtro de fuso com predicado sargável em seguida."
+    pros: ["Recupera a conversão em minutos", "Baixo risco"]
+    cons: ["Reintroduz o bug de fuso que a release corrigia", "Precisa de disciplina para não virar 'rollback e esquece'"]
+    bestWhen: "o impacto de negócio é alto e o bug corrigido pela release é menos grave que a latência — como aqui, desde que o fix venha em seguida"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "Rollback sem causa raiz vira repetição: a causa é o predicado não-sargável."
+          present: "Causa raiz correta."
+        - id: evidence
+          name: "Evidência mínima antes do rollback"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+          missing: "Confirme em pg_stat_statements que a query nova é a lenta antes de reverter."
+          present: "Rollback baseado em evidência."
+        - id: fix-plan
+          name: "Plano de correção"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [sargável, sargavel, intervalo, parâmetro, parametro, ">="], min: 1 }
+          missing: "Descreva a correção definitiva: mover a conversão de fuso para o parâmetro e comparar a coluna com intervalo."
+          present: "Correção definitiva planejada."
+        - id: communication
+          name: "Comunicação"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [comunicar, produto, stakeholder, aviso, status], min: 1 }
+          missing: "Rollback reintroduz o bug de fuso: avise produto/suporte e registre o trade-off."
+          present: "Trade-off comunicado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: NON_SARGABLE_PREDICATE, label: "Predicado não-sargável (função sobre coluna indexada)" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: STALE_STATS, label: "Estatísticas desatualizadas" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+        - { value: POOL_EXHAUSTION, label: "Pool de conexões esgotado" }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: sargable-rewrite, label: "Reescrever o predicado (sargável)" }
+        - { value: expression-index, label: "Índice de expressão" }
+        - { value: rollback-and-fix, label: "Rollback + fix na próxima release" }
+    - id: proposedSql
+      label: "Query/DDL proposta"
+      type: SQL
+      required: false
+    - id: explanation
+      label: "Diagnóstico, correção, rollout e validação"
+      type: MARKDOWN
+      required: true
+reference: |
+  ## Diagnóstico
+  Latência do receivables-api subiu para {{p99}}ms exatamente no deploy 2026.37.2 ({{sinceLabel}}). Em `pg_stat_statements`
+  há uma query nova com `date(settlement_date AT TIME ZONE 'America/Sao_Paulo') >= $2` e mean_exec_time ≈ {{p99}}ms; a versão
+  anterior (`settlement_date >= $2`) parou de ser chamada. `EXPLAIN` mostra Seq Scan em `receivables_schedule` com o
+  filtro em função da coluna: predicado não-sargável, índice `idx_recv_merchant_date` ignorado.
+
+  ## Correção
+  ```sql
+  SELECT ... FROM receivables_schedule r
+   WHERE r.merchant_account_id = $1
+     AND r.settlement_date >= ($2::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date
+     AND r.settlement_date <  ($3::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date + 1
+  ```
+  A conversão de fuso vai para o parâmetro; a coluna é comparada crua com intervalo semiaberto → Index Scan em
+  `idx_recv_merchant_date`.
+
+  ## Rollout
+  Mitigação imediata: rollback (ou flag desligando o novo filtro) — o bug de fuso é menos grave que 35% de queda na conversão.
+  Fix em hotfix com teste de borda (meia-noite, mudança de horário) e canário de 10%.
+
+  ## Validação
+  EXPLAIN com `Index Scan using idx_recv_merchant_date`; p99 de volta a ~{{p99Before}}ms; conversão da tela recuperada.
+
+  ## Prevenção
+  Checklist de review: "função sobre coluna em WHERE?"; `auto_explain` com `log_min_duration = 500ms` em staging com dados
+  realistas; teste de performance no CI para as 10 queries mais caras.
+scenario:
+  kind: slow-query
+  params:
+    service: receivables-api
+    endpoint: "GET /receivables/schedule"
+    table: receivables_schedule
+    slowSql: "SELECT r.id, r.settlement_date, r.arrangement, r.gross_cents, r.net_cents, r.status FROM receivables_schedule r WHERE r.merchant_account_id = $1 AND date(r.settlement_date AT TIME ZONE 'America/Sao_Paulo') >= $2 AND date(r.settlement_date AT TIME ZONE 'America/Sao_Paulo') <= $3 ORDER BY r.settlement_date"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    datastore: core-db
+recommendation:
+  default: sargable-rewrite
+  rules:
+    - { param: p99, op: ">=", value: 7500, path: rollback-and-fix, reason: "com p99 em {{p99}}ms e conversão da antecipação caindo 35%, reverter em minutos vale mais do que esperar o hotfix; a reescrita sargável vem logo depois" }

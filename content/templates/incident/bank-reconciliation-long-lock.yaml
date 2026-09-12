@@ -1,0 +1,345 @@
+id: bank-incident-reconciliation-long-lock
+type: INCIDENT
+company: banco-digital
+levels: [SENIOR, STAFF]
+competencies: [incident, databases, concurrency, sre, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [2500, 7500], step: 250 }
+  onsetMinutesAgo: { range: [25, 55], step: 5 }
+  batchMinutesAgo: { range: [70, 120], step: 10 }
+  merchantsAffected: { range: [38000, 210000], step: 1000 }
+  cause:
+    group:
+      - { batchChange: "o volume da CIP dobrou depois que o banco passou a operar como subadquirente, e o job ainda faz UPDATE linha a linha dentro de uma única transação", batchTicket: "CONC-311" }
+      - { batchChange: "alguém aumentou o chunk do Spring Batch de 500 para 50.000 para 'acelerar a conciliação', transformando cada commit em uma transação gigante", batchTicket: "CONC-402" }
+      - { batchChange: "uma reprocessamento manual de D-3 foi disparado por engano junto com o batch do dia, dobrando o tempo da transação", batchTicket: "CONC-377" }
+derived:
+  p99Before: "round(p99 / 18)"
+  batchOverrunMinutes: "round(batchMinutesAgo / 2)"
+narrative:
+  title: "Escritas travadas: conciliação D+1 segurando o ledger há {{batchOverrunMinutes}} minutos"
+  symptom: |
+    **{{onsetLabel}}** — o `receivables-api` começou a devolver erro em `POST /receivables/anticipate` e o p99 das
+    **escritas** do `account-api` está em **{{p99}}ms** (baseline ~{{p99Before}}ms). As **leituras** continuam normais.
+
+    O batch de conciliação D+1 (`reconciliation-batch`), que deveria terminar às 04:30, começou às {{batchLabel}} e
+    **ainda está rodando**. {{merchantsAffected|number}} lojistas estão com a agenda de recebíveis desatualizada e não
+    conseguem antecipar.
+
+    Nenhum deploy do account-api ou do receivables-api na janela.
+  businessContext: |
+    A antecipação de recebíveis é 22% da receita e concentra volume nas primeiras horas do dia. A conciliação da CIP é
+    obrigatória: divergência não resolvida em D+1 vira apontamento de auditoria do BCB. `ledger_entries` tem 2,1 bi de
+    linhas e `reconciliation_items`, 480 milhões.
+  hints:
+    - "Leitura normal e escrita lenta é assinatura de contenção, não de falta de índice."
+    - "`pg_stat_activity` mostra o estado e o wait_event de cada sessão; `pg_locks`, quem espera quem."
+    - "Uma sessão em 'idle in transaction' há muito tempo costuma ser a raiz."
+checkpoints:
+  - id: read-vs-write
+    question: "As leituras estão normais e as escritas, em {{p99}}ms. O que isso sugere?"
+    options:
+      - id: contention
+        label: "Contenção: alguma transação está segurando lock nas linhas/tabela que as escritas precisam"
+        verdict: GOOD
+        feedback: "Certo. Falta de índice ou scan degradariam também as leituras. A assimetria leitura/escrita aponta para lock — vá para pg_stat_activity e pg_locks."
+      - id: missing-index
+        label: "Índice ausente em ledger_entries"
+        verdict: BAD
+        feedback: "Índice ausente atingiria as leituras primeiro, e elas estão normais em ~{{p99Before}}ms. Aqui o sintoma é só na escrita: procure contenção."
+      - id: disk-full
+        label: "Disco do RDS cheio"
+        verdict: RISKY
+        feedback: "Vale uma olhada rápida no armazenamento, mas disco cheio derrubaria tudo, não só escritas. O padrão é de espera, não de falha."
+  - id: find-the-holder
+    question: "Você abriu `pg_stat_activity`. Qual linha interessa?"
+    options:
+      - id: idle-in-transaction
+        label: "A sessão do reconciliation-batch em 'idle in transaction' há mais de uma hora"
+        verdict: GOOD
+        feedback: "Essa é a raiz: uma transação aberta há {{batchOverrunMinutes}} minutos segurando locks em reconciliation_items e ledger_entries. Todas as escritas que tocam essas linhas ficam na fila."
+      - id: many-active
+        label: "As dezenas de sessões 'active' esperando, que são a maioria"
+        verdict: RISKY
+        feedback: "Elas são as vítimas, não a causa: todas com wait_event Lock. Ordene por duração e procure quem não está esperando — a sessão que segura o lock."
+      - id: idle
+        label: "As sessões 'idle', que estão ocupando conexões à toa"
+        verdict: BAD
+        feedback: "Sessões 'idle' não seguram lock, apenas conexões. Matá-las libera pool sem destravar nada e você continua com as escritas em {{p99}}ms."
+  - id: kill-or-wait
+    question: "Você identificou a transação do batch. Matar a sessão agora?"
+    options:
+      - id: assess-first
+        label: "Antes, verificar o que o batch já gravou e se ele é idempotente/reiniciável"
+        verdict: GOOD
+        feedback: "Sim. Matar a sessão faz rollback de tudo que a transação escreveu — pode significar reprocessar a conciliação inteira. Confirme que o job reinicia do ponto certo antes de puxar o gatilho."
+      - id: kill-now
+        label: "Matar imediatamente: escrita travada é pior que conciliação atrasada"
+        verdict: RISKY
+        feedback: "A urgência é real, e destravar é defensável. Mas o rollback de uma transação de {{batchOverrunMinutes}} minutos leva tempo e pode atrasar ainda mais a conciliação obrigatória do BCB. Decida com o dono do batch, não sozinho — e comunique."
+      - id: wait
+        label: "Esperar o batch terminar sozinho"
+        verdict: BAD
+        feedback: "Com {{merchantsAffected|number}} lojistas sem antecipar e escritas em {{p99}}ms, esperar sem prazo definido é deixar o incidente correr. Se for esperar, defina um limite e comunique."
+mitigations:
+  - id: kill-batch-session
+    label: "Encerrar a transação do reconciliation-batch (pg_terminate_backend)"
+    description: "Derruba a sessão que segura os locks; o batch faz rollback e precisa ser reiniciado"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "Locks liberados: as escritas voltam a ~{{p99Before}}ms em segundos e a antecipação volta a funcionar. O batch fez rollback e precisa ser reiniciado com chunk menor — registre isso nas ações do post-mortem."
+    feedbackWhenBlind: "Destravou, mas você derrubou uma transação de {{batchOverrunMinutes}} minutos sem verificar o que ela já tinha gravado nem se o job é reiniciável. Deu certo desta vez; em um batch não idempotente isso vira um segundo incidente, de dados."
+  - id: lock-timeout
+    label: "Definir lock_timeout de 3s nas sessões dos serviços online"
+    description: "Faz as escritas falharem rápido em vez de esperar"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Troca espera por erro rápido: o pool para de encher e o serviço deixa de arrastar todo mundo, mas a antecipação continua falhando — agora com 500 em vez de timeout. É contenção de dano, não solução."
+  - id: scale-db
+    label: "Escalar o RDS (db.r6g.8xlarge para 16xlarge)"
+    description: "Failover Multi-AZ com ~90s de indisponibilidade"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Lock não é falta de CPU: a transação continuaria segurando as mesmas linhas na instância maior. E o failover derruba todas as conexões por ~90s, incluindo PIX e cartão, no meio do incidente."
+  - id: restart-receivables
+    label: "Reiniciar os pods do receivables-api"
+    description: "Rollout restart"
+    verdict: BAD
+    effect: NONE
+    feedback: "Os pods não são o problema: eles estão esperando o banco. Depois do restart as requisições voltam a esperar o mesmo lock."
+  - id: pause-anticipation
+    label: "Desligar a antecipação por feature flag e avisar os lojistas"
+    description: "Bloqueia o fluxo que mais sofre, com mensagem explícita no app"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Reduz a fila de escritas e evita erro sem explicação para {{merchantsAffected|number}} lojistas. Bom como contenção enquanto se decide sobre o batch, desde que comunicado."
+stakeholders:
+  - id: cfo
+    from: "Helena (CFO)"
+    afterSeconds: 300
+    text: "A antecipação está parada? Isso é receita do dia. Preciso saber se comunico os grandes lojistas."
+  - id: compliance
+    from: "Diego (Compliance)"
+    afterSeconds: 720
+    text: "A conciliação D+1 é obrigatória. Se o batch não fechar hoje, temos apontamento. Qual o plano?"
+  - id: batch-owner
+    from: "Paula (squad Conciliação)"
+    afterSeconds: 900
+    text: "Vi o alerta. O job é reiniciável a partir do último chunk confirmado, mas perde o progresso da transação atual."
+    expectsUpdate: false
+solutionPaths:
+  - id: kill-and-restart-batch
+    name: "Encerrar a transação e reiniciar o batch com chunk menor"
+    summary: "Liberar os locks agora, restabelecer escrita e antecipação, e reprocessar a conciliação em lotes curtos."
+    pros: ["Restabelece o serviço em segundos", "A conciliação ainda fecha no dia", "Ataca o padrão errado (transação gigante)"]
+    cons: ["Perde o progresso da transação atual", "Exige que o batch seja reiniciável"]
+    bestWhen: "o batch é reiniciável e o impacto online é maior que o custo de reprocessar — o caso aqui, confirmado pelo dono do job"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [LONG_LOCK] }
+          missing: "A causa raiz é a transação longa do reconciliation-batch segurando locks: {{batchChange}} ({{batchTicket}})."
+          present: "Causa raiz correta: lock de transação longa."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_activity }
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Mostre a sessão em 'idle in transaction' no pg_stat_activity e a assimetria leitura/escrita nas métricas."
+          present: "Evidência de contenção coletada."
+        - id: safety
+          name: "Segurança antes de matar a sessão"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["idempot", "reinici", "rollback", "chunk", "checkpoint"], min: 1 }
+          missing: "Antes de encerrar uma transação de {{batchOverrunMinutes}} minutos é preciso saber o que ela gravou e se o job reinicia do ponto certo."
+          present: "Risco do rollback avaliado antes da ação."
+        - id: mitigation
+          name: "Mitigação aplicada"
+          weight: 15
+          evidence:
+            - { type: mitigation, id: kill-batch-session, informed: true }
+          missing: "Faltou aplicar a ação que de fato libera os locks, depois de investigar."
+          present: "Locks liberados com diagnóstico."
+        - id: communication
+          name: "Comunicação"
+          weight: 10
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 600 }
+          missing: "CFO e Compliance cobraram posição: pelo menos dois status updates, o primeiro em até 10 minutos."
+          present: "Stakeholders informados."
+        - id: postmortem
+          name: "Post-mortem e ações estruturais"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+            - { type: keyword, field: postMortem, anyOf: ["chunk", "lote", "transação curta", "transacao curta", "janela de batch", "statement_timeout", "idle_in_transaction_session_timeout"], min: 1 }
+          missing: "As ações precisam atacar o padrão: commits em lotes curtos, limite de duração de transação (idle_in_transaction_session_timeout) e alarme de janela de batch estourada."
+          present: "Post-mortem com ações estruturais."
+  - id: contain-and-let-it-finish
+    name: "Conter o dano e deixar o batch terminar"
+    summary: "Aplicar lock_timeout e desligar a antecipação por flag, aceitando a degradação até o batch fechar."
+    pros: ["Não perde o progresso da conciliação", "Sem risco de dados inconsistentes"]
+    cons: ["Antecipação parada por tempo indeterminado", "Receita do dia afetada", "Depende de o batch realmente terminar"]
+    bestWhen: "o batch não é reiniciável com segurança e o prazo regulatório é mais crítico que a receita do dia"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [LONG_LOCK] }
+          missing: "A causa raiz é a transação longa do batch."
+          present: "Causa raiz correta."
+        - id: deadline
+          name: "Prazo definido"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["prazo", "limite", "até as", "ate as", "deadline", "se não terminar", "se nao terminar"], min: 1 }
+          missing: "Esperar sem prazo é deixar o incidente correr: defina o horário-limite e o que acontece se ele passar."
+          present: "Prazo e plano B definidos."
+        - id: mitigation
+          name: "Contenção aplicada"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique de fato a contenção (lock_timeout ou desligar a antecipação); descrever não basta."
+          present: "Contenção aplicada."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 480 }
+          missing: "Parar a antecipação de propósito exige comunicar CFO e lojistas rapidamente."
+          present: "Decisão comunicada."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem."
+          present: "Post-mortem estruturado."
+  - id: isolate-batch
+    name: "Isolar o batch do caminho online"
+    summary: "Mover a conciliação para a réplica/instância dedicada e escrever o resultado por fila, tirando o batch do primário."
+    pros: ["Elimina a classe inteira de incidente", "Alinhado com a dívida técnica conhecida"]
+    cons: ["Não resolve o incidente de agora", "Projeto de semanas, não de minutos"]
+    bestWhen: "como ação estrutural depois do incidente — nunca como resposta imediata"
+    rubric:
+      criteria:
+        - id: immediate
+          name: "Resposta imediata também definida"
+          weight: 35
+          evidence:
+            - { type: mitigation, effect: RESOLVES }
+          missing: "Isolar o batch é a ação certa para depois; o incidente de agora ainda precisa de uma mitigação que libere as escritas."
+          present: "Resposta imediata aplicada além da estrutural."
+        - id: design
+          name: "Desenho do isolamento"
+          weight: 30
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["réplica", "replica", "instância dedicada", "instancia dedicada", "fila", "outbox", "cdc"], min: 1 }
+          missing: "Descreva como o batch sai do primário: leitura na réplica e escrita por fila/outbox, ou instância dedicada."
+          present: "Isolamento desenhado."
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [LONG_LOCK] }
+          missing: "A causa raiz é a transação longa do batch."
+          present: "Causa raiz correta."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 15
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem."
+          present: "Post-mortem estruturado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: LONG_LOCK, label: "Transação longa do batch segurando locks" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool (causa primária)" }
+        - { value: N_PLUS_ONE, label: "N+1 em um serviço online" }
+        - { value: INFRA_CHANGE, label: "Mudança de infraestrutura" }
+    - id: lockHolder
+      label: "Quem segura o lock"
+      type: SELECT
+      required: true
+      options:
+        - { value: reconciliation-batch, label: "reconciliation-batch (idle in transaction)" }
+        - { value: account-api, label: "account-api" }
+        - { value: receivables-api, label: "receivables-api" }
+        - { value: autovacuum, label: "autovacuum" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: kill-and-restart-batch, label: "Encerrar a transação e reiniciar o batch" }
+        - { value: contain-and-let-it-finish, label: "Conter o dano e deixar o batch terminar" }
+        - { value: isolate-batch, label: "Isolar o batch do caminho online" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até a liberação dos locks: escritas do account-api em {{p99}}ms (baseline {{p99Before}}ms),
+  `POST /receivables/anticipate` falhando e {{merchantsAffected|number}} lojistas sem conseguir antecipar. Leituras
+  não afetadas — o app "abria", mas não deixava operar, o que atrasou a percepção do problema.
+
+  ## Linha do tempo
+  - **{{batchLabel}}** — `reconciliation-batch` inicia (já fora da janela 01:00–04:30).
+  - **{{onsetLabel}}** — primeiras escritas entram em espera; p99 de escrita sobe; leitura permanece normal.
+  - **+ ~6min** — alerta de latência de escrita dispara.
+  - **+ ~15min** — `pg_stat_activity` mostra a sessão do batch em `idle in transaction` há {{batchOverrunMinutes}} minutos;
+    `pg_locks` mostra dezenas de sessões em `ShareLock` esperando um `ExclusiveLock` sobre as mesmas linhas.
+  - **+ ~20min** — transação encerrada após confirmação com a squad de Conciliação; escritas normalizam em segundos.
+
+  ## Causa raiz
+  Transação longa. {{batchChange}} ({{batchTicket}}). Em PostgreSQL, uma transação aberta mantém os locks de todas as
+  linhas que tocou até o commit; com a janela estourada, isso passou a coincidir com o horário de pico do online.
+  O sintoma característico é a assimetria: leitura intacta (MVCC não bloqueia leitura), escrita na fila.
+
+  ## Ações
+  1. **Imediata:** reiniciar a conciliação com chunk de 500 e commit por chunk.
+  2. **Guarda-corpo (esta semana):** `idle_in_transaction_session_timeout` e `lock_timeout` no role do batch, e alerta quando qualquer transação passar de 5 minutos.
+  3. **Detecção (esta semana):** alarme de "janela de batch estourada" às 05:00, não só falha do job.
+  4. **Estrutural (este trimestre):** tirar a conciliação do primário — leitura na réplica, escrita por outbox/fila (dívida técnica já mapeada).
+  5. **Separação:** roles distintos por workload no core-db, com limites de conexão e de duração de transação.
+
+  Blameless: o job sempre funcionou nessa forma; o que mudou foi o volume e a janela. Faltavam guarda-corpos, não cuidado.
+scenario:
+  kind: incident
+  params:
+    rootCause: LONG_LOCK
+    service: receivables-api
+    datastore: core-db
+    endpoint: "POST /receivables/anticipate"
+    table: reconciliation_items
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    deployAt: "{{batchMinutesAgoAt}}"
+    deployService: reconciliation-batch
+    deployVersion: "batch-2026.09.12"
+    deployAuthor: "squad-conciliacao"
+    deployDescription: "início do batch de conciliação D+1 (fora da janela)"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: kill-and-restart-batch
+  rules:
+    - { param: merchantsAffected, op: ">=", value: 150000, path: kill-and-restart-batch, reason: "com {{merchantsAffected|number}} lojistas sem antecipar, o custo de reprocessar a conciliação é menor que o de manter a receita parada" }

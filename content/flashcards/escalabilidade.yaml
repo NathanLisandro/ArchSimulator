@@ -1,0 +1,88 @@
+id: escalabilidade
+name: Escalabilidade e performance
+description: Gargalos, capacity planning, hot keys, particionamento e caching sob carga.
+cards:
+  - id: latency-vs-throughput
+    front: "Qual a diferença entre **latência** e **vazão**, e por que uma piora quando a outra melhora?"
+    back: |
+      Latência é o tempo de uma requisição; vazão é quantas cabem por segundo. Batching e filas aumentam vazão e
+      **pioram** a latência individual. Perto da saturação, pela lei de Little, a fila cresce e a latência dispara sem
+      que a vazão suba: por isso o alvo de utilização fica em 60–70%, não em 95%.
+    competencies: [capacity]
+  - id: percentiles
+    front: "Por que acompanhar **p99** e não a média?"
+    back: |
+      A média esconde a cauda. Com 1% de requisições em 5s, a média mal se move, mas uma em cada cem pessoas espera 5s —
+      e quem faz dez chamadas por tela sente isso quase sempre. Alerta em p99; capacidade dimensionada pelo p99.
+    competencies: [sre, capacity]
+  - id: hot-key
+    front: "O que é **hot key** e como tratar?"
+    back: |
+      Uma chave concentra a maior parte do tráfego (SKU em lançamento, lojista gigante, tenant grande), serializando
+      escrita em uma linha ou partição. Tratamentos: decremento atômico em vez de leitura-modificação-escrita,
+      **sharding do contador** (N sub-chaves, redistribuição quando uma zera), partição dedicada e cache local com TTL curto.
+    competencies: [capacity, kafka]
+  - id: compound-growth
+    front: "Crescimento de 10% ao mês: em quantos meses o volume dobra?"
+    back: |
+      ~7,3 meses (`ln 2 / ln 1,1`). Projeção linear erra feio: em 12 meses o composto dá 3,1x, o linear daria 2,2x.
+      Capacity planning sempre com `valor × (1 + taxa)^meses`, mais os degraus previstos (migração de cliente, campanha).
+    competencies: [capacity]
+  - id: dimensions
+    front: "Quais dimensões projetar em um **capacity planning** de banco?"
+    back: |
+      Conexões, CPU, memória, IOPS (e burst balance), armazenamento e, quando houver, lag de replicação. Projete todas no
+      mesmo horizonte: o gargalo raramente é o que aparece no título do chamado, e armazenamento é o único que não se
+      resolve em janela curta.
+    competencies: [capacity, cloud]
+  - id: connection-pool
+    front: "Por que aumentar o pool de conexões costuma piorar a latência?"
+    back: |
+      O banco processa em paralelo limitado por CPU e disco. Mais conexões não criam capacidade: criam fila dentro do
+      banco, mais troca de contexto e mais memória por conexão. O caminho é pool **menor** e bem dimensionado, com
+      pooler externo (PgBouncer em transaction mode) multiplexando.
+    competencies: [databases, capacity]
+  - id: partitioning
+    front: "Quando particionar uma tabela grande?"
+    back: |
+      Quando a manutenção (VACUUM, reindex, backup) não cabe mais na janela, ou quando a maior parte das consultas filtra
+      por uma dimensão natural (data, tenant) que permite **partition pruning**. Particionar não acelera consulta que
+      varre tudo; acelera a que descarta partições e torna o descarte de dados antigos um `DROP`.
+    competencies: [databases, capacity]
+  - id: read-replica-limits
+    front: "O que uma **réplica de leitura** não resolve?"
+    back: |
+      Não resolve escrita, não resolve consulta que varre a tabela (o plano ruim é o mesmo lá) e introduz lag: leitura
+      logo após escrita pode não ver o próprio dado. Serve para distribuir leitura já eficiente e isolar relatórios.
+    competencies: [databases, capacity]
+  - id: cache-invalidation
+    front: "Quais são as estratégias de invalidação de cache e quando usar cada uma?"
+    back: |
+      - **TTL:** simples, aceita janela de dado velho. Padrão para vitrine e dados tolerantes.
+      - **Cache-aside com invalidação por evento:** correto quando existe evento confiável de mudança.
+      - **Write-through:** consistência alta, escrita mais lenta.
+      - **Write-behind:** escrita rápida, risco de perda.
+      Sempre com jitter no TTL para não expirar tudo junto.
+    competencies: [caching]
+  - id: stampede
+    front: "O que é **cache stampede** e como evitar?"
+    back: |
+      Muitas chaves expiram ao mesmo tempo (ou uma chave quente expira sob alta carga) e todas as requisições vão à
+      origem de uma vez. Defesas: TTL com jitter, **single-flight** (uma requisição recalcula, as outras esperam),
+      refresh proativo antes do vencimento e valor stale servido enquanto recalcula.
+    competencies: [caching]
+  - id: eviction
+    front: "LRU, LFU, FIFO: quando cada política de despejo faz sentido?"
+    back: |
+      **LRU** (menos usado recentemente) é o padrão seguro para acesso com localidade temporal.
+      **LFU** protege itens populares de longo prazo contra varreduras pontuais.
+      **FIFO** é previsível e barato, mas ignora popularidade. No Redis, `allkeys-lru` para cache puro;
+      `volatile-lru` quando há chaves que não podem sumir.
+    competencies: [caching]
+  - id: backpressure
+    front: "O que é **backpressure** e por que importa mais que retry?"
+    back: |
+      É o sistema sinalizar que não aguenta mais (429, fila cheia, janela de crédito) em vez de aceitar trabalho que não
+      vai conseguir fazer. Sem backpressure, filas internas crescem, a latência dispara e o retry do cliente multiplica a
+      carga — o padrão que transforma degradação em queda.
+    competencies: [characteristics, sre]

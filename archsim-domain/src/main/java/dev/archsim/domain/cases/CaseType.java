@@ -1,0 +1,3 @@
+package dev.archsim.domain.cases;
+
+public enum CaseType { SLOW_QUERY, INCIDENT, ADR, SOLUTION_DESIGN, TRADE_OFF, CODE_REVIEW, CAPACITY_PLANNING, MIGRATION }

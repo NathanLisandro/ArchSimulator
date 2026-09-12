@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: archsim
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/archsim}
+    username: ${SPRING_DATASOURCE_USERNAME:archsim}
+    password: ${SPRING_DATASOURCE_PASSWORD:archsim}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+  jackson:
+    default-property-inclusion: non_null
+server:
+  port: 8080
+  servlet:
+    session:
+      timeout: 12h
+archsim:
+  content-path: ${ARCHSIM_CONTENT_PATH:../content}

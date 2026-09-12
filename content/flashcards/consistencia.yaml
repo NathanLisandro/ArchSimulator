@@ -1,0 +1,90 @@
+id: consistencia
+name: Consistência e transações
+description: ACID, isolamento, consistência eventual, outbox, saga e idempotência.
+cards:
+  - id: acid
+    front: "O que cada letra de **ACID** garante?"
+    back: |
+      - **Atomicidade:** tudo ou nada dentro da transação.
+      - **Consistência:** as invariantes declaradas do banco continuam válidas ao fim.
+      - **Isolamento:** transações concorrentes não veem estados intermediários umas das outras (em que grau depende do nível).
+      - **Durabilidade:** o que foi confirmado sobrevive a queda do processo.
+    competencies: [databases]
+  - id: read-committed
+    front: "No PostgreSQL, o nível padrão é READ COMMITTED. O que ele **não** evita?"
+    back: |
+      Não evita **non-repeatable read** nem **phantom read**: ler a mesma linha duas vezes na mesma transação pode dar
+      resultados diferentes, e uma segunda consulta pode trazer linhas novas. Evita apenas dirty read.
+      Para consistência de leitura dentro da transação, use REPEATABLE READ; para invariantes entre linhas, SERIALIZABLE.
+    competencies: [databases]
+  - id: lost-update
+    front: "Como evitar **lost update** ao decrementar um contador (estoque, saldo)?"
+    back: |
+      Não faça leitura-modificação-escrita na aplicação. Use:
+      - `UPDATE ... SET qty = qty - 1 WHERE sku = ? AND qty >= 1` (atômico no banco), ou
+      - `SELECT ... FOR UPDATE` antes de calcular, ou
+      - controle otimista com coluna de versão e retry.
+    competencies: [databases, concurrency]
+  - id: outbox-why
+    front: "Por que gravar no banco e publicar no broker em duas operações separadas é um bug?"
+    back: |
+      Não existe atomicidade entre os dois: se a publicação falhar, o evento se perde; se o commit falhar depois de
+      publicar, existe evento sem fato. O **transactional outbox** grava o evento na mesma transação do dado e um relay
+      publica depois, transformando o problema em "ao menos uma vez" + idempotência no consumidor.
+    competencies: [eda]
+  - id: outbox-vs-2pc
+    front: "Quando preferir **outbox** em vez de **2PC**?"
+    back: |
+      Quase sempre que um dos participantes for um broker. Outbox mantém uma transação local (latência preservada) e não
+      cria transações in-doubt segurando locks. 2PC só é defensável entre participantes com XA maduro, volume baixo e
+      latência não crítica — e ainda assim exige runbook para o coordenador cair entre prepare e commit.
+    competencies: [eda, microservices]
+  - id: saga
+    front: "O que é uma **saga** e qual o preço dela?"
+    back: |
+      Uma sequência de transações locais em serviços diferentes, com **compensação** para desfazer os passos já feitos
+      quando um falha. O preço: não há isolamento — estados intermediários ficam visíveis — e a compensação é lógica de
+      negócio (estorno, cancelamento com aviso), não um rollback técnico.
+    competencies: [eda, microservices]
+  - id: orchestration-vs-choreography
+    front: "Orquestração ou coreografia em uma saga?"
+    back: |
+      **Orquestração:** um serviço coordena e conhece o fluxo. Mais fácil de entender, depurar e alterar; acopla no coordenador.
+      **Coreografia:** cada serviço reage a eventos. Baixo acoplamento; o fluxo completo não existe em lugar nenhum, o que
+      dificulta diagnóstico. Regra prática: coreografia para 2 a 3 passos, orquestração a partir daí.
+    competencies: [eda]
+  - id: idempotency-key
+    front: "Como tornar um endpoint de escrita idempotente?"
+    back: |
+      Chave de idempotência **gerada pelo cliente** por tentativa lógica, persistida com restrição de unicidade junto do
+      resultado. A segunda requisição com a mesma chave devolve o mesmo resultado, sem novo efeito colateral.
+      Não use janela de tempo nem bloqueio no frontend: retry chega depois da janela e o frontend não é fronteira de confiança.
+    competencies: [microservices, eda]
+  - id: exactly-once
+    front: "Existe **exactly-once** de verdade entre sistemas?"
+    back: |
+      Não fim a fim. O que existe é **entrega ao menos uma vez + processamento idempotente**, que produz o efeito
+      observável de exactly-once. As "transações do Kafka" garantem atomicidade dentro do Kafka (consome-processa-produz),
+      não entre Kafka e um banco externo.
+    competencies: [eda]
+  - id: eventual-window
+    front: "O que precisa estar escrito ao assumir **consistência eventual**?"
+    back: |
+      1. A **janela** típica e o pior caso. 2. O que o usuário vê durante a janela (rótulo "atualizando", horário do dado).
+      3. Quem vence quando as fontes divergem. 4. Como a divergência é detectada e corrigida (job de reconciliação com alerta).
+      Consistência eventual sem essas quatro respostas é só ausência de decisão.
+    competencies: [eda, characteristics]
+  - id: cdc-vs-outbox
+    front: "CDC ou outbox por polling?"
+    back: |
+      **Outbox com polling:** simples, sem infraestrutura extra, latência de segundos, e você controla o formato do evento.
+      **CDC (Debezium):** lê o WAL, latência menor e sem carga de leitura na tabela, mas acopla o evento ao schema físico
+      e adiciona um componente com operação própria. Comece por polling; migre para CDC quando o volume justificar.
+    competencies: [eda, databases]
+  - id: dual-write
+    front: "Por que **dual write** é um antipadrão?"
+    back: |
+      Escrever nos dois destinos direto da aplicação não tem atomicidade nem ordem garantida: qualquer falha parcial deixa
+      os dois divergentes, e a divergência só aparece depois, em conciliação. Use uma fonte da verdade e derive a outra
+      (outbox, CDC, projeção).
+    competencies: [eda]

@@ -1,0 +1,299 @@
+id: bank-slow-query-statement-index
+type: SLOW_QUERY
+company: banco-digital
+levels: [JUNIOR, PLENO, SENIOR]
+competencies: [databases, observability, capacity]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [2800, 6400], step: 100 }
+  sinceHoursAgo: { range: [5, 19] }
+  windowDays: { choice: ["30", "60", "90"] }
+  droppedBy:
+    group:
+    - { droppedBy: "uma migration da squad de contas que 'limpou índices não usados' com base em um relatório de 3 dias", ticket: "CONTAS-4127" }
+    - { droppedBy: "um script de manutenção rodado pelo DBA para reduzir bloat, que recriou o índice com nome novo e falhou na segunda etapa", ticket: "DBA-882" }
+    - { droppedBy: "uma migration do Flyway que substituiu o índice por uma versão parcial (WHERE type = 'PIX') sem avisar os consumidores", ticket: "CONTAS-4190" }
+derived:
+  p99Before: "round(p99 / 24)"
+  callsPerMinute: "round(p99 / 9)"
+narrative:
+  title: "Extrato da conta em {{p99}}ms no p99 desde {{sinceLabel}}"
+  symptom: |
+    O alerta **HighLatencyP99 / account-api** disparou às {{sinceLabel}} e não voltou. O endpoint
+    `GET /accounts/{id}/statement?days={{windowDays}}` está em **{{p99}}ms no p99** (baseline histórico: ~{{p99Before}}ms).
+    O app mostra o extrato com spinner e o time de suporte já abriu 40 tickets de "extrato não carrega".
+
+    Nada foi deployado no account-api hoje. O squad de Pagamentos diz que o PIX está normal.
+    Você tem acesso ao console de métricas e ao console SQL somente-leitura do `core-db`.
+  businessContext: |
+    O extrato é a tela mais acessada do app ({{callsPerMinute}} req/min no pico). O SLO do account-api é p99 < 500ms.
+    A tabela `ledger_entries` tem 2,1 bilhões de linhas e qualquer índice novo leva ~6h para construir em produção.
+  hints:
+    - "Compare a latência entre serviços antes de descer ao banco."
+    - "`pg_stat_statements` ordenado por `mean_exec_time` mostra o que mudou de custo."
+    - "Um `EXPLAIN` da query do extrato revela se ela ainda usa o índice esperado."
+checkpoints:
+  - id: first-tool
+    question: "O alerta acabou de chegar. Qual é o seu primeiro passo?"
+    options:
+      - id: metrics-by-service
+        label: "Abrir as métricas por serviço para ver se a degradação é só no account-api"
+        verdict: GOOD
+        feedback: "Boa escolha: isolar o escopo antes de descer ao detalhe. O p99 saltou para {{p99}}ms só no account-api enquanto o pix-api, que usa o mesmo core-db, segue normal — isso já descarta 'o banco inteiro está lento'."
+      - id: db-logs
+        label: "Ir direto para os logs do banco procurar erros"
+        verdict: RISKY
+        feedback: "Parece que você está indo direto para os logs do banco. Não há erros aqui: o sintoma é latência, não falha. Com o core-db servindo 8 serviços, comece pela métrica por serviço para isolar quem degradou — só o account-api subiu para {{p99}}ms."
+      - id: restart-pods
+        label: "Reiniciar os pods do account-api para 'limpar' o pool de conexões"
+        verdict: BAD
+        feedback: "Reiniciar pods sem diagnóstico tende a dar problema aqui: o p99 de {{p99}}ms vem do custo da query no banco, não de estado nos pods. O restart derruba as conexões ativas, dobra o trabalho do core-db durante o warm-up e destrói a evidência. Prefira olhar métricas por serviço e depois `pg_stat_statements`."
+      - id: rollback
+        label: "Fazer rollback do último deploy do account-api"
+        verdict: BAD
+        feedback: "Não houve deploy do account-api hoje. Rollback cego aqui só gera mais uma mudança no meio do incidente. Comece pela linha do tempo do que mudou (deploys, migrations, jobs de DBA) e pela métrica por serviço."
+  - id: suspect
+    question: "As métricas mostram latência só no account-api, com CPU e IOPS de leitura do core-db subindo desde {{sinceLabel}}. O que você investiga agora?"
+    options:
+      - id: stat-statements
+        label: "Consultar pg_stat_statements ordenado por tempo médio para achar a query que mudou de custo"
+        verdict: GOOD
+        feedback: "Exato. IOPS de leitura subindo com CPU do banco é assinatura de scan em tabela grande. `pg_stat_statements` vai apontar a query do extrato com mean_exec_time na casa de {{p99}}ms."
+      - id: pool-size
+        label: "Aumentar o pool de conexões do account-api, porque o pool está saturado"
+        verdict: BAD
+        feedback: "O pool saturado é consequência, não causa: cada request segura a conexão por {{p99}}ms. Mais conexões só empurram mais scans para o core-db, que já está com CPU alta. Encontre a query primeiro."
+      - id: scale-db
+        label: "Escalar verticalmente o RDS (db.r6g.8xlarge → 16xlarge)"
+        verdict: BAD
+        feedback: "Escalar o RDS custa uma janela de failover (Multi-AZ, ~60–120s de indisponibilidade) e o dobro do custo por hora, para mascarar um problema que hoje está em uma query. Diagnostique antes."
+      - id: pg-locks
+        label: "Verificar pg_locks procurando locks longos"
+        verdict: RISKY
+        feedback: "Vale um olhar rápido, mas o padrão aqui (IOPS de leitura + CPU) não é o de contenção por lock — seria wait_event Lock e IOPS estáveis. Não gaste muito tempo aqui; vá para pg_stat_statements."
+  - id: fix-strategy
+    question: "Você achou a query do extrato fazendo Seq Scan em ledger_entries (2,1 bi de linhas). Qual estratégia adota para o fix?"
+    options:
+      - id: recreate-concurrently
+        label: "Recriar o índice (account_id, created_at) com CREATE INDEX CONCURRENTLY e, enquanto isso, mitigar"
+        verdict: GOOD
+        feedback: "Sim. CONCURRENTLY evita lock exclusivo na tabela de 2,1 bi de linhas; leva ~6h, então a mitigação (cache/limitar janela/redirecionar para réplica) é obrigatória durante a construção."
+      - id: create-index-plain
+        label: "Rodar CREATE INDEX (sem CONCURRENTLY) agora mesmo, é mais rápido"
+        verdict: BAD
+        feedback: "CREATE INDEX sem CONCURRENTLY pega ShareLock em ledger_entries por horas: bloqueia INSERT/UPDATE do ledger — ou seja, para PIX, cartão e lançamentos do banco inteiro. Em uma tabela de 2,1 bi de linhas isso é um incidente maior que o atual."
+      - id: cache-only
+        label: "Colocar o extrato no Redis com TTL de 10 min e não mexer no índice"
+        verdict: RISKY
+        feedback: "Cache reduz o volume, mas cada miss ainda custa {{p99}}ms e um scan de 2,1 bi de linhas; usuários que acabaram de receber um PIX veriam extrato desatualizado por 10 min (SLA de consistência do extrato é segundos). Use cache como mitigação, não como fix."
+solutionPaths:
+  - id: composite-index
+    name: "Recriar o índice composto (account_id, created_at)"
+    summary: "Restaurar o índice que servia igualdade em account_id + range/ordenação em created_at, criado com CONCURRENTLY."
+    pros: ["Ataca a causa raiz", "Volta ao plano de execução original (Index Scan Backward + Limit)", "Sem mudança de código"]
+    cons: ["~6h de construção em ledger_entries", "Precisa de mitigação durante a janela", "Não reduz o custo estrutural da tabela gigante"]
+    bestWhen: "a query filtra por igualdade + intervalo/ordenação e o índice foi removido — como aqui (ticket {{ticket}})"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz identificada"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [MISSING_INDEX] }
+          missing: "A causa raiz é a ausência do índice composto (account_id, created_at) em ledger_entries, removido por {{droppedBy}}."
+          present: "Você identificou a causa raiz: índice composto removido."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: EXPLAIN, target: ledger_entries }
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Uma investigação completa cruza métricas por serviço, pg_stat_statements e o EXPLAIN da query — faltou pelo menos uma dessas evidências."
+          present: "Investigação objetiva: métricas → pg_stat_statements → EXPLAIN."
+        - id: index-definition
+          name: "Definição correta do índice"
+          weight: 25
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)create\\s+index.*ledger_entries.*\\(\\s*account_id\\s*,\\s*created_at" }
+            - { type: regex, field: proposedSql, pattern: "(?i)concurrently" }
+          missing: "O índice precisa ser (account_id, created_at) — nessa ordem: igualdade primeiro, range/ordenação depois — e criado com CONCURRENTLY."
+          present: "Índice composto na ordem certa, criado online."
+        - id: mitigation
+          name: "Mitigação durante a construção"
+          weight: 15
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [cache, réplica, replica, limitar, janela, feature flag, degradar, timeout], min: 1 }
+          missing: "Durante as ~6h de construção o extrato continua em {{p99}}ms: descreva a mitigação (cache curto, réplica de leitura, limitar a janela de dias, feature flag)."
+          present: "Mitigação definida para a janela de construção."
+        - id: validation
+          name: "Validação e prevenção"
+          weight: 15
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [explain, p99, pg_stat, validar, medir, monitorar], min: 1 }
+            - { type: keyword, field: explanation, anyOf: [migration, review, pg_stat_user_indexes, idx_scan, 30 dias, alerta], min: 1 }
+          missing: "Diga como valida (EXPLAIN com Index Scan, p99 de volta a ~{{p99Before}}ms) e como evita repetição (review de migrations que dropam índice, janela de análise de uso maior que 3 dias)."
+          present: "Validação e prevenção descritas."
+  - id: query-rewrite
+    name: "Reescrever a query para usar índices existentes"
+    summary: "Reformular o extrato para varrer por reference_id/janela menor ou usar idx_ledger_account com LIMIT reduzido enquanto o índice composto não volta."
+    pros: ["Deploy em minutos", "Sem lock no banco"]
+    cons: ["Ainda lê muito mais linhas do que o necessário para contas movimentadas", "Mudança de comportamento (janela menor)", "Não resolve a causa raiz"]
+    bestWhen: "não é possível construir índice na janela do incidente e a query aceita restrição de escopo"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz identificada"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [MISSING_INDEX] }
+          missing: "A causa raiz é a ausência do índice composto (account_id, created_at) — a reescrita é paliativo."
+          present: "Causa raiz identificada."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: EXPLAIN, target: ledger_entries }
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+          missing: "Faltou EXPLAIN da query e/ou pg_stat_statements para provar o Seq Scan."
+          present: "Seq Scan comprovado por EXPLAIN e pg_stat_statements."
+        - id: rewrite
+          name: "Reescrita usa um índice existente"
+          weight: 30
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)select.*ledger_entries.*where.*account_id" }
+            - { type: keyword, field: explanation, anyOf: [idx_ledger_account, índice existente, indice existente, limit, janela], min: 1 }
+          missing: "A reescrita precisa usar idx_ledger_account (igualdade) e reduzir a janela/LIMIT para caber no orçamento de leitura."
+          present: "Reescrita ancorada em índice existente."
+        - id: follow-up
+          name: "Plano para o fix definitivo"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [concurrently, recriar o índice, recriar índice, índice composto, indice composto], min: 1 }
+          missing: "A reescrita é ponte: registre o plano de recriar o índice composto com CONCURRENTLY."
+          present: "Fix definitivo planejado."
+  - id: cache-mitigation
+    name: "Cache do extrato + réplica de leitura"
+    summary: "Servir o extrato do Redis com TTL curto e invalidação por evento de lançamento, redirecionando misses para a réplica de leitura, enquanto o índice é reconstruído."
+    pros: ["Alivia o core-db imediatamente", "Melhora p99 do caminho quente"]
+    cons: ["Cada miss ainda custa {{p99}}ms", "Invalidação por evento é obrigatória: extrato stale após PIX é ticket na certa", "Réplica de leitura também faz o Seq Scan"]
+    bestWhen: "o volume de leituras repetidas é alto e o time consegue invalidar por evento (ledger.entries no Kafka)"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz identificada"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [MISSING_INDEX] }
+          missing: "Cache mitiga, mas a causa raiz é o índice composto removido."
+          present: "Causa raiz identificada."
+        - id: invalidation
+          name: "Invalidação e consistência"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [invalida, evento, ledger.entries, ttl], min: 2 }
+          missing: "Defina TTL e invalidação por evento (tópico ledger.entries): extrato stale depois de um PIX recebido é inaceitável."
+          present: "Invalidação por evento + TTL definidos."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 15
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: EXPLAIN, target: ledger_entries }
+          missing: "Sem EXPLAIN e métricas você não sabe se o cache resolve ou só esconde."
+          present: "Evidência coletada."
+        - id: follow-up
+          name: "Fix definitivo"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [concurrently, recriar, índice composto, indice composto], min: 1 }
+          missing: "Cache não substitui o índice: registre o plano de recriá-lo com CONCURRENTLY."
+          present: "Fix definitivo planejado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: MISSING_INDEX, label: "Índice necessário não existe (removido/nunca criado)" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+        - { value: POOL_EXHAUSTION, label: "Esgotamento do pool de conexões" }
+        - { value: BLOAT, label: "Bloat / autovacuum atrasado" }
+        - { value: BAD_PARAMETER_SNIFFING, label: "Plano ruim por parâmetro" }
+        - { value: NETWORK, label: "Latência de rede até o RDS" }
+    - id: slowQueryTable
+      label: "Tabela central da query lenta"
+      type: SELECT
+      required: true
+      options:
+        - { value: ledger_entries, label: ledger_entries }
+        - { value: accounts, label: accounts }
+        - { value: pix_transactions, label: pix_transactions }
+        - { value: receivables_schedule, label: receivables_schedule }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: composite-index, label: "Recriar índice composto (CONCURRENTLY)" }
+        - { value: query-rewrite, label: "Reescrever a query" }
+        - { value: cache-mitigation, label: "Cache + réplica de leitura" }
+    - id: proposedSql
+      label: "DDL/SQL proposto"
+      type: SQL
+      required: false
+      help: "Ex.: CREATE INDEX CONCURRENTLY ... ou a query reescrita"
+    - id: explanation
+      label: "Diagnóstico, mitigação, validação e prevenção"
+      type: MARKDOWN
+      required: true
+      help: "Use seções: ## Diagnóstico, ## Correção, ## Mitigação, ## Validação, ## Prevenção"
+reference: |
+  ## Diagnóstico
+  Métricas: p99 do account-api saltou de ~{{p99Before}}ms para {{p99}}ms às {{sinceLabel}}; pix-api e receivables-api normais;
+  core-db com CPU e read IOPS subindo desde o mesmo instante → padrão de scan em tabela grande, não de lock.
+
+  `pg_stat_statements` ordenado por `mean_exec_time`: a query do extrato
+  (`SELECT ... FROM ledger_entries e WHERE e.account_id = $1 AND e.created_at >= $2 ORDER BY e.created_at DESC LIMIT 50`)
+  passou a custar ~{{p99}}ms. `EXPLAIN` mostra **Seq Scan on ledger_entries** com `Rows Removed by Filter` na casa de bilhões:
+  o índice `idx_ledger_account_created` não existe mais em `pg_indexes` — removido por {{droppedBy}} ({{ticket}}).
+
+  ## Correção
+  ```sql
+  CREATE INDEX CONCURRENTLY idx_ledger_account_created
+      ON ledger_entries (account_id, created_at DESC);
+  ```
+  Ordem importa: igualdade (`account_id`) antes do range/ordenação (`created_at`). Com `CONCURRENTLY` não há lock exclusivo,
+  mas a construção leva ~6h em 2,1 bi de linhas e é invalidada se a transação falhar (verificar `indisvalid`).
+
+  ## Mitigação durante a construção
+  - Extrato servido do Redis com TTL de 30s e invalidação pelo evento `ledger.entries` da conta.
+  - Reduzir a janela padrão de {{windowDays}} para 7 dias com feature flag até o índice ficar válido.
+  - Rotear leituras do extrato para a réplica (`core-db-ro`) para tirar o scan do primário — a réplica também faz scan, mas protege o caminho de escrita (PIX/cartão).
+
+  ## Validação
+  `EXPLAIN` volta a mostrar `Index Scan Backward using idx_ledger_account_created`; p99 do endpoint retorna a ~{{p99Before}}ms;
+  read IOPS do core-db volta ao baseline; `pg_stat_user_indexes.idx_scan` do novo índice cresce.
+
+  ## Prevenção
+  - Migrations que dropam índice passam por review do DBA com relatório de `pg_stat_user_indexes` de **30 dias**, não 3.
+  - Alerta em `pg_stat_user_tables.seq_scan` das 5 maiores tabelas.
+  - Longo prazo: particionar `ledger_entries` por mês (dívida técnica conhecida).
+scenario:
+  kind: slow-query
+  params:
+    service: account-api
+    endpoint: "GET /accounts/{id}/statement"
+    table: ledger_entries
+    slowSql: "SELECT e.id, e.created_at, e.type, e.amount_cents, e.direction, e.description, e.balance_after_cents FROM ledger_entries e WHERE e.account_id = $1 AND e.created_at >= $2 ORDER BY e.created_at DESC LIMIT 50"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    dropIndex: idx_ledger_account_created
+    datastore: core-db
+recommendation:
+  default: composite-index
+  rules:
+    - { param: p99, op: ">=", value: 6000, path: cache-mitigation, reason: "com p99 em {{p99}}ms e ~6h de construção do índice, a mitigação por cache + réplica precisa vir primeiro; o índice continua sendo o fix definitivo" }

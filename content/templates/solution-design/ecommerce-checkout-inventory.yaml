@@ -1,0 +1,324 @@
+id: ecommerce-design-checkout-inventory
+type: SOLUTION_DESIGN
+company: ecommerce
+levels: [PLENO, SENIOR, STAFF]
+competencies: [system-design, eda, microservices, ddd, caching]
+tools: [METRICS]
+parameters:
+  peakOrdersPerMinute: { range: [1800, 9000], step: 200 }
+  skus: { range: [400000, 2400000], step: 100000 }
+  oversellCostReais: { range: [60, 480], step: 20 }
+  window:
+    group:
+      - { eventName: "Black Friday", eventNote: "o pico dura 6 horas e concentra 40% do faturamento do trimestre" }
+      - { eventName: "lançamento de console", eventNote: "o estoque é de 3.000 unidades e esgota em menos de 2 minutos" }
+      - { eventName: "campanha de cupom relâmpago", eventNote: "o tráfego multiplica por 7 em 90 segundos, sem aviso prévio" }
+derived:
+  peakOrdersPerSecond: "round(peakOrdersPerMinute / 60)"
+  oversellPerHundred: "oversellCostReais * 100"
+narrative:
+  title: "Design: reserva de estoque no checkout para a {{eventName}}"
+  symptom: |
+    Hoje o checkout chama o `inventory-service` **de forma síncrona** para reservar estoque, dentro da mesma transação
+    que cria o pedido. Na última {{eventName}} isso derrubou o checkout: o `inventory-service` ficou lento, as conexões
+    do `orders-db` ficaram presas esperando resposta e o site parou de aceitar pedidos.
+
+    Você precisa **desenhar a solução** para o próximo evento: {{peakOrdersPerSecond}} pedidos por segundo no pico,
+    {{skus|number}} SKUs, e {{eventNote}}.
+
+    Entregue o desenho (arraste os componentes no editor ou descreva em Mermaid) e o texto explicando consistência,
+    idempotência e resiliência.
+  businessContext: |
+    Vender um item que não existe (oversell) custa em média R$ {{oversellCostReais}} por ocorrência entre cancelamento,
+    frete de compensação e atendimento — a cada 100 oversells, R$ {{oversellPerHundred|number}}. Deixar de vender por
+    excesso de bloqueio custa a venda inteira. A diretoria tolera oversell raro; não tolera checkout fora do ar.
+  hints:
+    - "Reserva de estoque não precisa ser a mesma transação que cria o pedido."
+    - "Pense no que acontece quando o cliente clica duas vezes em 'finalizar'."
+    - "Item muito disputado concentra escrita em uma única linha: isso é hot key."
+checkpoints:
+  - id: sync-or-async
+    question: "A reserva de estoque no checkout deve ser síncrona ou assíncrona?"
+    options:
+      - id: async-with-reservation
+        label: "Assíncrona, com reserva otimista: confirma o pedido e reconcilia por evento"
+        verdict: GOOD
+        feedback: "Boa escolha para {{peakOrdersPerSecond}} pedidos/s: o checkout deixa de depender da latência do estoque. O custo é oversell ocasional, que a R$ {{oversellCostReais}} por caso é mais barato que o checkout fora do ar."
+      - id: keep-sync
+        label: "Síncrona: garantir estoque antes de confirmar é requisito do negócio"
+        verdict: RISKY
+        feedback: "É defensável quando o item é escasso e caro (console, ingresso). Mas manter síncrono no caminho inteiro reproduz a falha da última {{eventName}}: um serviço lento derruba o checkout. Se for síncrono, isole com timeout curto e fallback."
+      - id: no-reservation
+        label: "Sem reserva: só verificar estoque na expedição"
+        verdict: BAD
+        feedback: "Sem reserva nenhuma, com {{peakOrdersPerSecond}} pedidos/s disputando {{skus|compact}} SKUs, o oversell deixa de ser raro e vira regra — e a R$ {{oversellCostReais}} por caso isso sai caro rápido."
+  - id: idempotency
+    question: "O cliente clica duas vezes em 'finalizar compra'. Como você evita dois pedidos?"
+    options:
+      - id: idempotency-key
+        label: "Chave de idempotência gerada no cliente, persistida com restrição de unicidade no servidor"
+        verdict: GOOD
+        feedback: "Certo: chave vinda do cliente (por tentativa de checkout), gravada com unique constraint. A segunda requisição encontra a chave e devolve o mesmo pedido, sem criar outro nem reservar estoque de novo."
+      - id: dedupe-window
+        label: "Ignorar requisições do mesmo usuário em uma janela de 5 segundos"
+        verdict: BAD
+        feedback: "Janela por tempo falha nos dois sentidos: perde a segunda compra legítima do mesmo cliente e não protege quando o retry chega depois da janela. Idempotência precisa de chave, não de relógio."
+      - id: frontend-disable
+        label: "Desabilitar o botão no frontend após o primeiro clique"
+        verdict: BAD
+        feedback: "O frontend não é fronteira de confiança: retry do app, reenvio do gateway e duplo clique com rede lenta passam por cima disso. A garantia tem de estar no servidor."
+  - id: hot-key
+    question: "Na {{eventName}}, um SKU concentra 60% dos pedidos. Qual o risco no desenho?"
+    options:
+      - id: hot-partition
+        label: "Hot key: todas as escritas de reserva convergem para a mesma linha/partição e serializam"
+        verdict: GOOD
+        feedback: "Exato. Uma linha de estoque disputada vira ponto de contenção — no banco (lock) e no broker (partição). Trate com decremento atômico em store adequado, sharding do contador ou fila dedicada para o item quente."
+      - id: more-replicas
+        label: "Adicionar réplicas de leitura do inventory-service"
+        verdict: BAD
+        feedback: "Réplica resolve leitura; o gargalo aqui é escrita concentrada em uma chave. Ler o estoque em dez lugares não muda quem decrementa o contador."
+      - id: cache-sku
+        label: "Cachear a quantidade disponível do SKU"
+        verdict: RISKY
+        feedback: "Cache ajuda a exibir a vitrine sem bater no banco, mas não pode ser a fonte da reserva: com {{peakOrdersPerSecond}} pedidos/s no mesmo SKU, o valor em cache está errado no instante seguinte."
+solutionPaths:
+  - id: async-reservation
+    name: "Reserva assíncrona com saga e compensação"
+    summary: "Checkout grava o pedido como PENDENTE, publica `OrderPlaced` por outbox; o estoque reserva e responde `StockReserved` ou `StockRejected`, confirmando ou cancelando o pedido."
+    pros: ["Checkout não depende da latência do estoque", "Absorve picos por fila", "Cada serviço escala sozinho"]
+    cons: ["Oversell possível na janela entre pedido e reserva", "Pedido pode ser cancelado depois de confirmado ao cliente", "Compensação precisa ser desenhada e testada"]
+    bestWhen: "o custo de oversell é baixo perto do custo de indisponibilidade — o caso de catálogo amplo em pico"
+    rubric:
+      criteria:
+        - id: async-edge
+          name: "Desacoplamento no desenho"
+          weight: 20
+          evidence:
+            - { type: graph, check: NODE_OF_TYPE, value: queue, min: 1 }
+            - { type: graph, check: NO_SYNC_EDGE, from: checkout, to: inventory }
+          missing: "O desenho precisa ter uma fila/tópico entre o checkout e o estoque, e nenhuma chamada síncrona direta entre eles."
+          present: "Desenho desacoplado: fila entre checkout e estoque."
+        - id: reliable-publish
+          name: "Publicação confiável"
+          weight: 15
+          evidence:
+            - { type: keyword, field: design, anyOf: ["outbox", "cdc", "debezium"], min: 1 }
+          missing: "Gravar o pedido e publicar o evento em operações separadas perde evento: use outbox ou CDC."
+          present: "Publicação confiável (outbox/CDC)."
+        - id: idempotency
+          name: "Idempotência"
+          weight: 20
+          evidence:
+            - { type: keyword, field: design, anyOf: ["idempot", "chave de idempotência", "chave de idempotencia", "unique", "deduplic"], min: 1 }
+            - { type: choice, field: idempotencyStrategy, anyOf: [client-key] }
+          missing: "Descreva a idempotência do checkout (chave do cliente + restrição de unicidade) e do consumidor de estoque."
+          present: "Idempotência desenhada nas duas pontas."
+        - id: compensation
+          name: "Compensação"
+          weight: 20
+          evidence:
+            - { type: keyword, field: design, anyOf: ["compensa", "saga", "cancela", "estorno", "reverte"], min: 1 }
+            - { type: keyword, field: design, anyOf: ["cliente", "notifica", "aviso", "e-mail", "comunica"], min: 1 }
+          missing: "Reserva assíncrona exige compensação: o que acontece com o pedido rejeitado e como o cliente é avisado."
+          present: "Fluxo de compensação e comunicação definidos."
+        - id: hot-key
+          name: "Item muito disputado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: design, anyOf: ["hot key", "hot partition", "shard", "contador", "atômic", "atomic", "partição", "particao"], min: 1 }
+          missing: "Um SKU pode concentrar 60% dos pedidos: trate a hot key (decremento atômico, sharding do contador, partição por SKU)."
+          present: "Hot key tratada."
+        - id: resilience
+          name: "Resiliência"
+          weight: 10
+          evidence:
+            - { type: keyword, field: design, anyOf: ["timeout", "retry", "dlq", "circuit", "backpressure", "degrada"], min: 2 }
+          missing: "Descreva timeout, retry com DLQ e o comportamento sob degradação do estoque."
+          present: "Resiliência descrita."
+  - id: sync-with-bulkhead
+    name: "Síncrono com isolamento e degradação"
+    summary: "Manter a reserva síncrona, mas fora da transação do pedido, com timeout curto, circuit breaker, pool isolado e fallback para reserva assíncrona quando o estoque degradar."
+    pros: ["Sem oversell no caminho feliz", "Modelo mental simples", "Menos peças móveis"]
+    cons: ["A latência do checkout inclui a do estoque", "O pico é absorvido por capacidade, não por fila", "Fallback precisa existir de verdade e ser testado"]
+    bestWhen: "o item é escasso e caro, e vender o que não existe é pior que perder a venda"
+    rubric:
+      criteria:
+        - id: isolation
+          name: "Isolamento da chamada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: design, anyOf: ["timeout", "circuit", "bulkhead", "pool isolado", "thread pool"], min: 2 }
+          missing: "Síncrono só é aceitável isolado: timeout curto, circuit breaker e pool separado, para que o estoque lento não prenda as conexões do pedido."
+          present: "Chamada isolada com timeout e breaker."
+        - id: outside-transaction
+          name: "Fora da transação do pedido"
+          weight: 20
+          evidence:
+            - { type: keyword, field: design, anyOf: ["fora da transação", "fora da transacao", "transação curta", "transacao curta", "sem transação distribuída", "sem transacao distribuida", "commit antes"], min: 1 }
+          missing: "O erro da última {{eventName}} foi a chamada remota dentro da transação do banco: explicite que a reserva ocorre fora dela."
+          present: "Chamada remota fora da transação."
+        - id: fallback
+          name: "Degradação definida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: design, anyOf: ["fallback", "degrada", "assíncron", "assincron", "fila", "aceita o pedido"], min: 1 }
+          missing: "Quando o breaker abrir, o checkout precisa de um caminho: aceitar o pedido e reservar depois, ou recusar com mensagem clara. Escolha e descreva."
+          present: "Degradação definida."
+        - id: idempotency
+          name: "Idempotência"
+          weight: 20
+          evidence:
+            - { type: choice, field: idempotencyStrategy, anyOf: [client-key] }
+          missing: "Mesmo síncrono, o retry existe: chave de idempotência com restrição de unicidade."
+          present: "Idempotência tratada."
+        - id: capacity
+          name: "Capacidade dimensionada"
+          weight: 10
+          evidence:
+            - { type: number, field: expectedRps, expected: "peakOrdersPerSecond", tolerance: 0.3 }
+          missing: "Síncrono exige dimensionar o estoque para {{peakOrdersPerSecond}} req/s de pico: informe o número que você usou."
+          present: "Capacidade dimensionada."
+  - id: pre-allocated-buckets
+    name: "Estoque pré-alocado em blocos"
+    summary: "Dividir o estoque do SKU em N blocos distribuídos entre instâncias/partições; cada checkout consome de um bloco local, com redistribuição periódica."
+    pros: ["Elimina a hot key: escrita distribuída", "Latência baixíssima no caminho feliz", "Funciona bem em lançamento com estoque finito"]
+    cons: ["Fragmentação: pode sobrar estoque em um bloco e faltar em outro", "Redistribuição é código novo e não trivial", "Difícil de explicar para o negócio"]
+    bestWhen: "um único SKU concentra a disputa e a contenção de escrita é o gargalo real — lançamento com estoque fixo"
+    rubric:
+      criteria:
+        - id: hot-key
+          name: "Hot key resolvida"
+          weight: 30
+          evidence:
+            - { type: keyword, field: design, anyOf: ["bloco", "bucket", "shard", "partição", "particao", "distribu"], min: 1 }
+          missing: "Descreva como o estoque é dividido e como cada instância consome do próprio bloco."
+          present: "Divisão de estoque descrita."
+        - id: rebalance
+          name: "Redistribuição"
+          weight: 25
+          evidence:
+            - { type: keyword, field: design, anyOf: ["redistribu", "rebalance", "sobra", "devolve", "esgota"], min: 1 }
+          missing: "O ponto difícil é a sobra: descreva a redistribuição quando um bloco esgota e outro ainda tem saldo."
+          present: "Redistribuição tratada."
+        - id: idempotency
+          name: "Idempotência"
+          weight: 25
+          evidence:
+            - { type: choice, field: idempotencyStrategy, anyOf: [client-key] }
+            - { type: keyword, field: design, anyOf: ["idempot", "unique", "deduplic"], min: 1 }
+          missing: "Descreva a idempotência do checkout com chave do cliente e restrição de unicidade."
+          present: "Idempotência tratada."
+        - id: resilience
+          name: "Resiliência"
+          weight: 20
+          evidence:
+            - { type: keyword, field: design, anyOf: ["timeout", "retry", "falha de instância", "falha de instancia", "perda de bloco", "recupera"], min: 1 }
+          missing: "Se a instância que detém um bloco cair, o estoque daquele bloco some: descreva a recuperação."
+          present: "Falha de instância tratada."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Abordagem"
+      type: SELECT
+      required: true
+      options:
+        - { value: async-reservation, label: "Reserva assíncrona com saga" }
+        - { value: sync-with-bulkhead, label: "Síncrono com isolamento e degradação" }
+        - { value: pre-allocated-buckets, label: "Estoque pré-alocado em blocos" }
+    - id: consistencyModel
+      label: "Consistência da reserva"
+      type: SELECT
+      required: true
+      options:
+        - { value: eventual, label: "Eventual: pedido confirmado, reserva depois" }
+        - { value: strong, label: "Forte: sem pedido sem reserva confirmada" }
+        - { value: hybrid, label: "Híbrida: forte para SKU escasso, eventual para o resto" }
+    - id: idempotencyStrategy
+      label: "Estratégia de idempotência"
+      type: SELECT
+      required: true
+      options:
+        - { value: client-key, label: "Chave do cliente + restrição de unicidade" }
+        - { value: time-window, label: "Janela de deduplicação por tempo" }
+        - { value: frontend, label: "Bloqueio no frontend" }
+        - { value: none, label: "Nenhuma" }
+    - id: expectedRps
+      label: "Pedidos por segundo no pico (seu número)"
+      type: NUMBER
+      required: true
+    - id: diagram
+      label: "Desenho da solução"
+      type: DIAGRAM
+      required: false
+      help: "Arraste os componentes ou escreva um flowchart Mermaid. Ligações pontilhadas representam assincronia."
+    - id: design
+      label: "Descrição da solução"
+      type: MARKDOWN
+      required: true
+      help: "Componentes, consistência, idempotência, compensação, hot key e resiliência."
+reference: |
+  ## Desenho
+
+  ```mermaid
+  flowchart LR
+    cli[Cliente] --> chk[checkout-api]
+    chk --> odb[(orders-db + outbox)]
+    odb -.->|relay| topic[[orders.placed]]
+    topic -.-> inv[inventory-service]
+    inv --> idb[(inventory-db)]
+    inv -.->|StockReserved / StockRejected| result[[orders.stock-result]]
+    result -.-> chk
+    chk -.-> notify[notification-service]
+  ```
+
+  ## Fluxo
+  1. `checkout-api` recebe a requisição com **chave de idempotência** gerada pelo cliente por tentativa de checkout.
+  2. Em **uma transação local**: grava o pedido como `AGUARDANDO_ESTOQUE` e a linha na `outbox`. A unique constraint na
+     chave de idempotência faz o segundo clique devolver o mesmo pedido, sem efeito colateral.
+  3. O relay publica `OrderPlaced` em `orders.placed`, **particionado por SKU** (mantém ordem por item e espalha a carga).
+  4. `inventory-service` consome, aplica decremento atômico no contador do SKU e publica `StockReserved` ou `StockRejected`.
+     O consumidor é idempotente por `orderId`: reprocessar o mesmo evento não reserva duas vezes.
+  5. O checkout confirma ou cancela o pedido e o `notification-service` avisa o cliente.
+
+  ## Consistência
+  Eventual, com janela típica abaixo de 2s. Aceita-se oversell na janela entre pedido e reserva: a R$ {{oversellCostReais}}
+  por ocorrência, é mais barato que o checkout indisponível. O pedido só vira "confirmado" para o cliente depois do
+  `StockReserved`; antes disso, a tela mostra "confirmando disponibilidade".
+
+  ## Item muito disputado (hot key)
+  Um SKU concentra a disputa. Duas defesas combinadas:
+  - Contador de estoque em store com **decremento atômico** (`DECRBY` no Redis com persistência, ou `UPDATE ... RETURNING`
+    em linha dedicada), não leitura-modificação-escrita.
+  - **Sharding do contador** para o SKU quente: N sub-contadores, escolha aleatória na reserva, redistribuição quando um zera.
+  Particionar `orders.placed` por SKU concentra a partição do item quente: para o lançamento, tópico dedicado com mais partições
+  usando `sku + bucket` como chave.
+
+  ## Resiliência
+  - Consumo com retry exponencial e **DLQ** após 5 tentativas, com alerta — DLQ crescendo em silêncio é incidente.
+  - `inventory-service` fora do ar: os pedidos acumulam na fila e a página informa "confirmação em instantes"; nada se perde.
+  - Alerta de lag do consumidor > 30s e de idade da mensagem mais antiga.
+  - Job de reconciliação: pedidos em `AGUARDANDO_ESTOQUE` há mais de 5 minutos são cancelados com aviso ao cliente.
+
+  ## Capacidade
+  {{peakOrdersPerSecond}} pedidos/s no pico. O consumidor de estoque é dimensionado para 2x isso, com partições suficientes
+  para paralelizar ({{peakOrdersPerSecond}} / 200 por partição, mínimo 24).
+
+  ## Quando o desenho seria outro
+  No {{eventName}} com estoque fixo e pequeno, a perda de uma venda é irrelevante perto do custo reputacional do oversell:
+  ali vale o estoque pré-alocado em blocos, com reserva forte antes da confirmação.
+scenario:
+  kind: capacity
+  params:
+    service: checkout-api
+    datastore: orders-db
+    growthPercentPerMonth: "6"
+    currentPeakRps: "{{peakOrdersPerSecond}}"
+    headroomMetric: active_connections
+    headroomLimit: "3000"
+    headroomNow: "1900"
+recommendation:
+  default: async-reservation
+  rules:
+    - { param: oversellCostReais, op: ">=", value: 400, path: sync-with-bulkhead, reason: "com R$ {{oversellCostReais}} por oversell, vender o que não existe passa a custar mais que perder a venda; aqui a reserva forte, isolada com timeout e breaker, se paga" }

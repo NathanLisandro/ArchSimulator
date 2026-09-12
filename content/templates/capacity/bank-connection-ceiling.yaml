@@ -1,0 +1,303 @@
+id: bank-capacity-connection-ceiling
+type: CAPACITY_PLANNING
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [capacity, cloud, databases, sre, system-design]
+tools: [METRICS, SQL, INFRA]
+parameters:
+  growthPercent: { range: [6, 18], step: 1 }
+  currentPeakRps: { range: [900, 3200], step: 100 }
+  connectionsNow: { range: [1100, 2600], step: 100 }
+  horizonMonths: { range: [6, 18], step: 3 }
+  driver:
+    group:
+      - { driver: "a folha de pagamento de três grandes varejistas migra para o banco no próximo trimestre, concentrando o pico no dia 5", driverNote: "o dia 5 já é o pico do mês e vai dobrar" }
+      - { driver: "o produto de antecipação vai abrir para todo o Brasil depois de um piloto regional", driverNote: "a base de lojistas multiplica por 4" }
+      - { driver: "a diretoria fechou parceria de conta-salário com uma rede de franquias de 40 mil funcionários", driverNote: "entra tudo de uma vez, com prazo contratual" }
+derived:
+  connectionLimit: "5000"
+  monthsToCeiling: "round(horizonMonths / 2)"
+  projectedRps: "round(currentPeakRps * 2)"
+narrative:
+  title: "Capacity planning: teto de conexões do core-db em {{horizonMonths}} meses"
+  symptom: |
+    A engenharia precisa de um plano de capacidade para os próximos **{{horizonMonths}} meses**. O gatilho: {{driver}}
+    — {{driverNote}}.
+
+    Hoje o `core-db` sustenta o pico com ~{{connectionsNow|number}} conexões ativas de um limite de 5.000
+    (`max_connections` do RDS). O `account-api` está em **{{currentPeakRps}} req/s** de pico e o crescimento medido é de
+    **{{growthPercent}}% ao mês**.
+
+    Use o console de métricas (90 dias de histórico), o SQL e o mapa de infraestrutura. Entregue: onde bate o teto,
+    quando, e o plano.
+  businessContext: |
+    O `core-db` é RDS PostgreSQL db.r6g.8xlarge Multi-AZ (32 vCPU, 256 GB), gp3 com 20.000 IOPS, 62 TB, compartilhado
+    por 8 serviços. Cada pod abre 20 conexões; há ~60 pods. A classe seguinte (16xlarge) dobra o custo de ~US$ 4,80/h
+    para ~US$ 9,60/h e o failover de troca leva 60 a 120 segundos.
+  hints:
+    - "Crescimento de {{growthPercent}}% ao mês é composto, não linear."
+    - "Conexão não é a única dimensão: veja IOPS, CPU e armazenamento no mesmo horizonte."
+    - "Em Postgres, cada conexão custa memória; o teto prático costuma vir antes do max_connections."
+checkpoints:
+  - id: which-limit
+    question: "Qual recurso você projeta primeiro?"
+    options:
+      - id: all-dimensions
+        label: "Todas as dimensões no mesmo horizonte: conexões, CPU, IOPS e armazenamento"
+        verdict: GOOD
+        feedback: "Certo. Capacity planning de uma dimensão só erra o gargalo: com {{growthPercent}}% ao mês, CPU e IOPS podem bater antes das conexões — e armazenamento é o que não se resolve em uma janela de manutenção."
+      - id: connections-only
+        label: "Só conexões: é o limite que aparece no título"
+        verdict: RISKY
+        feedback: "Conexão é o limite visível, mas não necessariamente o primeiro. Projete as quatro dimensões antes de escolher onde investir."
+      - id: wait-alert
+        label: "Esperar o alerta de 80% para agir"
+        verdict: BAD
+        feedback: "Com {{growthPercent}}% ao mês, do alerta de 80% até o teto sobram poucas semanas — menos que o tempo de planejar, testar e executar uma migração ou um PgBouncer em produção."
+  - id: math
+    question: "Com {{growthPercent}}% ao mês e {{connectionsNow|number}} conexões hoje, como projeta o teto de 5.000?"
+    options:
+      - id: compound
+        label: "Crescimento composto: conexões × (1 + taxa)^meses, até cruzar o limite"
+        verdict: GOOD
+        feedback: "Sim. Composto, não linear — é a diferença entre acertar e errar o mês em que o problema chega. E some o degrau do evento previsto: {{driverNote}}."
+      - id: linear
+        label: "Linear: soma {{growthPercent}}% do valor de hoje a cada mês"
+        verdict: BAD
+        feedback: "Linear subestima e dá falsa folga. A diferença entre composto e linear em {{horizonMonths}} meses é grande o suficiente para você planejar para o mês errado."
+      - id: double-capacity
+        label: "Não projetar: dobrar a capacidade agora e reavaliar depois"
+        verdict: RISKY
+        feedback: "Dobrar sem conta dobra o custo (de US$ 4,80 para US$ 9,60 por hora) e pode não resolver: se o gargalo for IOPS ou conexão por pod, a instância maior não muda nada."
+  - id: fix
+    question: "O teto de conexões é o problema mais próximo. Qual a primeira ação?"
+    options:
+      - id: pooler
+        label: "Pool de conexões externo (PgBouncer em transaction mode) entre serviços e banco"
+        verdict: GOOD
+        feedback: "Sim: o gargalo é conexão por pod, não capacidade de processar. Um pooler em transaction mode reduz de ~1.200 para dezenas de conexões reais, custa uma fração da instância maior e já é dívida técnica mapeada."
+      - id: bigger-instance
+        label: "Subir para db.r6g.16xlarge"
+        verdict: RISKY
+        feedback: "Resolve CPU e memória, e permite mais conexões — mas dobra o custo e só empurra o teto alguns meses com {{growthPercent}}% ao mês. Vale se CPU for o gargalo real; se for conexão, é caro demais para o efeito."
+      - id: more-replicas
+        label: "Adicionar réplicas de leitura"
+        verdict: RISKY
+        feedback: "Réplica ajuda se a carga for de leitura, e parte é. Mas as conexões de escrita continuam no primário, e cada réplica adiciona lag e mais um lugar para conectar."
+solutionPaths:
+  - id: pooler-first
+    name: "Pooler primeiro, depois escala vertical planejada"
+    summary: "Introduzir PgBouncer em transaction mode, reduzir conexões por pod e só então avaliar a instância maior, com gatilhos definidos por dimensão."
+    pros: ["Ataca o gargalo mais próximo com o menor custo", "Reduz a dívida técnica já mapeada", "Mantém a opção de escalar depois"]
+    cons: ["Transaction mode quebra prepared statements e advisory locks: exige revisão do código", "Mais um componente no caminho crítico", "Não resolve CPU nem IOPS"]
+    bestWhen: "o consumo de conexões cresce mais rápido que o consumo de CPU — o padrão de quem escala por pods"
+    rubric:
+      criteria:
+        - id: projection
+          name: "Projeção correta do teto"
+          weight: 25
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToCeiling", tolerance: 0.5 }
+            - { type: keyword, field: plan, anyOf: ["composto", "(1 +", "exponencial", "^", "acumulad"], min: 1 }
+          missing: "Projete com crescimento composto e diga em quantos meses as {{connectionsNow|number}} conexões cruzam 5.000."
+          present: "Projeção composta com prazo declarado."
+        - id: dimensions
+          name: "Todas as dimensões avaliadas"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["iops", "cpu", "armazenamento", "storage", "memória", "memoria"], min: 2 }
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Avalie conexões, CPU, IOPS e armazenamento no mesmo horizonte, com base nas métricas dos 90 dias."
+          present: "Quatro dimensões avaliadas com dados."
+        - id: action
+          name: "Ação principal e seu custo"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["pgbouncer", "pooler", "pool externo", "transaction mode"], min: 1 }
+            - { type: keyword, field: plan, anyOf: ["prepared", "advisory", "session", "limitação", "limitacao", "risco"], min: 1 }
+          missing: "Proponha o pooler e reconheça o que ele quebra (prepared statements, advisory locks em transaction mode)."
+          present: "Pooler proposto com suas limitações."
+        - id: triggers
+          name: "Gatilhos de próxima ação"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["gatilho", "quando atingir", "70%", "80%", "alerta", "limite de"], min: 1 }
+          missing: "Um plano de capacidade define gatilhos: em que número, em que dimensão, dispara a próxima ação."
+          present: "Gatilhos por dimensão definidos."
+        - id: cost
+          name: "Custo estimado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["custo", "us$", "r$", "por hora", "mensal", "orçamento", "orcamento"], min: 1 }
+          missing: "Capacity planning sem custo não fecha decisão: compare o pooler com a instância maior (US$ 4,80/h → US$ 9,60/h)."
+          present: "Custo comparado."
+  - id: scale-up
+    name: "Escala vertical com janela planejada"
+    summary: "Migrar para db.r6g.16xlarge em janela combinada, ganhando CPU, memória e teto de conexões de uma vez."
+    pros: ["Resolve várias dimensões ao mesmo tempo", "Nenhuma mudança de código", "Execução conhecida"]
+    cons: ["Dobra o custo por hora", "Failover de 60–120s", "Compra tempo, não resolve a tendência", "Próxima classe já é a última"]
+    bestWhen: "CPU ou memória são o gargalo real e há orçamento, ou quando falta tempo para mudança de código"
+    rubric:
+      criteria:
+        - id: projection
+          name: "Projeção correta"
+          weight: 25
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToCeiling", tolerance: 0.5 }
+          missing: "Declare em quantos meses o limite é atingido, com crescimento composto."
+          present: "Projeção declarada."
+        - id: justification
+          name: "Por que vertical e não pooler"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["cpu", "memória", "memoria", "sem mudança de código", "sem mudanca de codigo", "prazo"], min: 1 }
+          missing: "Escalar vertical custa o dobro: justifique com a dimensão que realmente satura ou com a restrição de prazo."
+          present: "Escolha justificada por dados."
+        - id: window
+          name: "Janela e risco do failover"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["failover", "janela", "indisponibilidade", "60s", "120s", "madrugada"], min: 1 }
+          missing: "A troca de classe causa 60–120s de indisponibilidade: defina janela, comunicação e plano de rollback."
+          present: "Janela e risco definidos."
+        - id: next-ceiling
+          name: "Próximo teto"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["próximo", "proximo", "depois", "não resolve", "nao resolve", "tendência", "tendencia", "particion", "shard"], min: 1 }
+          missing: "Vertical compra meses: diga qual é o próximo teto e o que vem depois (pooler, particionamento, sharding)."
+          present: "Próximo teto mapeado."
+  - id: reduce-demand
+    name: "Reduzir a demanda antes de comprar capacidade"
+    summary: "Atacar o consumo: mover leituras para réplica, cache do que é repetido, reduzir pool por pod e tirar o batch do primário."
+    pros: ["Mais barato que qualquer instância", "Melhora a eficiência de forma permanente", "Ataca dívidas técnicas conhecidas"]
+    cons: ["Depende de várias squads", "Efeito demora a aparecer", "Pode não ser suficiente sozinho"]
+    bestWhen: "há desperdício evidente (pool superdimensionado, batch no primário, leitura no primário) e prazo para agir"
+    rubric:
+      criteria:
+        - id: projection
+          name: "Projeção correta"
+          weight: 20
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToCeiling", tolerance: 0.5 }
+          missing: "Declare o prazo até o teto com crescimento composto."
+          present: "Projeção declarada."
+        - id: waste
+          name: "Desperdício identificado com dados"
+          weight: 30
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_activity }
+            - { type: keyword, field: plan, anyOf: ["idle", "pool por pod", "réplica", "replica", "batch", "leitura"], min: 1 }
+          missing: "Mostre o desperdício com dado: conexões idle, pool superdimensionado, leitura ou batch no primário."
+          present: "Desperdício identificado com evidência."
+        - id: quantified
+          name: "Ganho quantificado"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["reduz", "de 20 para", "%", "economiza", "libera"], min: 1 }
+          missing: "Quantifique o ganho: quantas conexões cada medida libera e quantos meses isso compra."
+          present: "Ganho quantificado."
+        - id: fallback
+          name: "Plano se não bastar"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["se não", "se nao", "caso", "gatilho", "então", "entao", "plano b"], min: 1 }
+          missing: "Reduzir demanda pode não bastar: defina o gatilho que aciona pooler ou escala vertical."
+          present: "Plano alternativo definido."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: bottleneck
+      label: "Primeiro recurso a saturar"
+      type: SELECT
+      required: true
+      options:
+        - { value: connections, label: "Conexões do core-db" }
+        - { value: cpu, label: "CPU do core-db" }
+        - { value: iops, label: "IOPS do armazenamento" }
+        - { value: storage, label: "Armazenamento" }
+        - { value: app-cpu, label: "CPU dos pods" }
+    - id: monthsToLimit
+      label: "Meses até atingir o limite"
+      type: NUMBER
+      required: true
+    - id: projectedPeakRps
+      label: "Pico projetado no horizonte (req/s)"
+      type: NUMBER
+      required: true
+    - id: solutionPath
+      label: "Plano principal"
+      type: SELECT
+      required: true
+      options:
+        - { value: pooler-first, label: "Pooler primeiro, vertical depois" }
+        - { value: scale-up, label: "Escala vertical planejada" }
+        - { value: reduce-demand, label: "Reduzir demanda antes de comprar capacidade" }
+    - id: plan
+      label: "Plano de capacidade"
+      type: MARKDOWN
+      required: true
+      help: "Projeção por dimensão, gargalo, ação, gatilhos e custo."
+reference: |
+  ## Projeção
+  Crescimento medido: {{growthPercent}}% ao mês, composto. Conexões hoje no pico: ~{{connectionsNow|number}} de 5.000.
+
+  `conexões(m) = {{connectionsNow}} × (1 + {{growthPercent}}/100)^m`
+
+  O limite é cruzado em torno do mês **{{monthsToCeiling}}** — antes disso, porque {{driverNote}}, o que adiciona um
+  degrau fora da tendência. Na prática, considere o teto **um mês antes** da conta pura.
+
+  Nas outras dimensões, no mesmo horizonte de {{horizonMonths}} meses:
+  - **CPU do core-db:** sai de ~45% para ~75% de pico. Aperta, não estoura.
+  - **IOPS:** de ~11k para ~19k do provisionado de 20k. **Este é o segundo teto**, e chega quase junto.
+  - **Armazenamento:** 62 TB crescendo ~1,4 TB/mês; sem risco no horizonte, mas é o que não se resolve em janela curta.
+  - **Pico de requisições:** {{currentPeakRps}} → ~{{projectedRps}} req/s.
+
+  ## Gargalo
+  Conexões, por um motivo estrutural: escalamos por pods, e cada pod abre 20 conexões fixas. Crescer em capacidade de
+  processamento significa, hoje, crescer em conexões — mesmo quando a maioria está ociosa. `pg_stat_activity` mostra a
+  maior parte das sessões em `idle`, segurando memória do Postgres sem executar nada.
+
+  ## Plano
+  **Agora (4 semanas):** PgBouncer em **transaction mode** entre os serviços e o core-db.
+  - Reduz de ~{{connectionsNow|number}} conexões reais para algumas dezenas por serviço.
+  - Custo: 2 instâncias pequenas, ~US$ 90/mês, contra +US$ 3.500/mês da classe maior.
+  - Risco: transaction mode não suporta prepared statements no modo padrão do driver nem advisory locks entre
+    comandos. Exige revisar o `reconciliation-batch` (usa advisory lock) e configurar `prepareThreshold=0` no JDBC.
+  - Rollout por serviço, começando pelo `notification-service` (menor risco), terminando no `pix-api`.
+
+  **Em paralelo (8 semanas):** reduzir demanda.
+  - Pool por pod de 20 para 8 depois do pooler (o pooler multiplexa).
+  - Leituras de extrato e agenda para a réplica.
+  - `reconciliation-batch` fora do primário (dívida técnica já mapeada).
+
+  **Gatilhos definidos:**
+  | Dimensão | Gatilho | Ação |
+  |---|---|---|
+  | Conexões | > 60% do limite por 3 dias | acelerar rollout do pooler |
+  | IOPS | > 75% do provisionado no pico | subir para 30k IOPS gp3 (~US$ 240/mês) |
+  | CPU | > 70% sustentado por 1 semana | avaliar db.r6g.12xlarge |
+  | Armazenamento | < 12 meses de folga | planejar particionamento de `ledger_entries` |
+
+  **Não recomendado agora:** subir para 16xlarge. Dobra o custo (US$ 4,80 → US$ 9,60 por hora, ~US$ 3.500/mês a mais),
+  exige failover de 60–120s e compra apenas ~{{horizonMonths}} meses com {{growthPercent}}% ao mês — depois dos quais
+  a próxima classe já é a última da família.
+
+  ## Revisão
+  Reprojetar mensalmente com os dados reais. Se o crescimento medido passar de {{growthPercent}}% + 4 pontos por dois
+  meses seguidos, antecipar o particionamento de `ledger_entries` e avaliar separação de workloads por instância.
+scenario:
+  kind: capacity
+  params:
+    service: account-api
+    datastore: core-db
+    growthPercentPerMonth: "{{growthPercent}}"
+    currentPeakRps: "{{currentPeakRps}}"
+    headroomMetric: active_connections
+    headroomLimit: "5000"
+    headroomNow: "{{connectionsNow}}"
+    storageNowGb: "62000"
+recommendation:
+  default: pooler-first
+  rules:
+    - { param: growthPercent, op: ">=", value: 15, path: scale-up, reason: "a {{growthPercent}}% ao mês o pooler sozinho compra poucos meses; vale combinar com a escala vertical já na primeira janela, senão você faz duas mudanças arriscadas em sequência" }

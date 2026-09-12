@@ -1,0 +1,280 @@
+id: bank-adr-realtime-receivables-report
+type: ADR
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [adr, eda, databases, system-design, communication]
+tools: []
+parameters:
+  merchants: { range: [180000, 520000], step: 10000 }
+  freshnessSeconds: { range: [5, 60], step: 5 }
+  reportRps: { range: [40, 400], step: 10 }
+  deadlineWeeks: { range: [4, 12], step: 1 }
+  sponsor:
+    group:
+      - { sponsor: "a diretoria comercial", trigger: "um concorrente lançou 'agenda ao vivo' e o time de vendas está perdendo lojistas grandes na renovação" }
+      - { sponsor: "o time de produto", trigger: "a pesquisa com lojistas apontou 'não saber quanto já entrou hoje' como a principal dor da ferramenta" }
+      - { sponsor: "a área de crédito", trigger: "o modelo de antecipação usa a agenda de D-1 e está recusando lojistas que já receberam o pagamento hoje" }
+derived:
+  dailyEvents: "merchants * 34"
+  cacheWindowSeconds: "max(freshnessSeconds, 5)"
+narrative:
+  title: "ADR: agenda de recebíveis em tempo real para {{merchants|compact}} lojistas"
+  symptom: |
+    {{sponsor}} pediu uma **agenda de recebíveis em tempo real**: hoje o lojista vê a agenda atualizada pelo batch
+    noturno (D-1) e quer ver o valor a receber **atualizado em até {{freshnessSeconds}} segundos** após cada venda.
+
+    O gatilho: {{trigger}}. O prazo pedido é de **{{deadlineWeeks}} semanas**.
+
+    Você precisa escrever o **ADR** que registra a decisão: contexto, opções consideradas, decisão e consequências.
+  businessContext: |
+    Números de hoje: {{merchants|number}} lojistas ativos, ~{{dailyEvents|compact}} eventos de venda por dia,
+    `receivables_schedule` com 310 milhões de linhas no `core-db` (RDS PostgreSQL, compartilhado com PIX, cartão e ledger).
+    A consulta da agenda deve suportar **{{reportRps}} req/s** no pico.
+
+    Restrições: a conciliação D+1 continua obrigatória (CIP/BCB) e é a fonte da verdade contábil; o `core-db` já opera
+    com 1.200 conexões e não tem folga para carga analítica; a squad de recebíveis tem 5 pessoas.
+  hints:
+    - "Um ADR não é um relatório técnico: registre o contexto, as opções reais, a decisão e o que ela custa."
+    - "Tempo real e fonte da verdade contábil não precisam ser o mesmo dado."
+    - "Pergunte o que 'tempo real' significa para o negócio antes de escolher a tecnologia."
+checkpoints:
+  - id: requirement
+    question: "Antes de escolher a solução: o que você esclarece com quem pediu?"
+    options:
+      - id: define-freshness
+        label: "O que 'tempo real' significa: {{freshnessSeconds}}s de atraso é aceitável? O valor pode ser aproximado?"
+        verdict: GOOD
+        feedback: "Certo. A diferença entre 'até {{freshnessSeconds}}s' e 'imediato e exato' muda tudo: a primeira permite projeção assíncrona com cache; a segunda obrigaria consulta transacional no core-db em {{reportRps}} req/s."
+      - id: pick-kafka
+        label: "Nada: já está claro que é caso de Kafka com CQRS"
+        verdict: BAD
+        feedback: "Escolher a tecnologia antes de definir o requisito é como o ADR vira teatro: você documenta uma decisão que já tomou. Sem saber se o valor pode ser aproximado, você não consegue justificar consistência eventual."
+      - id: ask-deadline
+        label: "Se o prazo de {{deadlineWeeks}} semanas é negociável"
+        verdict: RISKY
+        feedback: "Prazo importa, mas é a segunda pergunta. Sem saber o requisito de frescor e exatidão você não sabe nem quanto de trabalho existe para negociar."
+  - id: source-of-truth
+    question: "A agenda em tempo real substitui a conciliação D+1 como fonte da verdade?"
+    options:
+      - id: separate
+        label: "Não: a visão em tempo real é uma projeção para consulta; a conciliação continua sendo a verdade contábil"
+        verdict: GOOD
+        feedback: "Exato. Separar leitura rápida de verdade contábil é o que torna a consistência eventual aceitável aqui — e é isso que o ADR precisa registrar explicitamente, com o comportamento quando as duas divergem."
+      - id: replace
+        label: "Sim: unifica tudo em um só lugar e elimina o batch"
+        verdict: BAD
+        feedback: "A conciliação com a CIP é obrigação regulatória e cruza arquivo externo com o ledger. Uma projeção otimista não substitui isso; e se divergirem, o regulador olha a conciliação, não a sua tela."
+      - id: undecided
+        label: "Decidir depois, na implementação"
+        verdict: RISKY
+        feedback: "Essa é exatamente a decisão que um ADR existe para tomar. Deixar em aberto empurra o conflito para o momento em que os números divergirem em produção, na frente do lojista."
+  - id: consistency
+    question: "O lojista verá o valor atualizado {{freshnessSeconds}}s depois da venda. Como isso aparece no ADR?"
+    options:
+      - id: explicit-tradeoff
+        label: "Como consequência explícita: consistência eventual com janela declarada e comportamento de divergência"
+        verdict: GOOD
+        feedback: "Sim. Consequências negativas declaradas são o que distingue um ADR útil de uma propaganda da solução escolhida: janela de {{freshnessSeconds}}s, o que acontece em estorno e como a tela sinaliza 'atualizando'."
+      - id: omit
+        label: "Não mencionar: é detalhe de implementação"
+        verdict: BAD
+        feedback: "Omitir a consequência que o usuário vai sentir é o defeito mais comum em ADR. Quem ler daqui a um ano precisa saber que a eventualidade foi escolhida conscientemente."
+      - id: promise-strong
+        label: "Prometer consistência forte para evitar discussão"
+        verdict: BAD
+        feedback: "Prometer forte com {{reportRps}} req/s sobre o core-db compartilhado é assumir uma conta que o banco não paga: você empurra carga de leitura para o primário que já sustenta PIX e cartão."
+solutionPaths:
+  - id: cqrs-projection
+    name: "Projeção de leitura alimentada por eventos (CQRS)"
+    summary: "Publicar eventos de venda no Kafka via outbox, manter uma projeção da agenda por lojista em store dedicado e servir a consulta dali; conciliação D+1 inalterada."
+    pros: ["Tira a carga de leitura do core-db", "Escala independente do transacional", "Frescor de segundos sem tocar no caminho de escrita"]
+    cons: ["Consistência eventual visível ao lojista", "Mais uma peça para operar (tópico, consumidor, store)", "Precisa de reprocessamento para corrigir a projeção"]
+    bestWhen: "o requisito é frescor de segundos com valor aproximado e a fonte da verdade continua sendo outra — o caso aqui"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções: Contexto, Opções consideradas, Decisão e Consequências."
+          present: "ADR com a estrutura completa."
+        - id: options
+          name: "Opções reais, com descarte justificado"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["réplica", "replica", "materialized view", "view materializada", "cache", "consulta direta"], min: 1 }
+            - { type: keyword, field: adr, anyOf: ["descart", "não escolh", "nao escolh", "rejeit", "por que não", "por que nao"], min: 1 }
+          missing: "Um ADR com uma opção só não é decisão, é anúncio: cite ao menos uma alternativa concreta (réplica de leitura, view materializada, cache) e diga por que foi descartada."
+          present: "Alternativas consideradas e descarte justificado."
+        - id: consistency
+          name: "Consistência declarada"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["eventual", "assíncron", "assincron", "atraso", "janela"], min: 1 }
+            - { type: keyword, field: adr, anyOf: ["estorno", "divergência", "divergencia", "conciliação", "conciliacao", "fonte da verdade"], min: 1 }
+          missing: "Declare a consistência eventual com a janela de {{freshnessSeconds}}s e o que acontece quando a projeção diverge da conciliação (estorno, chargeback)."
+          present: "Consistência e divergência tratadas."
+        - id: mechanism
+          name: "Mecanismo de publicação confiável"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["outbox", "cdc", "debezium", "transactional outbox", "log de transação"], min: 1 }
+          missing: "Publicar evento e gravar no banco em operações separadas perde evento: use outbox ou CDC e registre essa escolha no ADR."
+          present: "Publicação confiável (outbox/CDC) definida."
+        - id: consequences
+          name: "Consequências operacionais"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["reprocess", "replay", "lag", "monitor", "operar", "on-call", "custo"], min: 2 }
+          missing: "Consequências de verdade: como reprocessar a projeção, como monitorar o lag, quem opera a peça nova e quanto custa."
+          present: "Consequências operacionais descritas."
+  - id: read-replica-view
+    name: "Réplica de leitura com view materializada refrescada"
+    summary: "Manter a agenda no core-db, criar uma view materializada por lojista e refrescá-la periodicamente, servindo a consulta pela réplica."
+    pros: ["Sem peça nova na arquitetura", "Time pequeno consegue entregar em {{deadlineWeeks}} semanas", "Um único modelo de dados"]
+    cons: ["REFRESH em 310 milhões de linhas não cabe em janela de {{freshnessSeconds}}s", "Carga adicional na réplica", "Frescor limitado pelo intervalo de refresh"]
+    bestWhen: "o requisito de frescor é de minutos, não de segundos, e o time precisa entregar rápido sem nova infraestrutura"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções: Contexto, Opções consideradas, Decisão e Consequências."
+          present: "ADR com a estrutura completa."
+        - id: refresh-cost
+          name: "Custo do refresh enfrentado"
+          weight: 30
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["refresh", "incremental", "particion", "por lojista", "concurrently"], min: 1 }
+          missing: "Refresh completo de uma view sobre 310 milhões de linhas não fecha em {{freshnessSeconds}}s: descreva refresh incremental, particionamento ou escopo por lojista."
+          present: "Custo do refresh enfrentado explicitamente."
+        - id: expectation
+          name: "Expectativa renegociada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["minutos", "renegoci", "acordo", "sla de frescor", "expectativa"], min: 1 }
+          missing: "Se a solução entrega minutos e o pedido era {{freshnessSeconds}}s, a renegociação da expectativa faz parte da decisão e precisa estar no ADR."
+          present: "Expectativa renegociada explicitamente."
+        - id: replica-load
+          name: "Carga na réplica"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["réplica", "replica", "lag de replicação", "lag de replicacao", "carga"], min: 1 }
+          missing: "Servir {{reportRps}} req/s pela réplica tem custo e afeta o lag de replicação: registre isso."
+          present: "Impacto na réplica considerado."
+  - id: cache-aside
+    name: "Cache da agenda com invalidação por evento"
+    summary: "Manter a consulta no core-db, mas servir do Redis com TTL curto, invalidando a chave do lojista a cada venda."
+    pros: ["Entrega mais rápida", "Sem mudar o modelo de dados", "Reaproveita o Redis que já existe"]
+    cons: ["Cada invalidação devolve a carga ao core-db no próximo acesso", "Lojista grande invalida o tempo todo, e o cache não ajuda", "Não resolve a origem: a consulta continua cara"]
+    bestWhen: "a leitura é muito repetida e a escrita é rara — o oposto do perfil de um lojista ativo"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções."
+          present: "ADR estruturado."
+        - id: hit-ratio
+          name: "Perfil de acesso analisado"
+          weight: 30
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["hit", "invalida", "perfil de acesso", "leitura repetida", "lojista ativo"], min: 1 }
+          missing: "Cache só compensa se a leitura se repetir entre invalidações: analise o perfil de acesso do lojista ativo, que vende o tempo todo."
+          present: "Perfil de acesso analisado."
+        - id: stampede
+          name: "Proteção contra stampede"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["stampede", "single flight", "lock", "jitter", "ttl escalonado"], min: 1 }
+          missing: "Invalidação em massa devolve carga ao core-db de uma vez: descreva a proteção (single-flight, jitter no TTL)."
+          present: "Stampede considerado."
+        - id: consequences
+          name: "Consequências"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["dado desatualizado", "stale", "eventual", "custo"], min: 1 }
+          missing: "Registre a consequência de servir dado potencialmente desatualizado e o custo da solução."
+          present: "Consequências declaradas."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Decisão"
+      type: SELECT
+      required: true
+      options:
+        - { value: cqrs-projection, label: "Projeção de leitura por eventos (CQRS)" }
+        - { value: read-replica-view, label: "Réplica com view materializada" }
+        - { value: cache-aside, label: "Cache com invalidação por evento" }
+    - id: consistencyModel
+      label: "Modelo de consistência assumido"
+      type: SELECT
+      required: true
+      options:
+        - { value: eventual, label: "Eventual, com janela declarada" }
+        - { value: strong, label: "Forte (leitura transacional)" }
+        - { value: mixed, label: "Forte para saldo, eventual para histórico" }
+    - id: freshnessTarget
+      label: "Janela de frescor prometida (segundos)"
+      type: NUMBER
+      required: true
+    - id: adr
+      label: "ADR"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Contexto, ## Opções consideradas, ## Decisão, ## Consequências"
+reference: |
+  # ADR-00X: Agenda de recebíveis em tempo real por projeção de eventos
+
+  ## Contexto
+  {{sponsor}} pediu agenda atualizada em até {{freshnessSeconds}}s após a venda, para {{merchants|number}} lojistas e
+  ~{{dailyEvents|compact}} eventos/dia, com pico de {{reportRps}} req/s na consulta. Hoje a agenda é materializada pelo
+  batch D+1. O `core-db` é compartilhado com PIX, cartão e ledger, já opera com ~1.200 conexões e não tem folga para
+  carga de leitura analítica. A conciliação D+1 com a CIP continua sendo obrigação regulatória e fonte da verdade contábil.
+
+  Requisito esclarecido com o solicitante: o valor exibido pode ser **aproximado e convergente** — o lojista quer
+  acompanhar, não fechar o caixa. Isso é o que torna consistência eventual aceitável.
+
+  ## Opções consideradas
+  1. **Consulta direta ao core-db.** Descartada: {{reportRps}} req/s de leitura sobre 310 milhões de linhas no primário
+     compartilhado ameaça PIX e cartão, que têm impacto financeiro imediato.
+  2. **View materializada na réplica.** Descartada para este requisito: `REFRESH` completo não cabe em {{freshnessSeconds}}s
+     e o refresh incremental por lojista reproduz, com mais esforço, o que a projeção por eventos já faz. Seria a escolha
+     se o frescor aceitável fosse de minutos.
+  3. **Cache com invalidação por venda.** Descartada como solução principal: o lojista ativo invalida a própria chave o
+     tempo todo, então o hit ratio no público que mais importa é baixo. Fica como camada de proteção da projeção.
+  4. **Projeção de leitura alimentada por eventos (escolhida).**
+
+  ## Decisão
+  Publicar `SaleSettled` / `ReceivableScheduled` a partir do `receivables-api` usando **transactional outbox** (a mesma
+  transação que grava a venda grava o evento; um relay publica no Kafka). Um consumidor mantém a projeção
+  `merchant_schedule_live` (chave: lojista + data de liquidação) em store dedicado, servida pela consulta em
+  {{cacheWindowSeconds}}s de frescor. A conciliação D+1 **permanece** como fonte da verdade contábil.
+
+  ## Consequências
+  **Positivas:** leitura sai do core-db; a projeção escala por conta própria; frescor de segundos sem tocar no caminho
+  de escrita; a mesma stream serve o modelo de crédito depois.
+
+  **Negativas, assumidas conscientemente:**
+  - Consistência eventual com janela de ~{{freshnessSeconds}}s. A tela mostra o horário da última atualização.
+  - Em estorno/chargeback, a projeção pode exibir valor maior por alguns segundos; a conciliação corrige e a tela
+    sinaliza "valor sujeito a confirmação".
+  - Quando a projeção divergir da conciliação, **vale a conciliação**; há job diário de reconciliação da projeção com alerta.
+  - Uma peça nova para operar: tópico, consumidor e store entram no on-call da squad, com alerta de lag > 60s.
+  - Reprocessamento: a projeção é reconstruível a partir do tópico (retenção de 7 dias) e, além disso, do `receivables_schedule`.
+  - Custo aproximado: +1 tópico no MSK existente e ~US$ 190/mês de store dedicado.
+
+  **Prazo:** cabe nas {{deadlineWeeks}} semanas se a projeção nascer somente com os campos da tela; o modelo de crédito
+  passa a consumir a mesma stream em uma segunda etapa.
+scenario:
+  kind: none
+recommendation:
+  default: cqrs-projection
+  rules:
+    - { param: freshnessSeconds, op: ">=", value: 45, path: read-replica-view, reason: "com {{freshnessSeconds}}s de janela aceita, a view materializada com refresh incremental entrega o mesmo resultado sem adicionar tópico, consumidor e store ao on-call de uma squad de 5 pessoas" }

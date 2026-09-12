@@ -1,0 +1,268 @@
+id: banco-digital
+name: Meridian Bank
+domain: banking
+description: >
+  Banco digital com conta corrente, cartão, PIX e antecipação de recebíveis para pessoas físicas e pequenos
+  comércios. Nasceu monólito em 2018, hoje é um conjunto de serviços Java/Kotlin em AWS com um core bancário
+  em PostgreSQL que ainda concentra o ledger de todas as contas. A conciliação com a câmara (CIP/SPB) é D+1
+  em batch noturno e a agenda de recebíveis alimenta o produto de antecipação, que é a principal fonte de
+  receita não-bancária.
+scale:
+  dailyActiveUsers: 4200000
+  peakTps: 3500
+  dataVolume: "62 TB no core (PostgreSQL), 180 TB no data lake (S3/Parquet)"
+  growthNote: "PIX cresce 9% ao mês; Black Friday e dia 5 (salários) dobram o volume de lançamentos"
+stack:
+  languages: [Java 21, Kotlin]
+  frameworks: [Spring Boot 3, Micronaut (serviços de risco)]
+  datastores: [PostgreSQL 15 (RDS Multi-AZ), Redis (ElastiCache), DynamoDB (sessões), S3]
+  messaging: [Kafka (MSK), SQS]
+  cloud: AWS
+  notes: "Observabilidade com OpenTelemetry → Grafana/Tempo/Loki; deploys por ArgoCD em EKS"
+team:
+  developers: 140
+  squads: 18
+  notes: "Squads por produto (contas, pagamentos, cartão, crédito, antifraude, plataforma); on-call semanal por squad"
+regulations:
+  - name: LGPD
+    description: "Dados pessoais e financeiros: minimização, retenção de 5 anos após encerramento, direito de exclusão com exceções regulatórias"
+  - name: "BCB — Regulamento do PIX"
+    description: "Liquidação em até 10s; disponibilidade 99,9% mensal; devoluções (MED) em até 7 dias; obrigatoriedade de mecanismos antifraude"
+  - name: "SPB/CIP — conciliação"
+    description: "Conciliação diária obrigatória dos arquivos da câmara; divergência não resolvida em D+1 vira apontamento de auditoria"
+  - name: "Resolução 4.893 (segurança cibernética)"
+    description: "Plano de resposta a incidentes, registro e comunicação ao BCB de incidentes relevantes"
+architecture:
+  services:
+    - name: account-api
+      description: "Contas, saldo e extrato; grava lançamentos no ledger"
+      language: Java
+      dependsOn: [ledger-db, redis-cache, fraud-scoring]
+      datastore: core-db
+      instances: 12
+    - name: pix-api
+      description: "Iniciação e recebimento PIX; integra com o SPI via pix-gateway"
+      language: Java
+      dependsOn: [account-api, pix-gateway, fraud-scoring, kafka]
+      datastore: core-db
+      instances: 16
+    - name: pix-gateway
+      description: "Conector com o SPI (BCB); assinatura e fila de mensagens"
+      language: Kotlin
+      dependsOn: [kafka]
+      datastore: core-db
+      instances: 4
+    - name: receivables-api
+      description: "Agenda de recebíveis dos lojistas e antecipação"
+      language: Java
+      dependsOn: [account-api, kafka]
+      datastore: core-db
+      instances: 6
+    - name: reconciliation-batch
+      description: "Batch noturno D+1: cruza arquivos da CIP com o ledger; roda 01:00–04:30"
+      language: Java
+      dependsOn: [s3, kafka]
+      datastore: core-db
+      instances: 1
+    - name: fraud-scoring
+      description: "Score em tempo real por transação (modelo + regras); p99 alvo 80ms"
+      language: Kotlin
+      dependsOn: [redis-cache, dynamodb]
+      datastore: fraud-db
+      instances: 10
+    - name: card-authorizer
+      description: "Autorização de cartão (ISO 8583) com a bandeira; timeout 2s"
+      language: Java
+      dependsOn: [account-api, fraud-scoring]
+      datastore: core-db
+      instances: 8
+    - name: notification-service
+      description: "Push, e-mail e SMS por eventos Kafka"
+      language: Kotlin
+      dependsOn: [kafka, sqs]
+      datastore: notif-db
+      instances: 4
+  datastores:
+    - name: core-db
+      engine: postgres
+      description: "Core bancário: contas, ledger, PIX, recebíveis. RDS PostgreSQL 15 Multi-AZ + 2 réplicas de leitura"
+      sizing: "db.r6g.8xlarge (32 vCPU, 256 GB), gp3 20k IOPS, 62 TB"
+    - name: fraud-db
+      engine: postgres
+      description: "Features e decisões do antifraude"
+      sizing: "db.r6g.2xlarge"
+    - name: notif-db
+      engine: postgres
+      description: "Histórico de notificações"
+      sizing: "db.t4g.large"
+  brokers:
+    - name: kafka
+      type: kafka
+      topics: [ledger.entries, pix.transactions, pix.refunds, receivables.schedule, fraud.decisions, notifications.outbound]
+    - name: sqs
+      type: sqs
+      topics: [notifications-sms, notifications-email, notifications-dlq]
+  caches:
+    - name: redis-cache
+      type: redis
+      usage: "Saldo consolidado (TTL 5s), limites, sessões de app, rate limit por CPF"
+infra:
+  resources:
+    - { id: alb-public, type: aws.alb, name: "ALB público", properties: { listeners: "443", targetGroups: "account-api,pix-api,receivables-api" } }
+    - { id: eks-main, type: aws.eks, name: "EKS prod-main", properties: { nodes: "24", instanceType: "m6i.2xlarge", version: "1.30" } }
+    - { id: rds-core, type: aws.rds.postgres, name: "RDS core-db", properties: { instanceClass: "db.r6g.8xlarge", multiAz: "true", storage: "62TB gp3", iops: "20000", maxConnections: "5000", readReplicas: "2" } }
+    - { id: rds-fraud, type: aws.rds.postgres, name: "RDS fraud-db", properties: { instanceClass: "db.r6g.2xlarge", multiAz: "true" } }
+    - { id: redis-main, type: aws.elasticache.redis, name: "ElastiCache redis-main", properties: { nodeType: "cache.r6g.xlarge", shards: "3", replicas: "1", maxmemoryPolicy: "volatile-lru" } }
+    - { id: msk-main, type: aws.msk, name: "MSK kafka", properties: { brokers: "6", instanceType: "kafka.m5.2xlarge", partitionsDefault: "24" } }
+    - { id: sqs-notif, type: aws.sqs, name: "SQS notifications", properties: { queues: "notifications-sms,notifications-email", dlq: "notifications-dlq" } }
+    - { id: ddb-sessions, type: aws.dynamodb, name: "DynamoDB sessions", properties: { billing: "on-demand", ttl: "enabled" } }
+    - { id: s3-files, type: aws.s3, name: "S3 cip-files", properties: { buckets: "cip-inbound,cip-outbound,datalake" } }
+    - { id: nat-gw, type: aws.nat, name: "NAT gateway", properties: { azs: "3" } }
+    - { id: spi-link, type: external, name: "SPI (BCB)", properties: { protocol: "ISO 20022 / mTLS", slaMs: "10000" } }
+  edges:
+    - { from: alb-public, to: eks-main, label: "HTTPS" }
+    - { from: eks-main, to: rds-core, label: "JDBC (pool 20/pod)" }
+    - { from: eks-main, to: rds-fraud, label: "JDBC" }
+    - { from: eks-main, to: redis-main, label: "Lettuce" }
+    - { from: eks-main, to: msk-main, label: "Kafka" }
+    - { from: eks-main, to: sqs-notif, label: "SQS" }
+    - { from: eks-main, to: ddb-sessions, label: "DynamoDB" }
+    - { from: eks-main, to: nat-gw, label: "egress" }
+    - { from: nat-gw, to: spi-link, label: "mTLS" }
+    - { from: s3-files, to: eks-main, label: "arquivos CIP" }
+schema:
+  dialect: POSTGRES
+  tables:
+    - name: accounts
+      rowCount: 6800000
+      sizeMb: 2100
+      columns:
+        - { name: id, type: bigint, distinct: 6800000 }
+        - { name: customer_id, type: bigint, distinct: 6500000 }
+        - { name: document, type: varchar(14), distinct: 6500000 }
+        - { name: branch, type: varchar(4), distinct: 1 }
+        - { name: number, type: varchar(12), distinct: 6800000 }
+        - { name: status, type: varchar(16), distinct: 5 }
+        - { name: opened_at, type: timestamp, distinct: 6000000 }
+        - { name: balance_cents, type: bigint, distinct: 3000000 }
+      indexes:
+        - { name: accounts_pkey, columns: [id], unique: true, sizeMb: 150 }
+        - { name: uq_accounts_document, columns: [document], unique: true, sizeMb: 210 }
+        - { name: idx_accounts_customer, columns: [customer_id], sizeMb: 150 }
+    - name: ledger_entries
+      rowCount: 2100000000
+      sizeMb: 1150000
+      columns:
+        - { name: id, type: bigint, distinct: 2100000000 }
+        - { name: account_id, type: bigint, distinct: 6800000 }
+        - { name: created_at, type: timestamp, distinct: 1900000000 }
+        - { name: type, type: varchar(24), distinct: 14 }
+        - { name: amount_cents, type: bigint, distinct: 9000000 }
+        - { name: direction, type: char(1), distinct: 2 }
+        - { name: counterparty_document, type: varchar(14), distinct: 40000000 }
+        - { name: reference_id, type: varchar(36), distinct: 2000000000 }
+        - { name: description, type: varchar(140), distinct: 300000000 }
+        - { name: balance_after_cents, type: bigint, distinct: 100000000 }
+      indexes:
+        - { name: ledger_entries_pkey, columns: [id], unique: true, sizeMb: 45000 }
+        - { name: idx_ledger_account, columns: [account_id], sizeMb: 47000 }
+        - { name: idx_ledger_account_created, columns: [account_id, created_at], sizeMb: 71000 }
+        - { name: idx_ledger_reference, columns: [reference_id], sizeMb: 98000 }
+        - { name: idx_ledger_type, columns: [type], sizeMb: 26000 }
+    - name: pix_transactions
+      rowCount: 890000000
+      sizeMb: 620000
+      columns:
+        - { name: id, type: bigint, distinct: 890000000 }
+        - { name: end_to_end_id, type: varchar(32), distinct: 890000000 }
+        - { name: account_id, type: bigint, distinct: 6800000 }
+        - { name: direction, type: varchar(8), distinct: 2 }
+        - { name: status, type: varchar(16), distinct: 7 }
+        - { name: amount_cents, type: bigint, distinct: 5000000 }
+        - { name: counterparty_key, type: varchar(77), distinct: 120000000 }
+        - { name: counterparty_ispb, type: varchar(8), distinct: 900 }
+        - { name: created_at, type: timestamp, distinct: 800000000 }
+        - { name: settled_at, type: timestamp, distinct: 800000000, nullable: true }
+        - { name: idempotency_key, type: varchar(64), distinct: 890000000 }
+      indexes:
+        - { name: pix_transactions_pkey, columns: [id], unique: true, sizeMb: 19000 }
+        - { name: uq_pix_end_to_end, columns: [end_to_end_id], unique: true, sizeMb: 38000 }
+        - { name: idx_pix_account_created, columns: [account_id, created_at], sizeMb: 31000 }
+        - { name: idx_pix_status, columns: [status], sizeMb: 11000 }
+        - { name: uq_pix_idempotency, columns: [idempotency_key], unique: true, sizeMb: 52000 }
+    - name: receivables_schedule
+      rowCount: 310000000
+      sizeMb: 140000
+      columns:
+        - { name: id, type: bigint, distinct: 310000000 }
+        - { name: merchant_account_id, type: bigint, distinct: 420000 }
+        - { name: settlement_date, type: date, distinct: 1500 }
+        - { name: arrangement, type: varchar(8), distinct: 12 }
+        - { name: acquirer_code, type: varchar(8), distinct: 30 }
+        - { name: gross_cents, type: bigint, distinct: 4000000 }
+        - { name: net_cents, type: bigint, distinct: 4000000 }
+        - { name: status, type: varchar(16), distinct: 6 }
+        - { name: anticipated, type: boolean, distinct: 2 }
+        - { name: updated_at, type: timestamp, distinct: 300000000 }
+      indexes:
+        - { name: receivables_schedule_pkey, columns: [id], unique: true, sizeMb: 6600 }
+        - { name: idx_recv_merchant_date, columns: [merchant_account_id, settlement_date], sizeMb: 12000 }
+        - { name: idx_recv_settlement_date, columns: [settlement_date], sizeMb: 7000 }
+        - { name: idx_recv_status, columns: [status], sizeMb: 4000 }
+    - name: reconciliation_items
+      rowCount: 480000000
+      sizeMb: 210000
+      columns:
+        - { name: id, type: bigint, distinct: 480000000 }
+        - { name: batch_id, type: bigint, distinct: 1400 }
+        - { name: cip_file_line, type: integer, distinct: 3000000 }
+        - { name: reference_id, type: varchar(36), distinct: 470000000 }
+        - { name: amount_cents, type: bigint, distinct: 6000000 }
+        - { name: matched_ledger_id, type: bigint, distinct: 470000000, nullable: true }
+        - { name: status, type: varchar(16), distinct: 4 }
+        - { name: processed_at, type: timestamp, distinct: 400000000, nullable: true }
+      indexes:
+        - { name: reconciliation_items_pkey, columns: [id], unique: true, sizeMb: 10000 }
+        - { name: idx_recon_batch, columns: [batch_id], sizeMb: 9000 }
+        - { name: idx_recon_reference, columns: [reference_id], sizeMb: 22000 }
+    - name: customers
+      rowCount: 6500000
+      sizeMb: 3900
+      columns:
+        - { name: id, type: bigint, distinct: 6500000 }
+        - { name: document, type: varchar(14), distinct: 6500000 }
+        - { name: full_name, type: varchar(160), distinct: 6000000 }
+        - { name: email, type: varchar(160), distinct: 6400000 }
+        - { name: phone, type: varchar(20), distinct: 6300000 }
+        - { name: risk_tier, type: varchar(8), distinct: 5 }
+        - { name: created_at, type: timestamp, distinct: 6000000 }
+      indexes:
+        - { name: customers_pkey, columns: [id], unique: true, sizeMb: 140 }
+        - { name: uq_customers_document, columns: [document], unique: true, sizeMb: 200 }
+        - { name: idx_customers_email, columns: [email], sizeMb: 260 }
+    - name: fraud_decisions
+      rowCount: 1200000000
+      sizeMb: 380000
+      columns:
+        - { name: id, type: bigint, distinct: 1200000000 }
+        - { name: transaction_ref, type: varchar(36), distinct: 1200000000 }
+        - { name: account_id, type: bigint, distinct: 6800000 }
+        - { name: score, type: numeric(5,4), distinct: 10000 }
+        - { name: decision, type: varchar(8), distinct: 3 }
+        - { name: rules_fired, type: jsonb, distinct: 90000 }
+        - { name: created_at, type: timestamp, distinct: 1100000000 }
+      indexes:
+        - { name: fraud_decisions_pkey, columns: [id], unique: true, sizeMb: 26000 }
+        - { name: idx_fraud_txref, columns: [transaction_ref], sizeMb: 60000 }
+        - { name: idx_fraud_account_created, columns: [account_id, created_at], sizeMb: 41000 }
+techDebts:
+  - title: "Ledger monolítico em uma tabela de 2,1 bi de linhas"
+    description: "ledger_entries nunca foi particionada; VACUUM leva 9h; qualquer índice novo demora 6h para construir"
+  - title: "Conciliação D+1 em batch único"
+    description: "reconciliation-batch é um job Spring Batch single-thread que lê o arquivo CIP inteiro e faz um SELECT por linha no ledger"
+  - title: "Saldo calculado por SUM no extrato"
+    description: "account-api ainda tem um endpoint legado que calcula saldo com SUM(amount_cents) no ledger quando o cache do Redis expira"
+  - title: "Idempotência do PIX depende do relógio do pod"
+    description: "idempotency_key inclui timestamp truncado ao minuto gerado no pod; skew de NTP já causou duplicidade em 2025"
+  - title: "Pool de conexões dimensionado por pod"
+    description: "Cada pod abre 20 conexões; com 60 pods o core-db passa de 1.200 conexões e o PgBouncer ainda não foi adotado"

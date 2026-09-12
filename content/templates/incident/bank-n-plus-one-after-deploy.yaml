@@ -1,0 +1,367 @@
+id: bank-incident-n-plus-one-statement
+type: INCIDENT
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, observability, sre, databases, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [3200, 9000], step: 200 }
+  onsetMinutesAgo: { range: [18, 40], step: 1 }
+  deployMinutesAgo: { range: [45, 70], step: 1 }
+  affectedShare: { choice: ["100", "100", "62"] }
+  change:
+    group:
+      - { changeDescription: "troca do fetch join por lazy loading no mapeamento de LedgerEntry, para 'reduzir o tamanho do SELECT'", author: "squad-contas", version: "2026.37.4" }
+      - { changeDescription: "novo campo calculado no DTO do extrato que consulta a conta de destino linha a linha", author: "squad-contas", version: "2026.38.0" }
+      - { changeDescription: "refactor do serviço de extrato para reaproveitar o repositório de conta, perdendo o batch de 50 ids", author: "squad-plataforma", version: "2026.37.9" }
+derived:
+  p99Before: "round(p99 / 22)"
+  ticketsPerMinute: "round(p99 / 260)"
+narrative:
+  title: "Extrato fora do ar: p99 do account-api em {{p99}}ms"
+  symptom: |
+    **{{onsetLabel}}** — o alerta `HighLatencyP99 / account-api` disparou e não voltou. O p99 do
+    `GET /accounts/{id}/statement` está em **{{p99}}ms** (baseline ~{{p99Before}}ms) e {{affectedShare}}% das chamadas
+    estouram o timeout de 5s do gateway. O suporte está recebendo ~{{ticketsPerMinute}} tickets por minuto.
+
+    Você é o on-call. O console tem logs, métricas, traces, SQL somente-leitura, linha do tempo de deploys/flags e
+    o mapa de infraestrutura. Ninguém sabe ainda o que mudou.
+  businessContext: |
+    O extrato é a tela mais acessada do app (4,2 milhões de usuários/dia). O SLO do account-api é p99 < 500ms com
+    error budget mensal de 0,1%. O `core-db` é compartilhado com PIX, cartão e recebíveis: o que satura o banco
+    atinge autorização de cartão, que tem timeout de 2s com a bandeira.
+  hints:
+    - "Comece isolando o escopo: a degradação está em um serviço ou em todos que usam o core-db?"
+    - "`| stats count by service` nos logs de ERROR mostra onde o erro se concentra."
+    - "Um trace do endpoint lento mostra se o tempo está em uma consulta cara ou em muitas consultas baratas."
+    - "A linha do tempo de deploys tem mais de uma entrada; nem toda mudança é a causa."
+checkpoints:
+  - id: first-tool
+    question: "O alerta acabou de disparar. Qual ferramenta você abre primeiro?"
+    options:
+      - id: metrics-by-service
+        label: "Métricas por serviço, para ver quem degradou"
+        verdict: GOOD
+        feedback: "Boa: isolar antes de aprofundar. Você vê o p99 do account-api em {{p99}}ms enquanto pix-api e receivables-api seguem normais — a degradação não é do banco inteiro, é de um caminho de código."
+      - id: db-logs
+        label: "Logs do banco, procurando erro"
+        verdict: RISKY
+        feedback: "Você foi direto para o banco, mas o p99 subiu só no account-api. Comece pela métrica por serviço para isolar; senão você vai ler milhares de linhas do core-db sem saber o que procurar."
+      - id: restart
+        label: "Reiniciar os pods do account-api"
+        verdict: BAD
+        feedback: "Reiniciar antes de olhar qualquer coisa tende a dar problema aqui: o restart apaga as métricas de heap e o estado das conexões, e com {{p99}}ms de p99 os pods novos entram já saturados. Você perde a evidência e não muda a causa."
+      - id: page-dba
+        label: "Acionar o DBA de plantão"
+        verdict: RISKY
+        feedback: "Escalar cedo não é errado, mas sem dado nenhum você transfere o problema sem contexto. Gaste 3 minutos nas métricas por serviço e chame o DBA com uma hipótese."
+  - id: what-changed
+    question: "O p99 subiu às {{onsetLabel}}. O que você verifica para responder 'o que mudou?'"
+    options:
+      - id: deploy-timeline
+        label: "Linha do tempo de deploys e feature flags, cruzando com o instante do início"
+        verdict: GOOD
+        feedback: "Certo. Há vários deploys na janela, mas só um bate com o horário e com o serviço afetado: {{version}} do account-api ({{author}}), {{deployLabel}} — {{changeDescription}}."
+      - id: any-deploy
+        label: "Fazer rollback do último deploy que aparecer na lista"
+        verdict: BAD
+        feedback: "Existem deploys de outros serviços na mesma janela. Reverter o último da lista sem cruzar serviço e horário reverte a release errada, cria uma segunda mudança no meio do incidente e não melhora os {{p99}}ms."
+      - id: infra-change
+        label: "Verificar mudanças de infraestrutura (RDS, EKS, rede)"
+        verdict: RISKY
+        feedback: "Vale olhar, e o mapa de infra está aí. Mas o padrão aqui é de um serviço só; mudança de RDS ou rede afetaria também pix-api e card-authorizer, que estão normais."
+  - id: read-the-trace
+    question: "Você abriu um trace do endpoint lento. O que caracteriza a assinatura de N+1?"
+    options:
+      - id: many-small-spans
+        label: "Dezenas de spans curtos e idênticos de SELECT dentro do mesmo request"
+        verdict: GOOD
+        feedback: "Exato: cada consulta custa poucos ms, mas são dezenas por request. Some tudo e você chega nos {{p99}}ms. É o padrão clássico de N+1 — nenhuma query isolada aparece como lenta no pg_stat_statements por tempo médio."
+      - id: one-long-span
+        label: "Um único span longo dominando o request"
+        verdict: BAD
+        feedback: "Essa é a assinatura de query cara/lock/terceiro lento, não de N+1. Aqui o trace mostra muitos spans curtos: o custo está na quantidade, não na duração de cada um."
+      - id: gaps-between-spans
+        label: "Intervalos vazios entre spans (tempo fora de instrumentação)"
+        verdict: RISKY
+        feedback: "Gaps indicam espera não instrumentada (fila, GC, pool). Vale checar, mas neste trace os spans estão colados e repetidos — a soma das consultas explica o tempo."
+  - id: mitigate-first
+    question: "São {{ticketsPerMinute}} tickets por minuto. Qual a primeira ação de mitigação?"
+    options:
+      - id: rollback
+        label: "Rollback do deploy {{version}} do account-api"
+        verdict: GOOD
+        feedback: "Sim: a mudança é recente, isolada em um serviço e correlacionada no tempo. Rollback é reversível, rápido e devolve o p99 a ~{{p99Before}}ms. Corrigir o mapeamento com calma vem depois."
+      - id: scale-pods
+        label: "Dobrar o número de pods do account-api"
+        verdict: BAD
+        feedback: "Escalar multiplica o problema: cada pod novo abre mais conexões e dispara mais consultas no core-db, que já está saturado — e o card-authorizer, que divide o banco, começa a negar compras. Mitigue revertendo a mudança."
+      - id: increase-timeout
+        label: "Aumentar o timeout do gateway de 5s para 30s"
+        verdict: BAD
+        feedback: "Aumentar timeout transforma erro rápido em espera longa: as conexões ficam presas por mais tempo, o pool satura de vez e o incidente piora. Nunca amplie timeout como mitigação de latência."
+mitigations:
+  - id: rollback-deploy
+    label: "Rollback do deploy {{version}} do account-api"
+    description: "Reverte para a release anterior via ArgoCD (leva ~3 min)"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "Rollback com diagnóstico: em 3 minutos o p99 do account-api volta a ~{{p99Before}}ms, os erros 504 cessam e o read IOPS do core-db normaliza. Registre o horário na linha do tempo do post-mortem."
+    feedbackWhenBlind: "Funcionou — o p99 caiu para ~{{p99Before}}ms — mas você reverteu sem nenhuma evidência de que esse deploy era a causa. Em um incidente com vários deploys na janela isso é aposta, não diagnóstico: da próxima vez cruze horário e serviço antes."
+  - id: scale-out
+    label: "Dobrar as réplicas do account-api (12 → 24 pods)"
+    description: "Escala horizontal no EKS"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Piorou: cada pod novo abre 20 conexões no core-db e repete as mesmas dezenas de consultas por request. As conexões passam de 1.200 e o card-authorizer começa a estourar o timeout de 2s com a bandeira."
+  - id: increase-pool
+    label: "Aumentar o pool de conexões de 20 para 60 por pod"
+    description: "Muda a configuração do HikariCP e reinicia os pods"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "O pool não é o gargalo, é o sintoma. Com 60 conexões por pod e 12 pods você leva o core-db a 720 conexões só do account-api, a CPU do banco satura e a degradação se espalha para PIX e cartão."
+  - id: kill-queries
+    label: "Matar as sessões ativas do account-api no banco (pg_terminate_backend)"
+    description: "Encerra as consultas em andamento do serviço afetado"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Alivia por alguns segundos e libera conexões, mas o serviço refaz as mesmas consultas no request seguinte. Serve para destravar o banco enquanto o rollback sobe, não como solução."
+  - id: rate-limit-endpoint
+    label: "Rate limit no endpoint de extrato (degradação controlada)"
+    description: "Limita o extrato a 30% do tráfego e devolve 429 no restante"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Protege o core-db e, com isso, o cartão e o PIX — decisão defensável quando o rollback demora. O custo é que 70% dos usuários ficam sem extrato de propósito: comunique antes de aplicar."
+  - id: restart-pods
+    label: "Reiniciar os pods do account-api"
+    description: "Rollout restart no deployment"
+    verdict: BAD
+    effect: NONE
+    feedback: "Sem efeito: o código continua o mesmo depois do restart. Você perdeu as métricas de heap e o estado do pool, que eram evidência, e adicionou um período de warm-up com ainda mais latência."
+stakeholders:
+  - id: cto
+    from: "Marina (CTO)"
+    afterSeconds: 240
+    text: "Estou vendo o alerta. O app está fora para os clientes? Preciso de um resumo em uma frase para o grupo da diretoria."
+  - id: support
+    from: "Rafael (Head de Suporte)"
+    afterSeconds: 600
+    text: "São {{ticketsPerMinute}} tickets por minuto. Posso publicar um aviso no app? Se sim, com qual previsão?"
+  - id: cards
+    from: "Bruno (squad Cartão)"
+    afterSeconds: 900
+    text: "Estamos vendo timeout com a bandeira. É o mesmo incidente? Precisamos abrir um segundo?"
+    expectsUpdate: false
+solutionPaths:
+  - id: rollback-then-fix
+    name: "Rollback imediato e correção do mapeamento depois"
+    summary: "Reverter a release {{version}}, restabelecer o SLO e corrigir o N+1 com batch/fetch join em um hotfix revisado."
+    pros: ["Restabelece o serviço em minutos", "Reversível", "Preserva a evidência para o post-mortem"]
+    cons: ["A funcionalidade da release volta a faltar", "Exige disciplina para o fix sair mesmo depois"]
+    bestWhen: "a mudança é recente, isolada e correlacionada no tempo — exatamente o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [N_PLUS_ONE] }
+          missing: "A causa raiz é um N+1 introduzido pela release {{version}}: {{changeDescription}}."
+          present: "Causa raiz correta: N+1 introduzido no deploy."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: TRACE_VIEW }
+            - { type: investigation, kind: DEPLOYS_VIEW }
+          missing: "Uma investigação defensável cruza métrica por serviço, trace do endpoint e linha do tempo de deploys — faltou pelo menos uma."
+          present: "Investigação completa: métrica, trace e o que mudou."
+        - id: mitigation
+          name: "Mitigação segura e informada"
+          weight: 20
+          evidence:
+            - { type: mitigation, id: rollback-deploy, informed: true }
+          missing: "Faltou estancar o sangramento com uma ação segura e informada: rollback da release correlacionada, depois de confirmar serviço e horário."
+          present: "Você mitigou com rollback, depois de investigar."
+        - id: communication
+          name: "Comunicação com stakeholders"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 600 }
+          missing: "Durante o incidente a CTO e o suporte cobraram posição: publique ao menos dois status updates, o primeiro em até 10 minutos."
+          present: "Stakeholders informados no ritmo certo."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 25
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+            - { type: keyword, field: postMortem, anyOf: ["sem culpado", "blameless", "processo", "não foi falta de atenção"], min: 1 }
+            - { type: keyword, field: postMortem, anyOf: ["teste", "detecção", "alerta", "limite de queries", "code review", "p6spy", "contador de queries"], min: 1 }
+          missing: "O post-mortem precisa das seções Impacto, Linha do tempo, Causa raiz e Ações, tom blameless e ações que ataquem detecção e prevenção (ex.: contador de queries por request no teste de integração)."
+          present: "Post-mortem completo, blameless e com ações de prevenção."
+  - id: hotfix-forward
+    name: "Hotfix para frente (fix forward)"
+    summary: "Corrigir o mapeamento e subir um hotfix sem reverter, mantendo a funcionalidade da release."
+    pros: ["Mantém o que a release entregou", "Evita dois deploys"]
+    cons: ["Escrever, revisar e subir código com o serviço fora leva dezenas de minutos", "Risco de um segundo erro sob pressão", "O error budget continua queimando"]
+    bestWhen: "o rollback é inviável (migração de banco irreversível, contrato quebrado) — não é o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [N_PLUS_ONE] }
+          missing: "A causa raiz é o N+1 da release {{version}}."
+          present: "Causa raiz correta."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: TRACE_VIEW }
+            - { type: investigation, kind: DEPLOYS_VIEW }
+          missing: "Sem trace e linha do tempo você não sustenta a escolha de corrigir para frente."
+          present: "Evidência coletada."
+        - id: interim
+          name: "Proteção enquanto o hotfix não sobe"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Fix forward leva tempo: use uma mitigação parcial (rate limit no extrato ou matar as sessões) para proteger o core-db e, com ele, cartão e PIX."
+          present: "Proteção intermediária aplicada."
+        - id: justification
+          name: "Justificativa do fix forward"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["rollback", "reverter", "irreversível", "migração"], min: 1 }
+          missing: "Explique por que não reverteu: fix forward precisa de justificativa explícita quando o rollback estava disponível."
+          present: "Escolha justificada."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem: Impacto, Linha do tempo, Causa raiz e Ações."
+          present: "Post-mortem estruturado."
+  - id: degrade-and-investigate
+    name: "Degradação controlada e investigação"
+    summary: "Reduzir o extrato a uma janela mínima (ou 429 para parte do tráfego), proteger o core-db e só então decidir entre rollback e hotfix."
+    pros: ["Protege cartão e PIX, que têm impacto financeiro imediato", "Compra tempo para diagnóstico"]
+    cons: ["Usuários ficam sem extrato de propósito", "Exige comunicação imediata", "Não resolve nada sozinha"]
+    bestWhen: "o raio de explosão ameaça sistemas mais críticos que o degradado e a causa ainda não está clara"
+    rubric:
+      criteria:
+        - id: blast-radius
+          name: "Raio de explosão"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["cartão", "cartao", "card-authorizer", "pix", "core-db", "compartilhado"], min: 1 }
+          missing: "O argumento dessa estratégia é o recurso compartilhado: explicite que o core-db serve cartão e PIX e que protegê-lo é a prioridade."
+          present: "Raio de explosão analisado."
+        - id: mitigation
+          name: "Mitigação aplicada"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique a degradação de fato (rate limit no extrato ou encerrar as sessões), não apenas descreva."
+          present: "Degradação controlada aplicada."
+        - id: communication
+          name: "Comunicação"
+          weight: 25
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 480 }
+          missing: "Degradar de propósito exige avisar antes: dois status updates, o primeiro em até 8 minutos."
+          present: "Degradação comunicada."
+        - id: postmortem
+          name: "Post-mortem"
+          weight: 25
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Faltam seções obrigatórias no post-mortem."
+          present: "Post-mortem estruturado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: N_PLUS_ONE, label: "N+1: muitas consultas pequenas por request, introduzidas no deploy" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool de conexões (causa primária)" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+        - { value: THIRD_PARTY, label: "Lentidão de terceiro" }
+        - { value: INFRA_CHANGE, label: "Mudança de infraestrutura" }
+    - id: triggerChange
+      label: "Mudança que disparou o incidente"
+      type: SELECT
+      required: true
+      options:
+        - { value: account-api-deploy, label: "Deploy do account-api" }
+        - { value: other-deploy, label: "Deploy de outro serviço" }
+        - { value: feature-flag, label: "Mudança de feature flag" }
+        - { value: none, label: "Nenhuma mudança: degradação orgânica" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: rollback-then-fix, label: "Rollback agora, correção depois" }
+        - { value: hotfix-forward, label: "Hotfix para frente" }
+        - { value: degrade-and-investigate, label: "Degradação controlada e investigação" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até o rollback, {{affectedShare}}% das chamadas a `GET /accounts/{id}/statement` ficaram acima do
+  timeout de 5s (p99 de {{p99}}ms contra baseline de {{p99Before}}ms). ~{{ticketsPerMinute}} tickets/min no suporte.
+  Impacto secundário: o `core-db` saturou e o `card-authorizer` registrou timeouts com a bandeira.
+
+  ## Linha do tempo
+  - **{{deployLabel}}** — deploy {{version}} do account-api ({{author}}): {{changeDescription}}.
+  - **{{onsetLabel}}** — p99 do account-api começa a subir; read IOPS do core-db acompanha; pix-api e receivables-api normais.
+  - **{{onsetLabel}} + 4min** — alerta `HighLatencyP99` dispara.
+  - **+ ~10min** — trace do endpoint mostra dezenas de spans `SELECT FROM ledger_entries WHERE id = ?` dentro de um request.
+  - **+ ~15min** — rollback da {{version}}; p99 volta a ~{{p99Before}}ms em 3 minutos.
+
+  ## Causa raiz
+  N+1. A mudança removeu o carregamento em lote: onde antes havia uma consulta com `IN (...)` de 50 ids, passou a haver
+  uma consulta por linha do extrato. Nenhuma query isolada é lenta — por isso `pg_stat_statements` ordenado por
+  `mean_exec_time` **não** aponta o problema; ordenado por `calls` ou `total_exec_time`, sim. A assinatura está no trace:
+  muitos spans curtos e idênticos.
+
+  ## Ações
+  1. **Correção (hoje):** restaurar o carregamento em lote (fetch join ou `IN` com particionamento de 500 ids) e subir com canário de 10%.
+  2. **Detecção (esta semana):** teste de integração que falha se um request executar mais de N queries (contador via `p6spy`/interceptor JDBC).
+  3. **Detecção (esta semana):** alerta de `calls/min` por statement no `pg_stat_statements`, não só de tempo médio.
+  4. **Prevenção (este mês):** checklist de review para mudanças em mapeamento ORM do ledger.
+  5. **Raio de explosão (este trimestre):** pool/role separado por serviço no core-db, para que o extrato não derrube a autorização de cartão.
+
+  Post-mortem blameless: o problema é de processo — nada no pipeline media quantidade de queries por request, e o
+  review não tinha como ver o efeito da mudança de mapeamento.
+scenario:
+  kind: incident
+  params:
+    rootCause: N_PLUS_ONE
+    service: account-api
+    datastore: core-db
+    endpoint: "GET /accounts/{id}/statement"
+    table: ledger_entries
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    deployAt: "{{deployMinutesAgoAt}}"
+    deployService: account-api
+    deployVersion: "{{version}}"
+    deployAuthor: "{{author}}"
+    deployDescription: "{{changeDescription}}"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: rollback-then-fix
+  rules:
+    - { param: p99, op: ">=", value: 8000, path: degrade-and-investigate, reason: "com p99 em {{p99}}ms o core-db compartilhado já está derrubando a autorização de cartão; proteger o recurso comum vem antes até do rollback" }

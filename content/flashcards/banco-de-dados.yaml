@@ -1,0 +1,88 @@
+id: banco-de-dados
+name: Banco de dados
+description: Índices, planos de execução, locks, vacuum e modelagem física.
+cards:
+  - id: sargable
+    front: "O que torna um predicado **não-sargável**?"
+    back: |
+      Aplicar função ou conversão **sobre a coluna**: `date(created_at) = ?`, `lower(email) = ?`, `documento = 123` em
+      coluna varchar (cast implícito). O índice b-tree guarda o valor da coluna, não o resultado da função, então o
+      planner varre tudo. Corrija movendo a transformação para o parâmetro ou criando índice de expressão.
+    competencies: [databases]
+  - id: composite-order
+    front: "Em um índice composto, qual coluna vem primeiro?"
+    back: |
+      As de **igualdade** primeiro, a de **intervalo ou ordenação** por último. Para
+      `WHERE account_id = ? AND created_at >= ? ORDER BY created_at DESC`, o índice é `(account_id, created_at)`.
+      Invertido, o banco não consegue usar a segunda coluna para filtrar.
+    competencies: [databases]
+  - id: index-cost
+    front: "Qual o custo de um índice?"
+    back: |
+      Espaço, escrita mais lenta (todo INSERT/UPDATE mantém o índice), mais trabalho para o vacuum e mais opções para o
+      planner errar. Índice que nunca aparece em `pg_stat_user_indexes.idx_scan` é dívida pura — mas verifique 30 dias,
+      não 3: relatórios mensais existem.
+    competencies: [databases]
+  - id: concurrently
+    front: "Por que `CREATE INDEX CONCURRENTLY` em tabela grande?"
+    back: |
+      `CREATE INDEX` comum pega ShareLock e bloqueia escrita pela duração inteira — horas em tabelas de bilhões de linhas.
+      `CONCURRENTLY` não bloqueia escrita, mas leva mais tempo, não roda dentro de transação e pode deixar o índice
+      `INVALID` se falhar (verifique `indisvalid` e recrie).
+    competencies: [databases]
+  - id: seq-scan-ok
+    front: "Seq Scan é sempre ruim?"
+    back: |
+      Não. Quando a consulta retorna boa parte da tabela, varrer sequencialmente é mais barato que pular pelo índice e
+      buscar linha a linha. O planner troca para Seq Scan em torno de 5–10% de seletividade. O problema é Seq Scan em
+      consulta que deveria retornar poucas linhas.
+    competencies: [databases]
+  - id: explain-analyze
+    front: "O que olhar primeiro em um `EXPLAIN ANALYZE`?"
+    back: |
+      A diferença entre `rows` estimado e `rows` real (estatística ruim), `Rows Removed by Filter` (lendo muito para
+      descartar), `loops` alto (N+1 dentro do plano) e `Sort Method: external merge Disk` (work_mem insuficiente).
+      O custo absoluto importa menos que onde o tempo se concentra.
+    competencies: [databases]
+  - id: n-plus-one-detection
+    front: "Como detectar **N+1** que não aparece no `pg_stat_statements` por tempo médio?"
+    back: |
+      Cada consulta é rápida; o problema é a quantidade. Ordene por `calls` e por `total_exec_time`, não por
+      `mean_exec_time`. No trace, a assinatura é dezenas de spans curtos e idênticos no mesmo request. No CI, um teste
+      que falha se um request executar mais de N consultas.
+    competencies: [databases, observability]
+  - id: long-transaction
+    front: "Por que uma transação longa é perigosa no PostgreSQL?"
+    back: |
+      Segura locks das linhas que tocou até o commit, impede o vacuum de limpar versões mortas (bloat cresce) e trava
+      escritas concorrentes. Defesas: commits em lotes curtos, `idle_in_transaction_session_timeout`, `lock_timeout` e
+      alerta para qualquer transação acima de alguns minutos.
+    competencies: [databases, concurrency]
+  - id: mvcc-vacuum
+    front: "Por que o PostgreSQL precisa de **VACUUM**?"
+    back: |
+      No MVCC, UPDATE e DELETE não apagam: criam versão nova e marcam a antiga como morta. VACUUM recupera esse espaço.
+      Sem ele, a tabela incha, as varreduras leem páginas mortas e o desempenho degrada. Autovacuum atrasado em tabela
+      grande com muita escrita é causa comum de lentidão sem mudança de código.
+    competencies: [databases]
+  - id: isolation-choice
+    front: "Quando subir o nível de isolamento para SERIALIZABLE?"
+    back: |
+      Quando a correção depende de uma invariante entre linhas que o READ COMMITTED não protege (dois pedidos lendo o
+      mesmo saldo e decidindo com base nele). O custo é erro de serialização sob concorrência: a aplicação **precisa**
+      ter retry. Alternativa mais barata: trazer a invariante para uma única linha e usar update atômico.
+    competencies: [databases, concurrency]
+  - id: nosql-choice
+    front: "Quando um banco de documentos ganha do relacional?"
+    back: |
+      Quando o agregado é lido e escrito inteiro, o schema varia por item e não há consulta que cruze muitos agregados
+      (catálogo com atributos por categoria, por exemplo). Perde quando você precisa de junções, transações entre
+      documentos ou relatórios ad hoc — que é onde a maioria dos projetos acaba.
+    competencies: [nosql]
+  - id: redis-use
+    front: "Quais usos de Redis vão além de cache?"
+    back: |
+      Contador atômico (`INCR`/`DECRBY`), rate limit (token bucket), lock distribuído com TTL (com as ressalvas do
+      Redlock), fila leve (Streams), deduplicação por conjunto e ranking (Sorted Set). Cuidado: memória é finita e a
+      política de despejo pode apagar o que você achava persistente.
+    competencies: [nosql, caching]

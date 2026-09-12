@@ -1,0 +1,179 @@
+.entry {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 1fr minmax(340px, 420px);
+  background: var(--ink-800);
+}
+
+.entry__pitch {
+  padding: clamp(1.75rem, 4vw, 3rem) clamp(1.5rem, 5vw, 4.5rem) clamp(2rem, 5vw, 4rem);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  color: var(--ink-text);
+}
+
+.entry__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  margin-bottom: clamp(2.5rem, 9vh, 6rem);
+  color: var(--signal);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.entry__brand span {
+  color: var(--ink-text);
+}
+
+.entry__mark {
+  width: 34px;
+  height: 20px;
+}
+
+/* O primeiro elemento da página é o alerta disparando: é o que este produto trata. */
+.entry__dispatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  align-self: flex-start;
+  margin: 0 0 var(--gap-5);
+  padding: 0.25rem 0.6rem;
+  border: 1px solid rgba(200, 64, 58, 0.55);
+  border-radius: 2px;
+  background: rgba(200, 64, 58, 0.12);
+  color: #f0a5a0;
+  font-size: var(--step--2);
+}
+
+.entry__dispatch-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--crit);
+  animation: alertPulse 2.4s ease-in-out infinite;
+}
+
+@keyframes alertPulse {
+  0%, 70%, 100% { opacity: 1; }
+  85% { opacity: 0.25; }
+}
+
+.entry__title {
+  font-size: clamp(2.1rem, 4.6vw, 3.4rem);
+  line-height: 1.06;
+  letter-spacing: -0.035em;
+  max-width: 16ch;
+  margin-bottom: var(--gap-4);
+}
+
+.entry__lede {
+  max-width: 54ch;
+  color: var(--ink-dim);
+  font-size: var(--step-1);
+  line-height: 1.55;
+  margin-bottom: var(--gap-6);
+}
+
+.entry__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+  max-width: 58ch;
+}
+
+.entry__list li {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr;
+  gap: var(--gap-4);
+  align-items: baseline;
+  font-size: var(--step--1);
+  color: var(--ink-dim);
+  padding-top: var(--gap-3);
+  border-top: 1px solid var(--ink-line);
+}
+
+.entry__list-key {
+  color: var(--signal);
+  font-size: var(--step--1);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ formulário */
+
+.entry__form-side {
+  display: grid;
+  place-items: center start;
+  padding: clamp(1.5rem, 4vw, 3rem);
+  background: var(--paper);
+}
+
+.entry__form {
+  width: min(340px, 100%);
+  margin: 0 auto;
+}
+
+.entry__tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: var(--gap-5);
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.entry__tab {
+  padding: 0.4rem 0.75rem;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  font-size: var(--step--1);
+  color: var(--graphite-faint);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+
+.entry__tab--on {
+  color: var(--graphite);
+  border-bottom-color: var(--signal);
+  font-weight: 600;
+}
+
+.entry__submit {
+  width: 100%;
+  justify-content: center;
+  padding: 0.6rem;
+  font-size: var(--step-0);
+}
+
+.entry__error {
+  margin: 0 0 var(--gap-3);
+  padding: 0.45rem 0.6rem;
+  background: var(--crit-wash);
+  color: #97241f;
+  border-radius: var(--radius);
+  font-size: var(--step--2);
+}
+
+.entry__note {
+  margin: var(--gap-4) 0 0;
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .entry {
+    grid-template-columns: 1fr;
+  }
+
+  .entry__pitch {
+    padding-bottom: var(--gap-6);
+  }
+
+  .entry__list {
+    display: none;
+  }
+}

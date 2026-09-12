@@ -1,0 +1,378 @@
+id: ecommerce-code-review-checkout-controller
+type: CODE_REVIEW
+company: ecommerce
+levels: [JUNIOR, PLENO, SENIOR]
+competencies: [solid, clean-arch, ddd, databases, microservices]
+tools: []
+parameters:
+  itemsPerOrder: { range: [3, 22], step: 1 }
+  ordersPerSecond: { range: [80, 900], step: 20 }
+  author:
+    group:
+      - { author: "um desenvolvedor recém-chegado à squad de checkout", reviewContext: "é o primeiro pull request dele no serviço e o time quer dar um feedback que ensine, não que humilhe" }
+      - { author: "uma pessoa sênior de outra squad, emprestada para a Black Friday", reviewContext: "ela conhece o negócio mas não conhece as convenções deste serviço" }
+      - { author: "o próprio tech lead do time, com o prazo em cima", reviewContext: "o PR está marcado como urgente e já tem uma aprovação automática de colega" }
+derived:
+  queriesPerOrder: "itemsPerOrder * 2 + 2"
+  queriesPerSecond: "ordersPerSecond * (itemsPerOrder * 2 + 2)"
+narrative:
+  title: "Code review: CheckoutController na véspera da Black Friday"
+  symptom: |
+    Chegou para revisão o pull request abaixo, escrito por {{author}} — {{reviewContext}}.
+
+    O código funciona nos testes e no ambiente de homologação com um pedido de 2 itens. Em produção, o pedido médio tem
+    **{{itemsPerOrder}} itens** e o pico é de **{{ordersPerSecond}} pedidos por segundo**.
+
+    Aponte os problemas, classifique o mais grave e escreva o comentário de revisão como você o deixaria no PR.
+  businessContext: |
+    O `checkout-api` roda em 30 pods com pool de 25 conexões cada no `orders-db` (RDS, limite de 3.000 conexões).
+    A Black Friday começa em 9 dias. O time segue Clean Architecture: regra de negócio no domínio, controller fino,
+    acesso a dados na infraestrutura.
+  hints:
+    - "Conte quantas idas ao banco um único pedido provoca."
+    - "Repare onde a transação começa e o que acontece dentro dela."
+    - "Procure o que acontece se a mesma requisição chegar duas vezes."
+artifacts:
+  - id: checkout-controller
+    title: "CheckoutController.java (do pull request)"
+    kind: CODE
+    language: java
+    content: |
+      @RestController
+      @RequestMapping("/checkout")
+      public class CheckoutController {
+
+          @Autowired private OrderRepository orderRepository;
+          @Autowired private ProductRepository productRepository;
+          @Autowired private InventoryClient inventoryClient;
+          @Autowired private PaymentClient paymentClient;
+          @Autowired private JdbcTemplate jdbc;
+
+          @PostMapping
+          @Transactional
+          public ResponseEntity<Map<String, Object>> checkout(@RequestBody CheckoutRequest request) {
+              Order order = new Order();
+              order.setCustomerId(request.getCustomerId());
+              order.setStatus("NEW");
+              order.setCreatedAt(new Date());
+              orderRepository.save(order);
+
+              long total = 0;
+              for (CartItem item : request.getItems()) {
+                  Product product = productRepository.findBySku(item.getSku());   // 1 query por item
+                  if (product == null) {
+                      return ResponseEntity.badRequest().body(Map.of("error", "produto " + item.getSku() + " nao existe"));
+                  }
+                  if (!product.isActive()) {
+                      return ResponseEntity.badRequest().body(Map.of("error", "produto inativo"));
+                  }
+                  // desconto progressivo: 5% acima de 3 unidades, 8% acima de 10, cumulativo com cupom
+                  long price = product.getPriceCents() * item.getQuantity();
+                  if (item.getQuantity() > 3) price = price - (price * 5 / 100);
+                  if (item.getQuantity() > 10) price = price - (price * 8 / 100);
+                  if (request.getCoupon() != null && request.getCoupon().startsWith("BF")) {
+                      price = price - (price * 15 / 100);
+                  }
+                  total += price;
+
+                  OrderItem orderItem = new OrderItem();
+                  orderItem.setOrderId(order.getId());
+                  orderItem.setSku(item.getSku());
+                  orderItem.setQuantity(item.getQuantity());
+                  orderItem.setUnitPriceCents(product.getPriceCents());
+                  jdbc.update("insert into order_items (order_id, sku, quantity, unit_price_cents, created_at) "
+                          + "values (" + order.getId() + ", '" + item.getSku() + "', " + item.getQuantity()
+                          + ", " + product.getPriceCents() + ", now())");
+
+                  inventoryClient.reserve(item.getSku(), item.getQuantity());     // HTTP dentro da transacao
+              }
+
+              order.setTotalCents(total);
+              orderRepository.save(order);
+
+              PaymentResponse payment = paymentClient.charge(request.getCardToken(), total);  // HTTP dentro da transacao
+              if (!payment.isApproved()) {
+                  throw new RuntimeException("pagamento recusado");
+              }
+              order.setStatus("PAID");
+              orderRepository.save(order);
+
+              System.out.println("pedido " + order.getId() + " do cliente " + request.getCustomerId()
+                      + " cartao " + request.getCardToken() + " total " + total);
+
+              return ResponseEntity.ok(Map.of("orderId", order.getId(), "total", total));
+          }
+      }
+checkpoints:
+  - id: worst-problem
+    question: "Qual é o problema mais grave deste código para a Black Friday?"
+    options:
+      - id: remote-in-transaction
+        label: "Chamadas HTTP (estoque e pagamento) dentro da transação do banco"
+        verdict: GOOD
+        feedback: "Esse é o mais grave: a transação fica aberta pelo tempo das chamadas remotas. Com {{ordersPerSecond}} pedidos/s e {{itemsPerOrder}} itens, as 750 conexões do pool ficam presas esperando rede, e o orders-db satura antes de qualquer pico real."
+      - id: sql-injection
+        label: "SQL concatenado, vulnerável a injeção"
+        verdict: RISKY
+        feedback: "É um problema sério e precisa ser corrigido — o `sku` vem do cliente. Mas para o risco da Black Friday, a transação segurando chamadas remotas derruba o serviço inteiro primeiro. Aponte os dois, com prioridades diferentes."
+      - id: n-plus-one
+        label: "Uma consulta de produto por item do pedido (N+1)"
+        verdict: RISKY
+        feedback: "Sim, são {{queriesPerOrder}} idas ao banco por pedido, ~{{queriesPerSecond|compact}} consultas/s no pico. Grave, mas ainda é carga; a transação aberta durante chamadas remotas é o que esgota o pool e para tudo."
+      - id: naming
+        label: "Nomes e formatação fora do padrão do time"
+        verdict: BAD
+        feedback: "Estilo não é o que vai derrubar o checkout. Um review que começa por formatação e não vê chamada remota dentro de transação gasta o crédito do revisor no lugar errado."
+  - id: domain-logic
+    question: "A regra de desconto progressivo está no controller. Qual o problema?"
+    options:
+      - id: anemic-domain
+        label: "Regra de negócio fora do domínio: não dá para testar sem HTTP e será duplicada no próximo canal"
+        verdict: GOOD
+        feedback: "Exato. O cálculo do preço é regra de negócio e pertence ao domínio (`OrderPricing` ou um método rico em `Order`). No controller, ela não é testável isoladamente e se repete quando o app mobile ou o seller-api precisarem do mesmo cálculo."
+      - id: performance
+        label: "Nenhum: é só um cálculo, não custa nada"
+        verdict: BAD
+        feedback: "O custo não é de CPU, é de manutenção e correção. Regra de preço duplicada entre canais é como surgem divergências de centavos que a contabilidade cobra depois."
+      - id: move-to-service
+        label: "Deveria estar em uma classe de serviço da aplicação"
+        verdict: RISKY
+        feedback: "Melhor que no controller, mas ainda vira domínio anêmico: a regra é sobre o pedido, então o pedido deveria sabê-la. Caso de uso orquestra; entidade decide."
+  - id: idempotency
+    question: "O gateway reenvia a requisição por timeout. O que acontece?"
+    options:
+      - id: duplicate-order
+        label: "Um segundo pedido é criado e o cartão é cobrado de novo"
+        verdict: GOOD
+        feedback: "Certo: não há chave de idempotência, e a tabela `orders` tem `uq_orders_idempotency` justamente para isso. Cobrar duas vezes na Black Friday é reembolso, ticket e reputação."
+      - id: transaction-protects
+        label: "A transação impede: a segunda falha por conflito"
+        verdict: BAD
+        feedback: "São duas requisições independentes, cada uma com a própria transação. Nada as relaciona — a transação garante atomicidade, não unicidade de intenção."
+      - id: client-problem
+        label: "É problema do cliente não reenviar"
+        verdict: BAD
+        feedback: "Retry por timeout é comportamento normal de qualquer gateway e SDK. O servidor é que precisa ser idempotente; essa responsabilidade não é delegável."
+solutionPaths:
+  - id: structural-review
+    name: "Review estrutural: separar transação, domínio e idempotência"
+    summary: "Apontar as classes de problema (transação com I/O remoto, domínio anêmico, N+1, injeção, vazamento de dado sensível) com prioridade e sugestão concreta para cada uma."
+    pros: ["Ensina o padrão, não só o caso", "Prioriza pelo risco real", "Deixa o PR pronto para ser corrigido de uma vez"]
+    cons: ["Review longo exige tempo do revisor", "Precisa de cuidado no tom para não soar como reprovação pessoal"]
+    bestWhen: "o código tem problemas de classe, não detalhes isolados — o caso aqui"
+    rubric:
+      criteria:
+        - id: transaction
+          name: "Chamada remota dentro da transação"
+          weight: 22
+          evidence:
+            - { type: choice, field: worstIssue, anyOf: [REMOTE_CALL_IN_TRANSACTION] }
+            - { type: keyword, field: review, anyOf: ["transação", "transacao", "pool", "conexão", "conexao"], min: 1 }
+          missing: "O problema mais grave é a chamada HTTP (estoque e pagamento) dentro da transação do banco, segurando conexão do pool durante I/O de rede."
+          present: "Chamada remota dentro da transação identificada como o risco principal."
+        - id: n-plus-one
+          name: "N+1 nas consultas de produto"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["n+1", "por item", "uma query por", "em lote", "findallby", "in ("], min: 1 }
+          missing: "São {{queriesPerOrder}} consultas por pedido: aponte o N+1 e sugira buscar os produtos em lote por SKU."
+          present: "N+1 apontado com sugestão de busca em lote."
+        - id: injection
+          name: "SQL concatenado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["injeção", "injecao", "injection", "parametriz", "prepared", "bind"], min: 1 }
+          missing: "O `sku` vem do cliente e é concatenado no SQL: aponte a injeção e peça parâmetros vinculados."
+          present: "Injeção de SQL apontada."
+        - id: domain
+          name: "Regra de negócio no lugar certo"
+          weight: 18
+          evidence:
+            - { type: keyword, field: review, anyOf: ["domínio", "dominio", "entidade", "regra de negócio", "regra de negocio", "anêmic", "anemic", "controller fino"], min: 1 }
+          missing: "O cálculo de desconto é regra de negócio no controller: proponha movê-la para o domínio, com teste unitário sem HTTP."
+          present: "Regra de negócio realocada no domínio."
+        - id: idempotency
+          name: "Idempotência"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["idempot", "duplicad", "retry", "reenvio", "chave"], min: 1 }
+          missing: "Sem chave de idempotência, o retry do gateway cria pedido e cobrança duplicados — a tabela já tem a restrição de unicidade para isso."
+          present: "Idempotência apontada."
+        - id: sensitive-data
+          name: "Dado sensível em log"
+          weight: 10
+          evidence:
+            - { type: keyword, field: review, anyOf: ["log", "println", "cardtoken", "token do cartão", "token do cartao", "dado sensível", "dado sensivel", "lgpd", "pci"], min: 1 }
+          missing: "O `System.out.println` imprime o token do cartão e o identificador do cliente: violação de LGPD/PCI e log não estruturado."
+          present: "Vazamento de dado sensível em log apontado."
+        - id: tone
+          name: "Tom do review"
+          weight: 5
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "poderia", "vamos", "que acha", "podemos", "proponho", "obrigad"], min: 1 }
+          missing: "{{reviewContext}} — escreva o comentário como um convite a mudar, não como veredito."
+          present: "Tom construtivo."
+  - id: blocking-review
+    name: "Bloquear o merge e repriorizar"
+    summary: "Reprovar o PR, apontar que a mudança precisa de outro desenho (reserva assíncrona, transação curta) e negociar o prazo antes de seguir."
+    pros: ["Evita colocar em produção um desenho que não sobrevive ao pico", "Explicita o risco para quem decide o prazo"]
+    cons: ["Confronta um prazo já assumido", "Exige alternativa pronta, senão vira só bloqueio"]
+    bestWhen: "o problema é de desenho e não cabe em ajuste de PR, e faltam poucos dias para o evento de pico"
+    rubric:
+      criteria:
+        - id: risk
+          name: "Risco explicitado com números"
+          weight: 30
+          evidence:
+            - { type: keyword, field: review, anyOf: ["pool", "conexão", "conexao", "pico", "black friday", "satura"], min: 1 }
+            - { type: number, field: estimatedQueriesPerOrder, expected: "queriesPerOrder", tolerance: 0.35 }
+          missing: "Bloquear exige número: quantas consultas por pedido, quantas conexões presas, o que acontece a {{ordersPerSecond}} pedidos/s."
+          present: "Risco quantificado."
+        - id: alternative
+          name: "Alternativa oferecida"
+          weight: 30
+          evidence:
+            - { type: keyword, field: review, anyOf: ["assíncron", "assincron", "fora da transação", "fora da transacao", "transação curta", "transacao curta", "fila", "outbox"], min: 1 }
+          missing: "Bloqueio sem alternativa é só atraso: proponha o desenho mínimo aceitável (transação curta, chamadas remotas fora dela)."
+          present: "Alternativa concreta oferecida."
+        - id: minimum-fixes
+          name: "Correções inegociáveis"
+          weight: 25
+          evidence:
+            - { type: keyword, field: review, anyOf: ["injeção", "injecao", "injection", "parametriz"], min: 1 }
+            - { type: keyword, field: review, anyOf: ["log", "token", "sensível", "sensivel"], min: 1 }
+          missing: "Mesmo em negociação de prazo, injeção de SQL e token de cartão em log não entram em produção: liste os inegociáveis."
+          present: "Inegociáveis listados."
+        - id: tone
+          name: "Tom"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "proponho", "vamos", "podemos", "alinhar", "conversar"], min: 1 }
+          missing: "Bloquear um PR urgente exige tom de negociação, não de veto."
+          present: "Tom de negociação."
+  - id: incremental-review
+    name: "Aprovar com correções obrigatórias e ticket de follow-up"
+    summary: "Exigir no PR as correções de segurança e as de custo baixo, registrando o redesenho da transação como item priorizado logo após o evento."
+    pros: ["Entrega valor sem travar o time", "Separa o que é urgente do que é estrutural"]
+    cons: ["Entra no pico com o desenho ruim", "Follow-up pode nunca acontecer"]
+    bestWhen: "o prazo é imexível e o time aceita um plano de contenção explícito para o pico"
+    rubric:
+      criteria:
+        - id: must-fix
+          name: "Correções obrigatórias"
+          weight: 35
+          evidence:
+            - { type: keyword, field: review, anyOf: ["injeção", "injecao", "parametriz"], min: 1 }
+            - { type: keyword, field: review, anyOf: ["log", "token", "sensível", "sensivel"], min: 1 }
+            - { type: keyword, field: review, anyOf: ["idempot", "duplicad"], min: 1 }
+          missing: "Injeção, dado sensível em log e idempotência precisam entrar antes do merge — são baratos e de risco alto."
+          present: "Correções obrigatórias bem delimitadas."
+        - id: contention-plan
+          name: "Plano de contenção para o pico"
+          weight: 30
+          evidence:
+            - { type: keyword, field: review, anyOf: ["timeout", "pool", "circuit", "limite", "rate", "monitor"], min: 1 }
+          missing: "Entrar no pico com chamadas remotas na transação exige contenção: timeout agressivo, breaker, alarme de pool."
+          present: "Plano de contenção definido."
+        - id: followup
+          name: "Follow-up com dono e prazo"
+          weight: 20
+          evidence:
+            - { type: keyword, field: review, anyOf: ["ticket", "follow", "após", "apos", "prazo", "dono", "backlog"], min: 1 }
+          missing: "Dívida sem dono e sem data não é decisão, é esquecimento: registre ticket, responsável e prazo."
+          present: "Follow-up com dono e prazo."
+        - id: tone
+          name: "Tom"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "podemos", "vamos", "proponho", "obrigad"], min: 1 }
+          missing: "{{reviewContext}} — mantenha o tom construtivo."
+          present: "Tom construtivo."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: worstIssue
+      label: "Problema mais grave"
+      type: SELECT
+      required: true
+      options:
+        - { value: REMOTE_CALL_IN_TRANSACTION, label: "Chamada HTTP dentro da transação do banco" }
+        - { value: SQL_INJECTION, label: "SQL concatenado (injeção)" }
+        - { value: N_PLUS_ONE, label: "N+1 nas consultas de produto" }
+        - { value: ANEMIC_DOMAIN, label: "Regra de negócio no controller" }
+        - { value: MISSING_IDEMPOTENCY, label: "Ausência de idempotência" }
+        - { value: SENSITIVE_LOG, label: "Dado sensível em log" }
+    - id: solutionPath
+      label: "Postura no review"
+      type: SELECT
+      required: true
+      options:
+        - { value: structural-review, label: "Review estrutural com prioridades" }
+        - { value: blocking-review, label: "Bloquear e repriorizar" }
+        - { value: incremental-review, label: "Aprovar com correções obrigatórias" }
+    - id: estimatedQueriesPerOrder
+      label: "Consultas ao banco por pedido (sua conta)"
+      type: NUMBER
+      required: true
+    - id: review
+      label: "Comentário de revisão"
+      type: MARKDOWN
+      required: true
+      help: "Escreva como deixaria no PR: o que muda, por que, e com qual prioridade."
+reference: |
+  ## Comentário de revisão
+
+  Obrigado pelo PR — o fluxo está correto e os testes cobrem o caminho feliz. Antes da Black Friday, tem alguns pontos
+  que vão nos derrubar em produção. Listei por prioridade.
+
+  ### 1. Bloqueante: chamadas HTTP dentro da transação do banco
+  `@Transactional` cobre o método inteiro, e dentro dele chamamos `inventoryClient.reserve(...)` por item e
+  `paymentClient.charge(...)`. A transação (e a conexão do pool) fica aberta durante toda a ida à rede. Com
+  {{itemsPerOrder}} itens médios e {{ordersPerSecond}} pedidos/s, as 750 conexões (30 pods × 25) ficam presas esperando
+  I/O e o `orders-db` satura antes do pico real.
+
+  Sugiro: transação curta só para persistir o pedido e a linha de outbox; reserva de estoque e cobrança fora dela,
+  orquestradas por evento (saga) ou, no mínimo, depois do commit, com estado intermediário no pedido.
+
+  ### 2. Bloqueante: SQL concatenado
+  ```java
+  jdbc.update("insert into order_items (...) values (" + order.getId() + ", '" + item.getSku() + "', ...)");
+  ```
+  `sku` vem do cliente: é injeção de SQL. Use parâmetros vinculados (`jdbc.update(sql, args...)`) ou o repositório JPA
+  que já existe para as outras entidades.
+
+  ### 3. Bloqueante: token de cartão no log
+  ```java
+  System.out.println("pedido ... cartao " + request.getCardToken() + ...);
+  ```
+  Token de cartão e identificador do cliente em log viola LGPD e nossa política de PCI. Troque por log estruturado
+  (`log.info("order.created", kv("orderId", id))`), sem dado sensível.
+
+  ### 4. Importante: N+1 nas consultas de produto
+  Um `findBySku` por item = {{queriesPerOrder}} idas ao banco por pedido (~{{queriesPerSecond|compact}} consultas/s no pico).
+  Sugiro `findAllBySkuIn(skus)` uma vez, antes do laço.
+
+  ### 5. Importante: sem idempotência
+  Se o gateway reenviar por timeout, criamos outro pedido e cobramos de novo. A tabela `orders` já tem
+  `uq_orders_idempotency`: receba a chave no cabeçalho, persista junto e devolva o pedido existente quando ela repetir.
+
+  ### 6. Estrutural: regra de negócio no controller
+  O desconto progressivo e o cupom são regra de domínio. No controller não dá para testar sem subir HTTP, e o cálculo
+  vai ser reescrito quando o app ou o `seller-api` precisarem dele. Sugiro `OrderPricing.calculate(items, coupon)` no
+  domínio, com teste unitário — inclusive porque hoje a ordem dos descontos (progressivo antes do cupom) não está
+  documentada em lugar nenhum.
+
+  ### Menores
+  - `@Autowired` em campo dificulta teste: prefira injeção por construtor.
+  - `new Date()` em vez de `Instant.now()` via porta de relógio (o time já usa `Clock` nos outros serviços).
+  - Retornar `Map<String, Object>` expõe estrutura sem contrato: use um DTO de resposta.
+  - `throw new RuntimeException("pagamento recusado")` dentro de `@Transactional` vira 500 e faz rollback de um pedido
+    que deveria existir com status `PAGAMENTO_RECUSADO`.
+
+  Posso pareá-lo amanhã de manhã para quebrar a transação — é a parte mais chata e a que mais muda o PR.
+scenario:
+  kind: none
+recommendation:
+  default: structural-review
+  rules:
+    - { param: ordersPerSecond, op: ">=", value: 700, path: blocking-review, reason: "a {{ordersPerSecond}} pedidos/s o desenho não sobrevive ao pico nem com ajustes pontuais; bloquear e renegociar é mais barato que um checkout fora do ar na Black Friday" }

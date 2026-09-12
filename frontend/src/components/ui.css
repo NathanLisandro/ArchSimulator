@@ -1,0 +1,188 @@
+.panel {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.panel--paper {
+  background: var(--paper-raised);
+  border: 1px solid var(--paper-line);
+  box-shadow: var(--shadow-raised);
+}
+
+.panel--ink {
+  background: var(--ink-700);
+  border: 1px solid var(--ink-line);
+}
+
+.panel__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gap-3);
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.panel--ink .panel__head {
+  border-bottom-color: var(--ink-line);
+  background: var(--ink-800);
+}
+
+.panel__title {
+  font-size: var(--step--1);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.panel--ink .panel__title {
+  color: var(--ink-text);
+}
+
+.panel__meta {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.panel--ink .panel__meta {
+  color: var(--ink-faint);
+}
+
+.panel__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+}
+
+.panel__body {
+  padding: 0.9rem;
+}
+
+.panel--ink .panel__body {
+  color: var(--ink-text);
+}
+
+.panel__body--flush {
+  padding: 0;
+}
+
+/* ------------------------------------------------------------------ estados */
+
+.empty {
+  padding: var(--gap-6) var(--gap-4);
+  text-align: center;
+}
+
+.empty__title {
+  margin: 0 0 0.25rem;
+  font-weight: 500;
+}
+
+.empty__hint {
+  margin: 0;
+  font-size: var(--step--1);
+  color: var(--graphite-faint);
+  max-width: 42ch;
+  margin-inline: auto;
+}
+
+.panel--ink .empty__title {
+  color: var(--ink-dim);
+}
+
+.panel--ink .empty__hint {
+  color: var(--ink-faint);
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-4);
+}
+
+.loading__bar {
+  display: block;
+  width: 72px;
+  height: 3px;
+  background: var(--paper-sunken);
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.loading__bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: var(--signal);
+  animation: sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.loading__label {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.error-note {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  background: var(--crit-wash);
+  color: #97241f;
+  border-radius: var(--radius);
+  font-size: var(--step--2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ------------------------------------------------------------------ nota */
+
+.score-ring__value {
+  font-family: var(--font-ui);
+  font-size: 1.75rem;
+  font-weight: 700;
+  fill: var(--graphite);
+}
+
+/* ------------------------------------------------------------------ trilha de cargo */
+
+.rank-track {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rank-track__step {
+  flex: 1;
+  padding: 0.3rem 0.5rem 0.35rem;
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+  background: var(--paper-sunken);
+  border-top: 2px solid var(--paper-line);
+  text-align: center;
+}
+
+.rank-track__step--done {
+  color: var(--signal-deep);
+  border-top-color: var(--signal);
+  background: var(--signal-wash);
+}
+
+.rank-track__step--current {
+  color: var(--paper-raised);
+  background: var(--graphite);
+  border-top-color: var(--signal);
+  font-weight: 600;
+}

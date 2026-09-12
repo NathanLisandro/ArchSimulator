@@ -1,0 +1,87 @@
+id: observabilidade-sre
+name: Observabilidade e SRE
+description: Logs, métricas, traces, SLO, error budget e resposta a incidentes.
+cards:
+  - id: three-pillars
+    front: "Logs, métricas e traces: qual pergunta cada um responde?"
+    back: |
+      **Métrica:** "algo está errado, e desde quando?" (barata, agregada, sem cardinalidade alta).
+      **Trace:** "onde o tempo foi gasto nesta requisição?" (caminho entre serviços).
+      **Log:** "o que exatamente aconteceu neste caso?" (detalhe, caro em volume).
+      A investigação eficiente vai nessa ordem: métrica → trace → log.
+    competencies: [observability]
+  - id: cardinality
+    front: "Por que **cardinalidade alta** quebra métricas?"
+    back: |
+      Cada combinação de rótulos vira uma série temporal. Colocar `userId` ou `orderId` como label gera milhões de
+      séries, estoura o custo e derruba a consulta. Identificadores vão em log e trace; métrica leva dimensões de
+      cardinalidade baixa (serviço, endpoint, status, região).
+    competencies: [observability]
+  - id: slo-sla
+    front: "SLI, SLO e SLA: qual a diferença?"
+    back: |
+      **SLI** é a medida (p99 de latência, taxa de sucesso). **SLO** é a meta interna sobre o SLI (99,9% de sucesso no
+      mês). **SLA** é o contrato com o cliente, com multa — e deve ser mais frouxo que o SLO, senão você descobre que
+      violou quando já é tarde.
+    competencies: [sre]
+  - id: error-budget
+    front: "O que é **error budget** e para que serve na prática?"
+    back: |
+      O complemento do SLO: 99,9% de meta dá 43 minutos de falha por mês. Serve para transformar "podemos arriscar este
+      deploy?" em conta objetiva: com orçamento sobrando, acelera; com orçamento estourado, congela funcionalidade e
+      investe em confiabilidade.
+    competencies: [sre]
+  - id: mttr-family
+    front: "MTTD, MTTA, MTTR, MTBF: qual costuma dar mais retorno?"
+    back: |
+      **MTTD** (detecção). Reduzir tempo de detecção melhora todo o resto e costuma custar alerta bem feito, não
+      arquitetura nova. Um incidente descoberto pelo cliente já consumiu mais orçamento que qualquer investigação rápida.
+    competencies: [sre, incident]
+  - id: alert-quality
+    front: "Como saber se um alerta é bom?"
+    back: |
+      Ele é **acionável** (existe algo a fazer), **sintomático** (mede dor do usuário, não causa interna) e **raro o
+      bastante** para ninguém ignorar. Alerta de CPU alta sem impacto é ruído; alerta de "p99 de checkout acima do SLO
+      por 5 minutos" é acionável.
+    competencies: [sre, observability]
+  - id: postmortem-blameless
+    front: "O que torna um post-mortem **blameless**?"
+    back: |
+      Focar no sistema que permitiu o erro, não em quem apertou o botão. A pergunta certa não é "por que ele fez isso?",
+      é "por que o sistema tornou isso fácil de fazer e difícil de perceber?". Sem isso, a informação para de circular e
+      o próximo incidente chega sem aviso.
+    competencies: [incident, leadership]
+  - id: postmortem-sections
+    front: "Quais seções um **post-mortem** precisa ter?"
+    back: |
+      **Impacto** (quem sofreu, quanto tempo, quanto custou), **Linha do tempo** (com horários), **Causa raiz**,
+      **Ações** com dono e prazo, separadas em correção, detecção e prevenção. Sem dono e prazo, a seção de ações é
+      lista de desejos.
+    competencies: [incident, communication]
+  - id: first-move
+    front: "Alerta dispara. Qual o primeiro movimento?"
+    back: |
+      Isolar o escopo: é um serviço ou todos? Métrica por serviço responde em segundos e evita meia hora lendo o log
+      errado. Em seguida: o que mudou (deploy, flag, config, job) na janela do início. Só então descer ao detalhe.
+    competencies: [incident, observability]
+  - id: mitigate-first
+    front: "Diagnosticar ou mitigar primeiro?"
+    back: |
+      Mitigar, desde que a ação seja **segura e reversível** (rollback, desligar flag, limitar tráfego) e você tenha
+      evidência mínima de que ela ajuda. Diagnóstico completo com o serviço fora custa error budget. O que não vale é
+      ação destrutiva sem evidência: restart que apaga estado, escalar o que já satura a dependência.
+    competencies: [incident]
+  - id: what-changed
+    front: "Por que \"o que mudou?\" é a pergunta mais produtiva em um incidente?"
+    back: |
+      A maioria dos incidentes começa com uma mudança: deploy, flag, config, migração, job, mudança de volume de um
+      parceiro. Uma linha do tempo unificada dessas mudanças reduz a investigação a cruzar dois eixos — o do sintoma e o
+      da mudança. Cuidado com o red herring: há sempre mais de uma mudança na janela.
+    competencies: [incident, observability]
+  - id: otel
+    front: "Qual o papel do **OpenTelemetry**?"
+    back: |
+      Padronizar instrumentação (API e SDK) e transporte (OTLP) para que logs, métricas e traces saiam do código sem
+      acoplamento ao fornecedor. Na prática, permite trocar o destino (Datadog, Grafana, New Relic) sem reinstrumentar —
+      e propagar o contexto de trace entre serviços de linguagens diferentes.
+    competencies: [observability]

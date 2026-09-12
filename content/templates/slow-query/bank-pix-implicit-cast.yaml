@@ -1,0 +1,241 @@
+id: bank-slow-query-pix-implicit-cast
+type: SLOW_QUERY
+company: banco-digital
+levels: [JUNIOR, PLENO, SENIOR]
+competencies: [databases, observability, microservices]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [4000, 12000], step: 250 }
+  sinceHoursAgo: { range: [1, 8] }
+  partner:
+    group:
+    - { partner: "Conciliadora Fênix", partnerService: "partner-recon-webhook", volume: "180000" }
+    - { partner: "ERP Nimbus", partnerService: "erp-sync-api", volume: "95000" }
+    - { partner: "Marketplace Orla", partnerService: "marketplace-payouts", volume: "260000" }
+derived:
+  p99Before: "round(p99 / 40)"
+  volumePerHour: "round(volume / 24)"
+narrative:
+  title: "Consulta de PIX por end_to_end_id em {{p99}}ms após integração com {{partner}}"
+  symptom: |
+    Desde {{sinceLabel}} o endpoint `GET /pix/transactions/by-e2e/{end_to_end_id}` do **pix-api** está em
+    **{{p99}}ms no p99** (baseline ~{{p99Before}}ms) e o pool de conexões dos pods saturou (20/20).
+    Como o pix-api compartilha o core-db, o **card-authorizer** começou a registrar timeouts de 2s com a bandeira.
+
+    O parceiro {{partner}} entrou em produção hoje enviando ~{{volumePerHour|number}} consultas/hora pelo novo
+    serviço `{{partnerService}}`, que passa o `end_to_end_id` no corpo JSON como **número** ("e2e": 12345678901234567890...).
+  businessContext: |
+    `pix_transactions` tem 890 milhões de linhas. `end_to_end_id` é `varchar(32)` com índice único `uq_pix_end_to_end`.
+    Timeouts na autorização de cartão viram transação negada no POS — impacto direto no lojista.
+  hints:
+    - "Compare o tipo do parâmetro no pg_stat_activity com o tipo da coluna."
+    - "Comparação varchar = numeric faz o Postgres converter a coluna, não o parâmetro."
+checkpoints:
+  - id: scope
+    question: "Dois serviços degradaram (pix-api e card-authorizer). Por onde começa?"
+    options:
+      - id: shared-resource
+        label: "Verificar o recurso compartilhado (core-db): CPU, conexões e pg_stat_activity"
+        verdict: GOOD
+        feedback: "Sim: quando serviços independentes degradam juntos, procure o recurso em comum. O core-db está com CPU alta e {{volumePerHour|number}} consultas/hora novas em pg_stat_activity vindas do pix-api."
+      - id: card-first
+        label: "Investigar o card-authorizer primeiro, porque negar cartão é o impacto maior"
+        verdict: RISKY
+        feedback: "O impacto é maior no cartão, mas o sintoma nasce fora dele: o card-authorizer só espera conexão. Comece pelo recurso compartilhado; senão você gasta 20 minutos onde não há causa."
+      - id: block-partner
+        label: "Bloquear o parceiro {{partner}} no WAF imediatamente"
+        verdict: RISKY
+        feedback: "Bloquear é uma mitigação possível — e rápida — mas sem confirmar que as consultas do parceiro são as lentas você pode cortar um cliente novo à toa. Rate limit por parceiro é mais proporcional; confirme em pg_stat_activity antes."
+  - id: cause
+    question: "pg_stat_activity mostra dezenas de sessões ativas com `WHERE end_to_end_id = 12345678901234567890` (sem aspas). O que está acontecendo?"
+    options:
+      - id: implicit-cast
+        label: "Comparação varchar com numeric: o Postgres converte a coluna para numeric em cada linha e o índice único é ignorado"
+        verdict: GOOD
+        feedback: "Exato. O plano vira Seq Scan em 890 milhões de linhas com `Filter: ((end_to_end_id)::numeric = ...)`. O fix é comparar string com string: validar/converter o parâmetro na borda do pix-api."
+      - id: missing-index
+        label: "Falta índice em end_to_end_id"
+        verdict: BAD
+        feedback: "O índice único uq_pix_end_to_end existe. Ele não é usado porque o predicado compara a coluna convertida para numeric — nenhum índice b-tree sobre o varchar serve para isso."
+      - id: partition-hot
+        label: "Hot partition no Kafka do parceiro"
+        verdict: BAD
+        feedback: "O caminho é síncrono (HTTP → pix-api → core-db); Kafka não participa dessa consulta. O sinal está no banco: sessões ativas com o predicado numérico."
+solutionPaths:
+  - id: fix-parameter-type
+    name: "Corrigir o tipo do parâmetro na borda"
+    summary: "Validar o end_to_end_id como string no contrato do endpoint e bindar como varchar no JDBC; devolver 400 para número."
+    pros: ["Corrige a causa raiz", "Zero mudança no banco", "Protege contra qualquer novo parceiro"]
+    cons: ["Quebra o contrato aceito implicitamente pelo parceiro (precisa comunicar)", "Depende de deploy do pix-api"]
+    bestWhen: "o contrato do endpoint deve ser string — como sempre foi — e você controla a borda"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [IMPLICIT_CAST] }
+          missing: "A causa raiz é a conversão implícita varchar → numeric que impede o uso de uq_pix_end_to_end."
+          present: "Causa raiz correta: cast implícito."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_activity }
+            - { type: investigation, kind: EXPLAIN, target: pix_transactions }
+          missing: "Mostre as sessões ativas com o predicado numérico (pg_stat_activity) e o EXPLAIN com `::numeric` no Filter."
+          present: "Evidência coletada."
+        - id: fix
+          name: "Correção na borda"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [string, varchar, validar, validação, contrato, 400, schema], min: 2 }
+          missing: "Descreva a validação do parâmetro como string (schema do contrato, 400 para tipo errado) e o bind tipado no repositório."
+          present: "Correção na borda descrita."
+        - id: mitigation
+          name: "Mitigação e proteção do cartão"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [rate limit, bulkhead, pool separado, timeout, circuit, isolar, limitar], min: 1 }
+          missing: "Enquanto o fix não sobe: rate limit para {{partnerService}} e isolamento do pool (bulkhead) para o card-authorizer não depender do pix-api."
+          present: "Mitigação e isolamento definidos."
+  - id: rate-limit-partner
+    name: "Rate limit + contrato com o parceiro"
+    summary: "Limitar {{partnerService}} por chave de API e exigir que envie o end_to_end_id como string, mantendo o fix no pix-api para depois."
+    pros: ["Alivia em minutos", "Não exige deploy do pix-api"]
+    cons: ["Depende do parceiro corrigir", "Qualquer outro cliente pode repetir o erro", "Não corrige a causa raiz"]
+    bestWhen: "o deploy do pix-api não é possível na janela e o parceiro é responsivo"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [IMPLICIT_CAST] }
+          missing: "A causa raiz é o cast implícito; rate limit só controla o volume."
+          present: "Causa raiz correta."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_activity }
+          missing: "Confirme em pg_stat_activity que as sessões lentas vêm do parceiro."
+          present: "Evidência coletada."
+        - id: limit
+          name: "Rate limit proporcional"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [rate limit, api key, chave, por parceiro, 429], min: 1 }
+          missing: "Defina o rate limit por chave do parceiro (ex.: 50 req/s, resposta 429) — não bloqueio total."
+          present: "Rate limit definido."
+        - id: follow-up
+          name: "Fix definitivo"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [validar, string, contrato, varchar], min: 1 }
+          missing: "Registre o fix definitivo: validar o tipo do parâmetro na borda do pix-api."
+          present: "Fix definitivo planejado."
+  - id: bulkhead
+    name: "Isolar pools (bulkhead) entre pix-api e card-authorizer"
+    summary: "Separar o pool/usuário de banco do card-authorizer e limitar conexões do pix-api, para que um serviço lento não derrube o outro."
+    pros: ["Reduz o raio de explosão de qualquer incidente futuro", "Alinha com a dívida técnica do pool por pod"]
+    cons: ["Não resolve a query lenta", "Mudança de infra (PgBouncer/limites por role) no meio do incidente"]
+    bestWhen: "como medida estrutural após o incidente, não como primeira resposta"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 30
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [IMPLICIT_CAST] }
+          missing: "Bulkhead protege o cartão, mas a causa raiz é o cast implícito."
+          present: "Causa raiz correta."
+        - id: isolation
+          name: "Isolamento correto"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [pgbouncer, role, usuário, limite de conexões, connection limit, pool], min: 2 }
+          missing: "Descreva o isolamento: role/usuário por serviço com CONNECTION LIMIT ou PgBouncer com pools por serviço."
+          present: "Isolamento por pool descrito."
+        - id: fix-plan
+          name: "Fix da query"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: [validar, string, varchar, contrato], min: 1 }
+          missing: "Sem corrigir o tipo do parâmetro, o pix-api continua lento — só o cartão fica protegido."
+          present: "Fix da query planejado."
+        - id: evidence
+          name: "Evidência"
+          weight: 15
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Use as métricas de pool e do core-db para dimensionar os limites."
+          present: "Métricas consultadas."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: IMPLICIT_CAST, label: "Cast implícito (varchar comparado com numeric) ignora o índice" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: HOT_PARTITION, label: "Hot partition no Kafka" }
+        - { value: POOL_EXHAUSTION, label: "Pool de conexões esgotado (causa primária)" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: fix-parameter-type, label: "Corrigir o tipo do parâmetro na borda" }
+        - { value: rate-limit-partner, label: "Rate limit + contrato com o parceiro" }
+        - { value: bulkhead, label: "Isolar pools (bulkhead)" }
+    - id: proposedSql
+      label: "Query corrigida (opcional)"
+      type: SQL
+      required: false
+    - id: explanation
+      label: "Diagnóstico, correção, mitigação e prevenção"
+      type: MARKDOWN
+      required: true
+reference: |
+  ## Diagnóstico
+  pix-api e card-authorizer degradaram juntos → recurso compartilhado: core-db com CPU alta e read IOPS 4x.
+  `pg_stat_activity` mostra dezenas de sessões ativas do pix-api com
+  `WHERE end_to_end_id = 12345678901234567890` (literal numérico). `EXPLAIN` da query: **Seq Scan on pix_transactions**
+  com `Filter: ((end_to_end_id)::numeric = '...'::numeric)` — o Postgres converte a coluna, não o parâmetro, e o índice
+  único `uq_pix_end_to_end` é ignorado. Cada consulta varre 890 milhões de linhas ({{p99}}ms), segura uma conexão do pool
+  e o card-authorizer, que divide o mesmo banco, passa a esperar conexão até estourar o timeout de 2s da bandeira.
+
+  ## Correção
+  - Contrato do endpoint: `end_to_end_id` é `string` (regex `^E\d{8}\d{4}...$`); JSON com número → 400.
+  - Repositório: bind como `String` (`setString`), nunca `setLong`; teste que garante `Index Scan using uq_pix_end_to_end`.
+
+  ## Mitigação imediata
+  - Rate limit de 50 req/s para a chave de `{{partnerService}}` (429) e aviso ao parceiro {{partner}}.
+  - Bulkhead: role `card_authorizer` com `CONNECTION LIMIT` próprio (ou pool dedicado no PgBouncer) para que o cartão não
+    dependa da saúde do pix-api.
+
+  ## Validação
+  Sessões ativas do pix-api caem; p99 volta a ~{{p99Before}}ms; timeouts do card-authorizer zeram; EXPLAIN com Index Scan.
+
+  ## Prevenção
+  Validação de tipo por schema (OpenAPI) em todos os endpoints públicos; alerta em `pg_stat_user_tables.seq_scan`
+  para pix_transactions; teste de contrato com parceiros antes do go-live.
+scenario:
+  kind: slow-query
+  params:
+    service: pix-api
+    endpoint: "GET /pix/transactions/by-e2e/{end_to_end_id}"
+    table: pix_transactions
+    slowSql: "SELECT t.id, t.end_to_end_id, t.status, t.amount_cents, t.settled_at FROM pix_transactions t WHERE t.end_to_end_id = 20260912000000000000001"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    datastore: core-db
+recommendation:
+  default: fix-parameter-type
+  rules:
+    - { param: p99, op: ">=", value: 10000, path: rate-limit-partner, reason: "com p99 em {{p99}}ms o cartão está negando compras agora; o rate limit por parceiro cai em minutos, enquanto o deploy do pix-api leva mais — o fix do tipo do parâmetro vem logo em seguida" }

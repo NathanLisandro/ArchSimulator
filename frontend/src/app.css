@@ -1,0 +1,146 @@
+.boot {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background: var(--ink-800);
+}
+
+.boot .loading__label {
+  color: var(--ink-faint);
+}
+
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.shell__main {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------------ barra superior */
+
+.chrome {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-5);
+  height: var(--bar-height);
+  padding: 0 var(--gap-5);
+  background: var(--ink-800);
+  border-bottom: 1px solid var(--ink-900);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.chrome__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  color: var(--signal);
+}
+
+.chrome__mark {
+  width: 34px;
+  height: 20px;
+}
+
+.chrome__name {
+  font-size: var(--step-0);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-text);
+}
+
+.chrome__nav {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+}
+
+.chrome__link {
+  padding: 0.3rem 0.7rem;
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  font-size: var(--step--1);
+  text-decoration: none;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.chrome__link:hover {
+  color: var(--ink-text);
+  background: var(--ink-700);
+}
+
+.chrome__link--on {
+  color: var(--ink-900);
+  background: var(--signal);
+  font-weight: 500;
+}
+
+.chrome__session {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+}
+
+.chrome__user {
+  font-size: var(--step--1);
+  color: var(--ink-dim);
+}
+
+.chrome .btn--quiet {
+  background: transparent;
+  border-color: var(--ink-line);
+  color: var(--ink-dim);
+}
+
+.chrome .btn--quiet:hover {
+  background: var(--ink-700);
+  color: var(--ink-text);
+}
+
+/* ------------------------------------------------------------------ largura de página */
+
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: var(--gap-6) var(--gap-5) var(--gap-7);
+}
+
+.page__head {
+  margin-bottom: var(--gap-5);
+}
+
+.page__title {
+  font-size: var(--step-3);
+  letter-spacing: -0.025em;
+}
+
+.page__lede {
+  margin: 0.35rem 0 0;
+  max-width: 62ch;
+  color: var(--graphite-soft);
+}
+
+@media (max-width: 720px) {
+  .chrome {
+    gap: var(--gap-3);
+    padding: 0 var(--gap-3);
+  }
+
+  .chrome__name {
+    display: none;
+  }
+
+  .chrome__user {
+    display: none;
+  }
+
+  .page {
+    padding: var(--gap-5) var(--gap-3) var(--gap-6);
+  }
+}

@@ -1,0 +1,205 @@
+.designer {
+  border: 1px solid var(--paper-line);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  overflow: hidden;
+}
+
+.designer__palette {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: 0.45rem 0.6rem;
+  background: var(--paper-sunken);
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.designer__palette-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.22rem 0.5rem;
+  border: 1px solid var(--paper-line);
+  border-radius: 2px;
+  background: var(--paper-raised);
+  font-size: var(--step--2);
+  cursor: pointer;
+}
+
+.designer__palette-item:hover {
+  border-color: var(--graphite-faint);
+}
+
+.designer__swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.designer__swatch--service { background: var(--signal); }
+.designer__swatch--database { background: #4b6a86; }
+.designer__swatch--queue { background: var(--warn); }
+.designer__swatch--cache { background: #8a6fb0; }
+.designer__swatch--external { background: var(--graphite-faint); }
+.designer__swatch--client { background: #3f8f5c; }
+
+.designer__mode {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.designer__surface {
+  position: relative;
+  height: 340px;
+  background:
+    linear-gradient(var(--paper-sunken) 1px, transparent 1px) 0 0 / 100% 28px,
+    linear-gradient(90deg, var(--paper-sunken) 1px, transparent 1px) 0 0 / 28px 100%;
+  background-color: var(--paper-raised);
+  overflow: hidden;
+  touch-action: none;
+}
+
+.designer__surface--connecting {
+  cursor: crosshair;
+}
+
+.designer__edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  color: var(--graphite-soft);
+  pointer-events: none;
+}
+
+.designer__edge line {
+  stroke: var(--graphite-soft);
+  stroke-width: 1.4;
+}
+
+.designer__edge text {
+  font-family: var(--font-data);
+  font-size: 10px;
+  fill: var(--graphite-soft);
+}
+
+.designer__edge--async line {
+  stroke-dasharray: 5 4;
+  stroke: var(--signal-deep);
+}
+
+.designer__edge--async text {
+  fill: var(--signal-deep);
+}
+
+.designer__node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--graphite-faint);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-raised);
+  cursor: grab;
+  user-select: none;
+}
+
+.designer__node:active {
+  cursor: grabbing;
+}
+
+.designer__node--selected {
+  border-color: var(--signal);
+  box-shadow: 0 0 0 3px var(--signal-wash);
+}
+
+.designer__node--source {
+  border-style: dashed;
+}
+
+.designer__node--service { border-left-color: var(--signal); }
+.designer__node--database { border-left-color: #4b6a86; }
+.designer__node--queue { border-left-color: var(--warn); }
+.designer__node--cache { border-left-color: #8a6fb0; }
+.designer__node--external { border-left-color: var(--graphite-faint); }
+.designer__node--client { border-left-color: #3f8f5c; }
+
+.designer__node-type {
+  font-size: var(--step--2);
+  color: var(--graphite-faint);
+}
+
+.designer__node-label {
+  font-size: var(--step--1);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.designer__hint {
+  position: absolute;
+  inset: auto 10% 38%;
+  margin: 0;
+  text-align: center;
+  font-size: var(--step--1);
+  color: var(--graphite-faint);
+}
+
+.designer__inspector {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--gap-3);
+  padding: 0.5rem 0.6rem;
+  border-top: 1px solid var(--paper-line);
+  background: var(--paper-sunken);
+}
+
+.designer__field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--step--2);
+  color: var(--graphite-soft);
+  flex: 1;
+  max-width: 18rem;
+}
+
+.designer__edge-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--step--2);
+  border-top: 1px solid var(--paper-line);
+}
+
+.designer__edge-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--graphite-faint);
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.designer__edge-table td {
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--paper-sunken);
+  vertical-align: middle;
+}
+
+.input--tight {
+  padding: 0.2rem 0.4rem;
+  font-size: var(--step--2);
+}
+
+.designer__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: var(--step--2);
+  white-space: nowrap;
+}

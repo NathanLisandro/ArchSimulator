@@ -1,0 +1,89 @@
+id: ddd-arquitetura
+name: DDD e arquitetura de software
+description: Bounded contexts, agregados, Clean Architecture, SOLID e ADRs.
+cards:
+  - id: bounded-context
+    front: "O que é um **bounded context**?"
+    back: |
+      A fronteira dentro da qual um termo tem um significado só. "Pedido" no checkout, na logística e no financeiro são
+      modelos diferentes com o mesmo nome. Insistir em um modelo único para os três é a origem do modelo canônico que
+      ninguém entende e todo mundo estende.
+    competencies: [ddd]
+  - id: subdomain-types
+    front: "Core, supporting e generic: por que a distinção importa?"
+    back: |
+      **Core** é onde a empresa ganha dinheiro: investe-se modelagem, testes e gente boa. **Supporting** é necessário mas
+      não diferencia: simples e pragmático. **Generic** compra-se pronto. Escrever motor de regras artesanal para
+      subdomínio genérico é o desperdício mais comum de time sênior.
+    competencies: [ddd]
+  - id: aggregate-boundary
+    front: "Como definir a fronteira de um **agregado**?"
+    back: |
+      Pela invariante que precisa ser verdadeira **a cada transação**. Tudo que participa dessa regra fica dentro; o
+      resto vira referência por id e consistência eventual. Agregado grande demais vira contenção; pequeno demais
+      espalha a regra por vários lugares.
+    competencies: [ddd]
+  - id: anemic-domain
+    front: "Por que **domínio anêmico** é problema?"
+    back: |
+      Entidades viram sacos de getters e a regra vive em serviços, longe do dado que ela protege. Resultado: a mesma
+      regra reescrita em cada caso de uso, invariantes violáveis por qualquer caminho e testes que precisam montar meio
+      sistema. Entidade rica decide; caso de uso orquestra.
+    competencies: [ddd, solid]
+  - id: context-mapping
+    front: "Cite três padrões de **context mapping** e o que significam politicamente."
+    back: |
+      **Anticorruption layer:** você traduz o modelo do outro para não contaminar o seu (relação com legado).
+      **Conformist:** você aceita o modelo do outro sem tradução (você não tem poder de negociação).
+      **Shared kernel:** dois times compartilham um pedaço de modelo (exige coordenação alta, use pouco).
+      Context mapping é tanto desenho quanto mapa de poder entre times.
+    competencies: [ddd]
+  - id: clean-arch-rule
+    front: "Qual a única regra da **Clean Architecture**?"
+    back: |
+      Dependências apontam para dentro. O domínio não conhece framework, banco, HTTP nem o caso de uso; o caso de uso
+      conhece o domínio; a infraestrutura conhece os dois. Verificável por teste (ArchUnit) ou, melhor, pelo compilador,
+      com módulos separados.
+    competencies: [clean-arch]
+  - id: ports-adapters
+    front: "O que é um **port** e o que é um **adapter**?"
+    back: |
+      Port é a interface declarada por dentro (o domínio diz "preciso de um repositório de pedidos"); adapter é a
+      implementação por fora (JPA, HTTP, arquivo). O teste do desenho: trocar Postgres por outro banco deve mudar só
+      adapters, nunca o domínio.
+    competencies: [clean-arch]
+  - id: dependency-inversion
+    front: "O **D** do SOLID, em uma frase prática."
+    back: |
+      Quem decide a regra declara a interface; quem implementa detalhe se adapta a ela. Na prática: a interface do
+      repositório mora no domínio, não no pacote de persistência. Se a interface está junto da implementação, você tem
+      inversão no nome só.
+    competencies: [solid, clean-arch]
+  - id: open-closed
+    front: "O **O** do SOLID vale sempre?"
+    back: |
+      Não. Abrir para extensão custa abstração, e abstração errada é mais cara que duplicação. Aplique quando o eixo de
+      variação já se mostrou (o terceiro caso parecido), não na primeira suspeita. Generalizar cedo é como se constrói
+      framework interno que ninguém quer manter.
+    competencies: [solid]
+  - id: adr-sections
+    front: "Quais seções um **ADR** precisa ter?"
+    back: |
+      **Contexto** (forças e restrições no momento), **Opções consideradas** (com o motivo do descarte),
+      **Decisão** e **Consequências** — incluindo as negativas. ADR sem alternativa descartada e sem consequência ruim
+      é propaganda da escolha, não registro de decisão.
+    competencies: [adr, communication]
+  - id: adr-immutable
+    front: "Pode editar um ADR aceito?"
+    back: |
+      Não: cria-se outro que o **substitui**, marcando o antigo como superseded. O valor do ADR é registrar o que se
+      sabia **naquele momento**; reescrever o passado apaga exatamente a informação que faz alguém entender por que a
+      decisão fazia sentido.
+    competencies: [adr]
+  - id: architecture-characteristics
+    front: "Por que características arquiteturais competem entre si?"
+    back: |
+      Porque quase toda escolha troca uma pela outra: disponibilidade contra consistência, performance contra
+      simplicidade, segurança contra usabilidade, evolução contra custo. O trabalho do arquiteto não é maximizar todas,
+      é escolher quais duas ou três importam neste sistema e declarar as demais como aceitáveis.
+    competencies: [characteristics]

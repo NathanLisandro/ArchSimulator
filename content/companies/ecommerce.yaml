@@ -1,0 +1,278 @@
+id: ecommerce
+name: Pangeia Commerce
+domain: ecommerce
+description: >
+  Marketplace brasileiro de eletrônicos, casa e moda, com 12 mil sellers e loja própria. Nasceu como um monólito Rails
+  em 2014, migrado por partes para serviços Java/Kotlin e Node em AWS. O catálogo é grande e volátil, o checkout é o
+  ponto mais crítico do ano na Black Friday, e o estoque ainda é decidido por um serviço que herdou regras do monólito.
+scale:
+  dailyActiveUsers: 2800000
+  peakTps: 9000
+  dataVolume: "28 TB no transacional, 340 TB no data lake (S3), 1,9 TB no OpenSearch"
+  growthNote: "Black Friday multiplica o tráfego por 11 em 6 horas; o pico de pedidos é 40x a média diária"
+stack:
+  languages: [Java 21, Kotlin, TypeScript (Node), Ruby (legado)]
+  frameworks: [Spring Boot 3, NestJS, Rails 6 (monólito legado)]
+  datastores: [PostgreSQL 15 (RDS), MongoDB (catálogo), Redis (ElastiCache), OpenSearch, S3]
+  messaging: [Kafka (MSK), SQS, SNS]
+  cloud: AWS
+  notes: "Observabilidade com Datadog; deploys por GitHub Actions em ECS Fargate e EKS"
+team:
+  developers: 210
+  squads: 26
+  notes: "Squads por jornada (busca, produto, carrinho, checkout, pagamento, pós-venda, seller, logística)"
+regulations:
+  - name: LGPD
+    description: "Dados de clientes e sellers; direito de exclusão com retenção fiscal de 5 anos para pedidos"
+  - name: "Código de Defesa do Consumidor"
+    description: "Preço anunciado deve ser honrado; cancelamento por indisponibilidade gera exposição legal e reputacional"
+  - name: "PCI-DSS (parcial)"
+    description: "Dados de cartão tokenizados no gateway; o marketplace nunca armazena PAN"
+architecture:
+  services:
+    - name: catalog-api
+      description: "Catálogo de produtos e variações; leitura pesada, escrita por seller"
+      language: Kotlin
+      dependsOn: [catalog-db, redis-cache, search-api]
+      datastore: catalog-db
+      instances: 20
+    - name: search-api
+      description: "Busca e vitrine, indexada no OpenSearch"
+      language: Java
+      dependsOn: [opensearch, redis-cache]
+      datastore: opensearch
+      instances: 16
+    - name: cart-api
+      description: "Carrinho, cupons e frete estimado"
+      language: Java
+      dependsOn: [cart-db, redis-cache, shipping-api, catalog-api]
+      datastore: cart-db
+      instances: 24
+    - name: checkout-api
+      description: "Criação do pedido, reserva de estoque e chamada de pagamento"
+      language: Java
+      dependsOn: [orders-db, inventory-service, payment-api, kafka]
+      datastore: orders-db
+      instances: 30
+    - name: inventory-service
+      description: "Estoque por SKU e por seller; reserva e baixa"
+      language: Java
+      dependsOn: [inventory-db, kafka]
+      datastore: inventory-db
+      instances: 12
+    - name: payment-api
+      description: "Integração com adquirentes e antifraude; tokenização"
+      language: Java
+      dependsOn: [payments-db, kafka]
+      datastore: payments-db
+      instances: 14
+    - name: order-service
+      description: "Ciclo de vida do pedido pós-checkout, saga de confirmação"
+      language: Java
+      dependsOn: [orders-db, kafka]
+      datastore: orders-db
+      instances: 10
+    - name: shipping-api
+      description: "Cálculo de frete e prazo, integra com transportadoras"
+      language: Kotlin
+      dependsOn: [kafka]
+      datastore: shipping-db
+      instances: 8
+    - name: seller-api
+      description: "Portal do seller: produtos, estoque, pedidos e repasses"
+      language: TypeScript
+      dependsOn: [catalog-db, orders-db]
+      datastore: seller-db
+      instances: 6
+    - name: pricing-batch
+      description: "Recalcula preços e promoções a cada 15 minutos, 4,8 milhões de SKUs"
+      language: Java
+      dependsOn: [catalog-db, kafka]
+      datastore: catalog-db
+      instances: 1
+  datastores:
+    - name: orders-db
+      engine: postgres
+      description: "Pedidos, itens e pagamentos do pedido. RDS PostgreSQL 15 Multi-AZ"
+      sizing: "db.r6g.4xlarge (16 vCPU, 128 GB), gp3 12k IOPS, 9 TB"
+    - name: inventory-db
+      engine: postgres
+      description: "Estoque por SKU e reservas"
+      sizing: "db.r6g.2xlarge"
+    - name: catalog-db
+      engine: postgres
+      description: "Produtos, variações e preços"
+      sizing: "db.r6g.4xlarge, 6 TB"
+    - name: payments-db
+      engine: postgres
+      description: "Transações de pagamento e tokens"
+      sizing: "db.r6g.2xlarge"
+    - name: cart-db
+      engine: postgres
+      description: "Carrinhos ativos (TTL de 30 dias)"
+      sizing: "db.r6g.xlarge"
+    - name: shipping-db
+      engine: postgres
+      description: "Cotações e rastreio"
+      sizing: "db.t4g.large"
+    - name: seller-db
+      engine: postgres
+      description: "Cadastro e repasses de sellers"
+      sizing: "db.t4g.large"
+    - name: opensearch
+      engine: opensearch
+      description: "Índice de busca do catálogo"
+      sizing: "6 nós r6g.2xlarge, 1,9 TB"
+  brokers:
+    - name: kafka
+      type: kafka
+      topics: [orders.placed, orders.stock-result, orders.paid, orders.cancelled, catalog.updated, pricing.changed, shipping.quoted]
+    - name: sqs
+      type: sqs
+      topics: [email-outbound, seller-notifications, invoice-generation, invoice-dlq]
+  caches:
+    - name: redis-cache
+      type: redis
+      usage: "Ficha de produto (TTL 5 min), frete estimado (TTL 1 h), sessão de carrinho, rate limit"
+infra:
+  resources:
+    - { id: cloudfront, type: aws.cloudfront, name: "CloudFront", properties: { origins: "alb-public,s3-assets", cacheHitRate: "0.82" } }
+    - { id: alb-public, type: aws.alb, name: "ALB público", properties: { listeners: "443", targetGroups: "catalog-api,search-api,cart-api,checkout-api" } }
+    - { id: eks-main, type: aws.eks, name: "EKS prod", properties: { nodes: "60", instanceType: "c6i.4xlarge", version: "1.30" } }
+    - { id: rds-orders, type: aws.rds.postgres, name: "RDS orders-db", properties: { instanceClass: "db.r6g.4xlarge", multiAz: "true", storage: "9TB gp3", iops: "12000", maxConnections: "3000", readReplicas: "2" } }
+    - { id: rds-inventory, type: aws.rds.postgres, name: "RDS inventory-db", properties: { instanceClass: "db.r6g.2xlarge", multiAz: "true", maxConnections: "1600" } }
+    - { id: rds-catalog, type: aws.rds.postgres, name: "RDS catalog-db", properties: { instanceClass: "db.r6g.4xlarge", storage: "6TB gp3" } }
+    - { id: redis-main, type: aws.elasticache.redis, name: "ElastiCache", properties: { nodeType: "cache.r6g.2xlarge", shards: "4", replicas: "1", maxmemoryPolicy: "allkeys-lru" } }
+    - { id: msk-main, type: aws.msk, name: "MSK", properties: { brokers: "9", instanceType: "kafka.m5.2xlarge", partitionsDefault: "36" } }
+    - { id: opensearch-cluster, type: aws.s3, name: "OpenSearch", properties: { nodes: "6", instanceType: "r6g.2xlarge" } }
+    - { id: sqs-main, type: aws.sqs, name: "SQS", properties: { queues: "email-outbound,seller-notifications,invoice-generation", dlq: "invoice-dlq" } }
+    - { id: s3-assets, type: aws.s3, name: "S3 assets", properties: { buckets: "product-images,datalake,invoices" } }
+    - { id: acquirer, type: external, name: "Adquirente Cielo/Stone", properties: { protocol: "HTTPS", slaMs: "3000" } }
+  edges:
+    - { from: cloudfront, to: alb-public, label: "cache miss" }
+    - { from: alb-public, to: eks-main, label: "HTTPS" }
+    - { from: eks-main, to: rds-orders, label: "JDBC (pool 25/pod)" }
+    - { from: eks-main, to: rds-inventory, label: "JDBC" }
+    - { from: eks-main, to: rds-catalog, label: "JDBC" }
+    - { from: eks-main, to: redis-main, label: "Lettuce" }
+    - { from: eks-main, to: msk-main, label: "Kafka" }
+    - { from: eks-main, to: opensearch-cluster, label: "REST" }
+    - { from: eks-main, to: sqs-main, label: "SQS" }
+    - { from: eks-main, to: acquirer, label: "HTTPS" }
+    - { from: cloudfront, to: s3-assets, label: "imagens" }
+schema:
+  dialect: POSTGRES
+  tables:
+    - name: orders
+      rowCount: 890000000
+      sizeMb: 420000
+      columns:
+        - { name: id, type: bigint, distinct: 890000000 }
+        - { name: customer_id, type: bigint, distinct: 41000000 }
+        - { name: status, type: varchar(24), distinct: 9 }
+        - { name: total_cents, type: bigint, distinct: 3000000 }
+        - { name: channel, type: varchar(16), distinct: 4 }
+        - { name: idempotency_key, type: varchar(64), distinct: 890000000 }
+        - { name: created_at, type: timestamp, distinct: 800000000 }
+        - { name: updated_at, type: timestamp, distinct: 800000000 }
+      indexes:
+        - { name: orders_pkey, columns: [id], unique: true, sizeMb: 19000 }
+        - { name: uq_orders_idempotency, columns: [idempotency_key], unique: true, sizeMb: 52000 }
+        - { name: idx_orders_customer_created, columns: [customer_id, created_at], sizeMb: 31000 }
+        - { name: idx_orders_status, columns: [status], sizeMb: 9000 }
+    - name: order_items
+      rowCount: 3100000000
+      sizeMb: 980000
+      columns:
+        - { name: id, type: bigint, distinct: 3100000000 }
+        - { name: order_id, type: bigint, distinct: 890000000 }
+        - { name: sku, type: varchar(32), distinct: 4800000 }
+        - { name: seller_id, type: bigint, distinct: 12000 }
+        - { name: quantity, type: integer, distinct: 30 }
+        - { name: unit_price_cents, type: bigint, distinct: 900000 }
+        - { name: created_at, type: timestamp, distinct: 800000000 }
+      indexes:
+        - { name: order_items_pkey, columns: [id], unique: true, sizeMb: 66000 }
+        - { name: idx_items_order, columns: [order_id], sizeMb: 71000 }
+        - { name: idx_items_sku_created, columns: [sku, created_at], sizeMb: 88000 }
+    - name: inventory
+      rowCount: 14000000
+      sizeMb: 4200
+      columns:
+        - { name: sku, type: varchar(32), distinct: 4800000 }
+        - { name: seller_id, type: bigint, distinct: 12000 }
+        - { name: available, type: integer, distinct: 4000 }
+        - { name: reserved, type: integer, distinct: 2000 }
+        - { name: warehouse, type: varchar(8), distinct: 22 }
+        - { name: updated_at, type: timestamp, distinct: 12000000 }
+      indexes:
+        - { name: inventory_pkey, columns: [sku, seller_id], unique: true, sizeMb: 680 }
+        - { name: idx_inventory_seller, columns: [seller_id], sizeMb: 300 }
+    - name: reservations
+      rowCount: 620000000
+      sizeMb: 180000
+      columns:
+        - { name: id, type: bigint, distinct: 620000000 }
+        - { name: order_id, type: bigint, distinct: 620000000 }
+        - { name: sku, type: varchar(32), distinct: 4800000 }
+        - { name: quantity, type: integer, distinct: 30 }
+        - { name: status, type: varchar(16), distinct: 5 }
+        - { name: expires_at, type: timestamp, distinct: 500000000 }
+        - { name: created_at, type: timestamp, distinct: 600000000 }
+      indexes:
+        - { name: reservations_pkey, columns: [id], unique: true, sizeMb: 13000 }
+        - { name: uq_reservations_order_sku, columns: [order_id, sku], unique: true, sizeMb: 28000 }
+        - { name: idx_reservations_expires, columns: [expires_at], sizeMb: 14000 }
+    - name: products
+      rowCount: 4800000
+      sizeMb: 26000
+      columns:
+        - { name: sku, type: varchar(32), distinct: 4800000 }
+        - { name: seller_id, type: bigint, distinct: 12000 }
+        - { name: title, type: varchar(220), distinct: 4600000 }
+        - { name: category_id, type: bigint, distinct: 4200 }
+        - { name: price_cents, type: bigint, distinct: 700000 }
+        - { name: active, type: boolean, distinct: 2 }
+        - { name: updated_at, type: timestamp, distinct: 4500000 }
+      indexes:
+        - { name: products_pkey, columns: [sku], unique: true, sizeMb: 420 }
+        - { name: idx_products_category_active, columns: [category_id, active], sizeMb: 380 }
+        - { name: idx_products_seller, columns: [seller_id], sizeMb: 260 }
+    - name: payments
+      rowCount: 940000000
+      sizeMb: 310000
+      columns:
+        - { name: id, type: bigint, distinct: 940000000 }
+        - { name: order_id, type: bigint, distinct: 890000000 }
+        - { name: acquirer, type: varchar(16), distinct: 4 }
+        - { name: status, type: varchar(16), distinct: 7 }
+        - { name: amount_cents, type: bigint, distinct: 3000000 }
+        - { name: authorization_code, type: varchar(32), distinct: 900000000 }
+        - { name: created_at, type: timestamp, distinct: 900000000 }
+      indexes:
+        - { name: payments_pkey, columns: [id], unique: true, sizeMb: 20000 }
+        - { name: idx_payments_order, columns: [order_id], sizeMb: 33000 }
+        - { name: idx_payments_status_created, columns: [status, created_at], sizeMb: 24000 }
+    - name: carts
+      rowCount: 74000000
+      sizeMb: 31000
+      columns:
+        - { name: id, type: bigint, distinct: 74000000 }
+        - { name: customer_id, type: bigint, distinct: 41000000 }
+        - { name: items, type: jsonb, distinct: 70000000 }
+        - { name: coupon_code, type: varchar(24), distinct: 9000, nullable: true }
+        - { name: updated_at, type: timestamp, distinct: 70000000 }
+      indexes:
+        - { name: carts_pkey, columns: [id], unique: true, sizeMb: 1600 }
+        - { name: idx_carts_customer, columns: [customer_id], sizeMb: 1900 }
+techDebts:
+  - title: "Reserva de estoque síncrona dentro da transação do pedido"
+    description: "checkout-api abre transação no orders-db, chama inventory-service por HTTP e só então commita: chamada remota dentro de transação de banco"
+  - title: "pricing-batch reescreve 4,8 milhões de produtos a cada 15 minutos"
+    description: "UPDATE em massa no catalog-db gera bloat e picos de IOPS; o índice de busca é reindexado inteiro em seguida"
+  - title: "Regras de estoque duplicadas entre o monólito Rails e o inventory-service"
+    description: "Baixa de estoque de pedidos antigos ainda passa pelo monólito, com regra levemente diferente"
+  - title: "Frete estimado cacheado por 1 hora sem invalidação"
+    description: "Mudança de tabela da transportadora só aparece depois do TTL, gerando divergência entre carrinho e checkout"
+  - title: "order_items sem particionamento"
+    description: "3,1 bilhões de linhas em uma tabela só; consultas do seller por período varrem índice gigante"
