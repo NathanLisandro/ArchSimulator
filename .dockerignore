@@ -1,0 +1,10 @@
+.git
+.gitignore
+frontend
+docs
+target
+*/target
+**/*.tsbuildinfo
+*.pdf
+.idea
+.vscode

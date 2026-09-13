@@ -386,3 +386,11 @@ export interface SolutionGraph {
   nodes: GraphNode[]
   edges: GraphEdge[]
 }
+
+/** Uma combinação empresa + tipo que tem conteúdo, com os níveis em que ela existe. */
+export interface CatalogEntry {
+  companyId: string
+  caseType: string
+  levels: string[]
+  templates: number
+}

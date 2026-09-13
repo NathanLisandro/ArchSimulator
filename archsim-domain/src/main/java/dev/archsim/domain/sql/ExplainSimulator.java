@@ -128,9 +128,10 @@ public final class ExplainSimulator {
             for (String col : index.columns()) {
                 Optional<Predicate> eq = sargable.stream().filter(p -> p.column().column().equalsIgnoreCase(col) && p.operator() == Operator.EQ).findFirst();
                 if (eq.isPresent()) { conds.add(eq.get()); sel *= selectivity(eq.get(), table); continue; }
-                Optional<Predicate> range = sargable.stream().filter(p -> p.column().column().equalsIgnoreCase(col)
-                        && (p.operator() == Operator.RANGE || p.operator() == Operator.LIKE_PREFIX || p.operator() == Operator.IN)).findFirst();
-                if (range.isPresent()) { conds.add(range.get()); sel *= selectivity(range.get(), table); }
+                // Both ends of a range on the same column go into Index Cond, as Postgres does for `>= a AND < b`.
+                List<Predicate> ranges = sargable.stream().filter(p -> p.column().column().equalsIgnoreCase(col)
+                        && (p.operator() == Operator.RANGE || p.operator() == Operator.LIKE_PREFIX || p.operator() == Operator.IN)).toList();
+                if (!ranges.isEmpty()) { conds.addAll(ranges); sel *= selectivity(ranges.getFirst(), table); }
                 break;
             }
             boolean ordersByIndex = orderMatches(stmt, ref, index, conds);

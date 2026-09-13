@@ -50,4 +50,35 @@ class SelectParserTest {
         assertThat(s.predicates().get(0).operator()).isEqualTo(Operator.IN);
         assertThat(s.predicates().get(1).literalIsNumeric()).isTrue();
     }
+
+    /**
+     * Conversão de fuso seguida de cast é o jeito mais comum de escrever "o dia do cliente" no Brasil,
+     * e é não-sargável. O parser não pode descartar a condição: ela precisa aparecer no plano como Filter.
+     */
+    @Test
+    void keepsTheColumnOfAnExpressionPredicateAndMarksItNonSargable() {
+        SelectStatement s = parser.parse(
+                "SELECT i.sku FROM order_items i WHERE i.seller_id = 42 "
+                + "AND (i.created_at AT TIME ZONE 'America/Sao_Paulo')::date = '2026-09-12'");
+
+        assertThat(s.predicates()).hasSize(2);
+        assertThat(s.predicates().get(1)).satisfies(p -> {
+            assertThat(p.column()).isNotNull();
+            assertThat(p.column().alias()).isEqualTo("i");
+            assertThat(p.column().column()).isEqualTo("created_at");
+            assertThat(p.operator()).isEqualTo(Operator.EQ);
+            assertThat(p.wrappedInFunction()).isTrue();
+            assertThat(p.rawText()).contains("AT TIME ZONE");
+        });
+    }
+
+    @Test
+    void findsTheColumnInsideAFunctionWithLeadingArguments() {
+        SelectStatement s = parser.parse("SELECT * FROM orders o WHERE date_trunc('day', o.created_at) = '2026-09-12'");
+
+        assertThat(s.predicates().getFirst()).satisfies(p -> {
+            assertThat(p.column().column()).isEqualTo("created_at");
+            assertThat(p.wrappedInFunction()).isTrue();
+        });
+    }
 }

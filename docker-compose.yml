@@ -5,7 +5,7 @@ services:
       POSTGRES_DB: archsim
       POSTGRES_USER: archsim
       POSTGRES_PASSWORD: archsim
-    ports: ["5432:5432"]
+    ports: ["5433:5432"]   # 5433 no host para não brigar com um Postgres local
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U archsim"]

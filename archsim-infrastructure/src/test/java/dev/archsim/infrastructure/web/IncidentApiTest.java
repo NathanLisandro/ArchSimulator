@@ -2,6 +2,10 @@ package dev.archsim.infrastructure.web;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.archsim.domain.cases.CaseId;
+import dev.archsim.domain.cases.CaseRepository;
+import dev.archsim.domain.cases.Mitigation;
+import dev.archsim.domain.cases.MitigationEffect;
 import dev.archsim.infrastructure.persistence.PostgresTestSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,6 +28,19 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class IncidentApiTest extends PostgresTestSupport {
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
+    @Autowired CaseRepository cases;
+
+    /**
+     * A mitigação que resolve não é sempre a primeira da lista: em vários templates a opção óbvia é a que
+     * só alivia. O efeito é escondido do jogador, então o teste lê do caso salvo em vez de adivinhar pela ordem.
+     */
+    private String resolvingMitigation(String caseId) {
+        return cases.findById(new CaseId(caseId)).orElseThrow().mitigations().stream()
+                .filter(m -> m.effect() == MitigationEffect.RESOLVES)
+                .map(Mitigation::id)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("todo incidente precisa de ao menos uma mitigação que resolve"));
+    }
 
     /** First declared option of a structured field, so the test works for any incident template. */
     private static String firstOption(JsonNode attempt, String fieldId) {
@@ -63,8 +80,7 @@ class IncidentApiTest extends PostgresTestSupport {
                 .andExpect(jsonPath("$.deploys").isNotEmpty())
                 .andExpect(jsonPath("$.infraResources").isNotEmpty());
 
-        // any incident template exposes mitigations; the safe one is declared first by convention
-        String mitigationId = attempt.at("/theCase/mitigations/0/id").asText();
+        String mitigationId = resolvingMitigation(attempt.at("/theCase/id").asText());
         mvc.perform(post("/api/attempts/" + id + "/mitigations").session(s).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"mitigationId\":\"" + mitigationId + "\"}"))
                 .andExpect(status().isOk())

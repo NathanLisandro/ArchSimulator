@@ -1,0 +1,372 @@
+id: ecommerce-incident-checkout-pool
+type: INCIDENT
+company: ecommerce
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, databases, resilience, sre, observability, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [9000, 30000], step: 1000 }
+  onsetMinutesAgo: { range: [15, 40], step: 5 }
+  lostOrdersPerMinute: { range: [180, 1400], step: 20 }
+  inventoryP99: { range: [900, 4200], step: 100 }
+  change:
+    group:
+      - { changeText: "o inventory-service subiu a versão 7.3, que passou a validar a reserva contra a tabela de reservas expiradas antes de gravar", changeVersion: "7.3.0" }
+      - { changeText: "o inventory-service subiu a versão 7.3, que trocou a baixa de estoque por SKU por uma verificação de todas as variações do produto", changeVersion: "7.3.0" }
+      - { changeText: "o inventory-service subiu a versão 7.3 com um novo lock pessimista na linha de estoque, para evitar venda acima do disponível", changeVersion: "7.3.0" }
+derived:
+  p99Before: "round(p99 / 30)"
+  p99Seconds: "round(p99 / 1000)"
+  inventoryBefore: "round(inventoryP99 / 12)"
+  lostRevenueThousands: "round(lostOrdersPerMinute * 38 / 100)"
+narrative:
+  title: "Checkout em {{p99Seconds}}s: pedidos caindo com 503"
+  symptom: |
+    **{{onsetLabel}}** — o `checkout-api` está com p99 de **{{p99}}ms** (baseline ~{{p99Before}}ms) e taxa de erro
+    subindo, quase tudo `503`. O painel de negócio mostra ~{{lostOrdersPerMinute|number}} pedidos por minuto a menos
+    que a mesma hora da semana passada.
+
+    Catálogo, busca e carrinho seguem normais. O cliente monta o carrinho, clica em finalizar e fica esperando.
+
+    Na linha do tempo há deploys do dia em mais de um serviço.
+  businessContext: |
+    Cada minuto assim custa na casa de R$ {{lostRevenueThousands|number}} mil em pedidos que não entram, e parte do
+    cliente não volta. O `checkout-api` roda 30 pods com pool de 25 conexões cada no `orders-db`, que aceita 3.000.
+    O fluxo atual abre transação no `orders-db`, chama o `inventory-service` por HTTP para reservar estoque e só então
+    commita — dívida técnica conhecida e registrada. Pelo Código de Defesa do Consumidor, pedido confirmado sem estoque
+    vira cancelamento com exposição legal.
+  hints:
+    - "Veja o que as threads do checkout estão esperando: banco lento e pool vazio parecem iguais no p99, mas não são."
+    - "Um trace de pedido lento mostra onde o tempo vai, e dentro de qual transação."
+    - "O serviço que degradou não é necessariamente o que mudou."
+checkpoints:
+  - id: first-signal
+    question: "O checkout está com 503 e o resto está normal. O que você olha primeiro?"
+    options:
+      - id: pool-metrics
+        label: "Uso e fila do pool de conexões do checkout, junto com a latência do orders-db"
+        verdict: GOOD
+        feedback: "Certo. Se o pool está em 25 de 25 com threads na fila e o `orders-db` está confortável, o banco não é o gargalo: alguém está segurando conexão sem usar. É a pergunta que separa banco lento de conexão presa."
+      - id: db-cpu
+        label: "CPU e IOPS do orders-db"
+        verdict: RISKY
+        feedback: "Vale olhar, e você vai ver o banco com folga. O risco é parar aí e concluir que não é banco, sem perceber que o problema está nas conexões abertas e ociosas que o checkout mantém enquanto espera outra coisa."
+      - id: restart
+        label: "Reiniciar os pods do checkout para liberar as conexões"
+        verdict: BAD
+        feedback: "As conexões voltam a encher em segundos, porque a causa continua lá, e o restart derruba os pedidos que estavam no meio da transação. Com ~{{lostOrdersPerMinute|number}} pedidos por minuto em jogo, você perde exatamente os que estavam quase fechando."
+  - id: where-time-goes
+    question: "O trace de um pedido lento mostra 30s em `acquireConnection` e, nos que conseguem conexão, a chamada ao inventory-service levando {{inventoryP99}}ms. O que isso diz?"
+    options:
+      - id: held-connection
+        label: "Cada pedido segura uma conexão do banco enquanto espera o estoque; o inventory lento esvazia o pool"
+        verdict: GOOD
+        feedback: "Exato. Com a chamada HTTP dentro da transação, a conexão fica ocupada por {{inventoryP99}}ms em vez de ~{{inventoryBefore}}ms. O pool de 25 conexões atende doze vezes menos pedidos por segundo, e o resto espera 30s e cai com 503."
+      - id: db-slow
+        label: "O orders-db está lento para entregar conexões"
+        verdict: BAD
+        feedback: "`acquireConnection` mede espera no pool da aplicação, não no banco. As conexões existem e estão abertas; estão ocupadas por transações paradas esperando o `inventory-service`."
+      - id: two-problems
+        label: "São dois problemas independentes: pool pequeno e inventory lento"
+        verdict: RISKY
+        feedback: "Não são independentes: o pool só ficou pequeno porque cada conexão passou a ficar presa durante a chamada ao estoque. Aumentar o pool sem entender isso só move a saturação para o banco."
+  - id: which-deploy
+    question: "Houve deploy no checkout-api de manhã e no inventory-service logo antes do início. Qual você reverte?"
+    options:
+      - id: inventory
+        label: "O inventory-service: a latência dele subiu no mesmo minuto em que o checkout começou a degradar"
+        verdict: GOOD
+        feedback: "Correlação no minuto certo, e com mecanismo explicado: o inventory ficou lento, e o desenho do checkout transforma lentidão de dependência em falta de conexão. O deploy do checkout de manhã passou horas saudável."
+      - id: checkout
+        label: "O checkout-api, porque é o serviço que está com erro"
+        verdict: BAD
+        feedback: "O serviço com erro é onde o problema aparece, não necessariamente onde ele nasceu. O deploy do checkout foi de manhã e o serviço ficou saudável por horas depois dele."
+      - id: both
+        label: "Os dois, para garantir"
+        verdict: RISKY
+        feedback: "Resolve, mas você perde a informação de qual mudança causou o problema e reverte uma entrega que estava funcionando. Em incidente, reverter uma coisa por vez é também uma forma de investigar."
+mitigations:
+  - id: increase-pool
+    label: "Aumentar o pool do checkout de 25 para 80 conexões por pod"
+    description: "Mudança de configuração do HikariCP com rollout dos 30 pods"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Com 30 pods, são 2.400 conexões presas esperando o estoque, perto do limite de 3.000 do `orders-db`. O banco passa a recusar conexão também para `order-service` e `seller-api`, e o incidente sai do checkout e vira de toda a base de pedidos."
+  - id: scale-checkout
+    label: "Escalar o checkout-api de 30 para 60 pods"
+    description: "Aumenta a réplica do deployment no EKS"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Cada pod novo traz mais 25 conexões para segurar durante a chamada lenta, e mais chamadas simultâneas para um `inventory-service` que já está sofrendo. Você aumenta a pressão justamente sobre a dependência degradada."
+  - id: timeout-inventory
+    label: "Baixar o timeout da chamada ao inventory de 10s para 800ms"
+    description: "Configuração em runtime, sem rollout"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "As conexões voltam a girar e o `503` vira falha rápida com mensagem clara, o que é melhor para o cliente e para o pool. Mas os pedidos cujo estoque demora mais que 800ms continuam falhando: você contém, não resolve."
+  - id: rollback-inventory
+    label: "Reverter o inventory-service para a versão anterior"
+    description: "Rollback do deployment para a imagem de ontem"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "A reserva volta a responder em ~{{inventoryBefore}}ms, as transações do checkout voltam a durar milissegundos e o pool esvazia em menos de um minuto. O p99 do checkout cai de volta ao baseline."
+  - id: rollback-checkout
+    label: "Reverter o checkout-api para a versão anterior"
+    description: "Rollback do deploy da manhã"
+    verdict: BAD
+    effect: NONE
+    feedback: "Sem efeito: a versão anterior do checkout tem a mesma chamada dentro da transação, e o `inventory-service` continua lento. Você gastou quatro minutos de rollout e perdeu a entrega da manhã."
+  - id: disable-reservation
+    label: "Desligar a reserva de estoque e confirmar o pedido direto"
+    description: "Feature flag que pula a chamada ao inventory"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Os pedidos voltam a entrar, mas sem reserva. Item com pouco estoque é vendido acima do disponível, e cada pedido sem estoque vira cancelamento com exposição no Código de Defesa do Consumidor. Pode ser defensável por minutos, com decisão explícita do negócio."
+stakeholders:
+  - id: ecommerce-head
+    from: "Rafael (Head de E-commerce)"
+    afterSeconds: 180
+    text: "O painel mostra a venda despencando. É geral? Já temos previsão?"
+  - id: support
+    from: "Tati (Atendimento)"
+    afterSeconds: 480
+    text: "Clientes dizendo que clicaram em finalizar e não sabem se o pedido entrou. Posso orientar a tentar de novo?"
+  - id: inventory-squad
+    from: "Diego (squad de Estoque)"
+    afterSeconds: 720
+    text: "Subimos a 7.3 do inventory há pouco. Nossas métricas mostram latência maior, mas sem erro. Tem relação?"
+    expectsUpdate: false
+solutionPaths:
+  - id: rollback-and-move-call
+    name: "Reverter o inventory e tirar a chamada de dentro da transação"
+    summary: "Mitigar com rollback e corrigir o desenho: reservar o estoque antes de abrir a transação do pedido, com compensação se o pedido não for gravado."
+    pros: ["Resolve o incidente e a vulnerabilidade de desenho", "Conexão do banco volta a durar milissegundos", "Mudança contida no checkout"]
+    cons: ["Exige compensação para reserva sem pedido", "Reserva órfã precisa expirar", "Não protege contra o inventory totalmente fora"]
+    bestWhen: "o incidente foi disparado por uma dependência lenta e a chamada dentro da transação é o que transformou lentidão em indisponibilidade — o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [POOL_EXHAUSTION] }
+            - { type: choice, field: trigger, anyOf: [inventory-deploy] }
+          missing: "A causa é saturação do pool do checkout, disparada pela lentidão do `inventory-service` depois da 7.3 e amplificada pela chamada HTTP dentro da transação."
+          present: "Causa raiz e gatilho corretos."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: TRACE_VIEW }
+            - { type: investigation, kind: DEPLOYS_VIEW }
+          missing: "Mostre o pool cheio nas métricas, o tempo em `acquireConnection` no trace e o deploy do inventory na linha do tempo."
+          present: "Causa comprovada por métrica, trace e linha do tempo."
+        - id: mitigation
+          name: "Mitigação informada"
+          weight: 15
+          evidence:
+            - { type: mitigation, effect: RESOLVES, informed: true }
+          missing: "Faltou reverter o `inventory-service` depois de confirmar a correlação."
+          present: "Mitigação certa, aplicada com diagnóstico."
+        - id: transaction
+          name: "Fronteira da transação"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["dentro da transação", "dentro da transacao", "fora da transação", "fora da transacao", "fronteira", "antes de abrir"], min: 1 }
+            - { type: keyword, field: postMortem, anyOf: ["compensa", "expira", "órfã", "orfa", "libera a reserva", "saga"], min: 1 }
+          missing: "O post-mortem precisa tratar o desenho: chamada remota fora da transação do banco, e o que acontece com a reserva se o pedido não for gravado."
+          present: "Fronteira da transação corrigida com compensação."
+        - id: postmortem
+          name: "Post-mortem estruturado"
+          weight: 10
+          evidence:
+            - { type: section, headings: ["Impacto", "Linha do tempo", "Causa raiz", "Ações"] }
+          missing: "Use as seções Impacto, Linha do tempo, Causa raiz e Ações."
+          present: "Post-mortem completo."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "O head de e-commerce e o atendimento cobraram posição: dois status updates, o primeiro em até 7 minutos."
+          present: "Stakeholders informados."
+  - id: async-saga
+    name: "Reserva assíncrona por evento"
+    summary: "Gravar o pedido como pendente, publicar em `orders.placed` e confirmar quando `orders.stock-result` chegar, tirando o inventory do caminho síncrono."
+    pros: ["Checkout deixa de depender da latência do estoque", "Usa tópicos que já existem", "Absorve picos de Black Friday"]
+    cons: ["Cliente não sabe na hora se o item tem estoque", "Projeto de semanas, não resposta a incidente", "Mais estados de pedido para suporte e seller"]
+    bestWhen: "a dependência de estoque é instável com frequência e a Black Friday exige que o checkout sobreviva a ela degradada"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [POOL_EXHAUSTION] }
+          missing: "A causa é saturação do pool por conexão presa durante a chamada ao estoque."
+          present: "Causa raiz correta."
+        - id: mitigation
+          name: "Mitigação informada"
+          weight: 20
+          evidence:
+            - { type: mitigation, effect: RESOLVES, informed: true }
+          missing: "O desenho novo leva semanas: hoje, reverta o inventory."
+          present: "Incidente mitigado antes do redesenho."
+        - id: saga
+          name: "Desenho da saga"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["orders.placed", "orders.stock-result", "pendente", "saga", "evento"], min: 1 }
+            - { type: keyword, field: postMortem, anyOf: ["cancel", "compensa", "sem estoque", "idempot"], min: 1 }
+          missing: "Descreva os estados do pedido, os eventos trocados e o que acontece quando o estoque responde que não há."
+          present: "Saga descrita com o caminho de falha."
+        - id: customer
+          name: "Experiência do cliente"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["cliente", "confirmação", "confirmacao", "e-mail", "aviso", "consumidor"], min: 1 }
+          missing: "Com reserva assíncrona o cliente não sabe na hora: diga como ele é avisado e quando."
+          present: "Experiência do cliente considerada."
+        - id: communication
+          name: "Comunicação"
+          weight: 20
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "Dois status updates, o primeiro em até 7 minutos."
+          present: "Stakeholders informados."
+  - id: contain-with-bulkhead
+    name: "Conter com timeout curto e bulkhead"
+    summary: "Timeout agressivo e limite de chamadas simultâneas ao inventory, para que a lentidão dele vire falha rápida em vez de pool vazio."
+    pros: ["Efeito imediato sem rollback", "Protege o pool contra qualquer dependência lenta", "Padrão reaproveitável para pagamento e frete"]
+    cons: ["Pedidos continuam falhando enquanto o inventory estiver lento", "Timeout mal calibrado derruba pedido saudável", "Não corrige a chamada dentro da transação"]
+    bestWhen: "o rollback não é possível ou não é seguro, e é preciso parar o espalhamento enquanto a squad de estoque corrige"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [POOL_EXHAUSTION] }
+          missing: "A causa é saturação do pool."
+          present: "Causa raiz correta."
+        - id: mitigation
+          name: "Contenção aplicada"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique a contenção de fato: timeout curto na chamada ao estoque."
+          present: "Contenção aplicada."
+        - id: calibration
+          name: "Calibragem do timeout"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["p99", "p999", "calibr", "baseline", "bulkhead", "semáforo", "semaforo"], min: 1 }
+          missing: "Justifique o valor do timeout pela latência normal do inventory, e diga como limita as chamadas simultâneas."
+          present: "Timeout e bulkhead justificados."
+        - id: next
+          name: "Correção definitiva"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["fora da transação", "fora da transacao", "rollback", "reverter", "saga", "antes de abrir"], min: 1 }
+          missing: "Contenção não é correção: registre a mudança de desenho e a reversão do inventory."
+          present: "Correção definitiva registrada."
+        - id: communication
+          name: "Comunicação"
+          weight: 20
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "Dois status updates, o primeiro em até 7 minutos."
+          present: "Stakeholders informados."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool de conexões por conexão presa durante chamada remota" }
+        - { value: THIRD_PARTY_TIMEOUT, label: "Timeout de dependência externa" }
+        - { value: N_PLUS_ONE, label: "N+1 depois do deploy do checkout" }
+        - { value: LONG_LOCK, label: "Lock longo no orders-db" }
+        - { value: TRAFFIC_SPIKE, label: "Pico de tráfego" }
+    - id: trigger
+      label: "Mudança que disparou o incidente"
+      type: SELECT
+      required: true
+      options:
+        - { value: inventory-deploy, label: "Deploy do inventory-service" }
+        - { value: checkout-deploy, label: "Deploy do checkout-api da manhã" }
+        - { value: no-change, label: "Nenhuma mudança, só volume" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: rollback-and-move-call, label: "Reverter o inventory e tirar a chamada da transação" }
+        - { value: async-saga, label: "Reserva assíncrona por evento" }
+        - { value: contain-with-bulkhead, label: "Conter com timeout curto e bulkhead" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até o rollback: checkout com p99 de {{p99}}ms contra baseline de {{p99Before}}ms, erros `503` e
+  ~{{lostOrdersPerMinute|number}} pedidos por minuto a menos, algo como R$ {{lostRevenueThousands|number}} mil por
+  minuto. Catálogo, busca e carrinho não foram afetados. Parte dos clientes não sabe se o pedido entrou.
+
+  ## Linha do tempo
+  - **manhã** — deploy do `checkout-api`; serviço saudável por horas depois.
+  - **{{onsetLabel}}** — {{changeText}}.
+  - **+1min** — latência da reserva sobe de ~{{inventoryBefore}}ms para {{inventoryP99}}ms, sem erro no inventory.
+  - **+3min** — pool do checkout em 25 de 25 conexões; threads na fila; `503` por timeout de 30s em `acquireConnection`.
+  - **+~12min** — trace mostra a conexão ocupada durante a chamada ao estoque; métricas do `orders-db` com folga.
+  - **+~15min** — rollback do `inventory-service`; pool esvazia em menos de um minuto e o p99 volta ao baseline.
+
+  ## Causa raiz
+  Saturação do pool de conexões do `checkout-api`. O gatilho foi a versão {{changeVersion}} do `inventory-service`,
+  que deixou a reserva doze vezes mais lenta sem gerar erro. O que transformou lentidão em indisponibilidade foi o
+  desenho do checkout: a transação no `orders-db` fica aberta durante a chamada HTTP de reserva. Cada pedido segura
+  uma das 25 conexões do pod enquanto espera, e a vazão do pool cai na mesma proporção em que a dependência fica lenta.
+
+  Aumentar o pool ou escalar pods teria piorado: 2.400 conexões presas levariam o `orders-db` ao limite de 3.000 e o
+  incidente para `order-service` e `seller-api`.
+
+  ## Ações
+  1. **Imediata:** rollback do `inventory-service` para a versão anterior.
+  2. **Checkout (esta semana):** reservar o estoque antes de abrir a transação do pedido. Se a gravação falhar, liberar
+     a reserva; reservas órfãs expiram por `expires_at`, que já existe em `reservations`.
+  3. **Resiliência (esta semana):** timeout de 800ms na reserva, calibrado pelo p99 normal, e bulkhead limitando as
+     chamadas simultâneas ao inventory por pod.
+  4. **Detecção (esta semana):** alerta de `db_pool_pending` acima de zero por dois minutos, antes do `503`.
+  5. **Estoque (antes da Black Friday):** teste de carga da reserva como critério de release do inventory, e avaliação
+     da reserva assíncrona por `orders.placed` e `orders.stock-result`.
+
+  Blameless: a versão 7.3 resolvia um problema real de venda acima do estoque, e não gerou erro. O que faltava era o
+  checkout estar protegido contra uma dependência lenta, e um alerta que mostrasse o pool enchendo antes do cliente.
+scenario:
+  kind: incident
+  params:
+    rootCause: POOL_EXHAUSTION
+    poolSize: "25"
+    service: checkout-api
+    datastore: orders-db
+    endpoint: "POST /checkout"
+    table: orders
+    slowSql: "INSERT INTO orders (customer_id, status, total_cents, channel, idempotency_key, created_at) VALUES ($1, 'PENDING', $2, 'web', $3, now())"
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    deployAt: "{{onsetMinutesAgoAt}}"
+    deployService: inventory-service
+    deployVersion: "{{changeVersion}}"
+    deployAuthor: "squad-estoque"
+    deployDescription: "validação de reserva de estoque"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: rollback-and-move-call
+  rules:
+    - { param: lostOrdersPerMinute, op: ">=", value: 1100, path: contain-with-bulkhead, reason: "com {{lostOrdersPerMinute|number}} pedidos por minuto perdidos, cada minuto de rollout pesa: o timeout curto em runtime contém em segundos, e o rollback vem logo depois" }

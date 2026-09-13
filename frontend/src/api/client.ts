@@ -1,6 +1,7 @@
 import type {
   AttemptSummary,
   AttemptView,
+  CatalogEntry,
   CheckpointFeedback,
   CompanySummary,
   DeckView,
@@ -57,6 +58,7 @@ export const api = {
   me: () => request<User>('/api/auth/me'),
 
   companies: () => request<CompanySummary[]>('/api/companies'),
+  catalog: () => request<CatalogEntry[]>('/api/catalog'),
   company: (id: string) => request<CompanySummary>(`/api/companies/${id}`),
 
   startCase: (companyId?: string, caseType?: string, level?: string, templateId?: string) =>

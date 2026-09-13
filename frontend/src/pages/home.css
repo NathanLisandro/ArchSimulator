@@ -249,3 +249,19 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Opção sem conteúdo: legível, mas claramente fora de alcance. Não é erro, é ausência. */
+.home__level--off {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.home__unavailable {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-wash);
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}

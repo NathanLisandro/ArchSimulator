@@ -54,6 +54,7 @@ public class UseCaseConfig {
     @Bean RegisterUser registerUser(UserRepository users, PasswordHasher hasher, Clock clock) { return new RegisterUser(users, hasher, clock); }
     @Bean AuthenticateUser authenticateUser(UserRepository users, PasswordHasher hasher) { return new AuthenticateUser(users, hasher); }
     @Bean ListCompanies listCompanies(CompanyRepository companies) { return new ListCompanies(companies); }
+    @Bean ListCatalog listCatalog(CaseTemplateRepository templates) { return new ListCatalog(templates); }
     @Bean StartCase startCase(CompanyRepository c, CaseTemplateRepository t, CaseRepository cases, AttemptRepository a, CaseGenerator g, SeedGenerator s, Clock clock) {
         return new StartCase(c, t, cases, a, g, s, clock);
     }

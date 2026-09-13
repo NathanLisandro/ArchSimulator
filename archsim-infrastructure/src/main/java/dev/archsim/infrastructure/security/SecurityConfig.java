@@ -1,6 +1,8 @@
 package dev.archsim.infrastructure.security;
 
 import jakarta.servlet.http.HttpServletResponse;
+
+import java.nio.charset.StandardCharsets;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -28,7 +30,9 @@ public class SecurityConfig {
                         .anyRequest().permitAll())
                 .exceptionHandling(ex -> ex.authenticationEntryPoint((req, res, e) -> {
                     res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-                    res.setContentType("application/json");
+                    // Charset explícito: a mensagem tem acento e o padrão do container é ISO-8859-1.
+                    res.setCharacterEncoding(StandardCharsets.UTF_8.name());
+                    res.setContentType("application/json;charset=UTF-8");
                     res.getWriter().write("{\"error\":\"Não autenticado\"}");
                 }))
                 .httpBasic(b -> b.disable())

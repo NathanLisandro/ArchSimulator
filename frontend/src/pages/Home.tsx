@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
-import type { CompanySummary, ProgressView, SprintView } from '../api/types'
+import type { CatalogEntry, CompanySummary, ProgressView, SprintView } from '../api/types'
 import { CASE_TYPE_LABEL, LEVEL_LABEL, clock, compact, number } from '../api/format'
 import { Empty, ErrorNote, Loading, Panel, RankTrack } from '../components/ui'
+import { companyHasContent, levelHasContent, reachableTemplates, typeHasContent } from './availability'
 import './home.css'
 
 const CASE_TYPES = Object.keys(CASE_TYPE_LABEL)
@@ -12,6 +13,7 @@ const LEVELS = ['JUNIOR', 'PLENO', 'SENIOR', 'STAFF']
 export function Home() {
   const navigate = useNavigate()
   const [companies, setCompanies] = useState<CompanySummary[] | null>(null)
+  const [catalog, setCatalog] = useState<CatalogEntry[]>([])
   const [progress, setProgress] = useState<ProgressView | null>(null)
   const [sprint, setSprint] = useState<SprintView | null>(null)
   const [companyId, setCompanyId] = useState('')
@@ -22,9 +24,10 @@ export function Home() {
   const [openCompany, setOpenCompany] = useState<string | null>(null)
 
   useEffect(() => {
-    void Promise.all([api.companies(), api.progress(), api.currentSprint().catch(() => undefined)])
-      .then(([companyList, progressView, sprintView]) => {
+    void Promise.all([api.companies(), api.progress(), api.currentSprint().catch(() => undefined), api.catalog().catch(() => [])])
+      .then(([companyList, progressView, sprintView, catalogList]) => {
         setCompanies(companyList)
+        setCatalog(catalogList)
         setProgress(progressView)
         setSprint(sprintView ?? null)
         setLevel(progressView.rank)
@@ -62,6 +65,8 @@ export function Home() {
   if (!companies || !progress) return <div className="page"><Loading label="carregando contextos" /></div>
 
   const suggested = progress.suggestedNextType
+  const reachable = reachableTemplates(catalog, companyId, caseType, level)
+  const nothingToGenerate = catalog.length > 0 && reachable === 0
 
   return (
     <div className="page home">
@@ -90,11 +95,15 @@ export function Home() {
               <span className="field__label">Empresa</span>
               <select className="select" value={companyId} onChange={(event) => setCompanyId(event.target.value)}>
                 <option value="">sortear</option>
-                {companies.map((company) => (
-                  <option key={company.id} value={company.id}>
-                    {company.name}
-                  </option>
-                ))}
+                {companies.map((company) => {
+                  const available = catalog.length === 0 || companyHasContent(catalog, company.id, caseType, level)
+                  return (
+                    <option key={company.id} value={company.id} disabled={!available}>
+                      {company.name}
+                      {available ? '' : ' — sem caso assim'}
+                    </option>
+                  )
+                })}
               </select>
             </label>
 
@@ -102,39 +111,62 @@ export function Home() {
               <span className="field__label">Tipo de caso</span>
               <select className="select" value={caseType} onChange={(event) => setCaseType(event.target.value)}>
                 <option value="">sortear</option>
-                {CASE_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {CASE_TYPE_LABEL[type]}
-                    {type === suggested ? ' — sugerido' : ''}
-                  </option>
-                ))}
+                {CASE_TYPES.map((type) => {
+                  const available = catalog.length === 0 || typeHasContent(catalog, type, companyId, level)
+                  return (
+                    <option key={type} value={type} disabled={!available}>
+                      {CASE_TYPE_LABEL[type]}
+                      {!available ? ' — sem caso assim' : type === suggested ? ' — sugerido' : ''}
+                    </option>
+                  )
+                })}
               </select>
             </label>
 
             <fieldset className="home__levels">
               <legend className="field__label">Nível</legend>
               <div className="home__level-row">
-                {LEVELS.map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    className={`home__level ${level === option ? 'home__level--on' : ''}`}
-                    onClick={() => setLevel(option)}
-                  >
-                    {LEVEL_LABEL[option]}
-                  </button>
-                ))}
+                {LEVELS.map((option) => {
+                  const available = catalog.length === 0 || levelHasContent(catalog, option, companyId, caseType)
+                  return (
+                    <button
+                      key={option}
+                      type="button"
+                      disabled={!available}
+                      title={available ? undefined : 'Não há caso desse tipo neste nível'}
+                      className={`home__level ${level === option ? 'home__level--on' : ''} ${available ? '' : 'home__level--off'}`}
+                      onClick={() => setLevel(option)}
+                    >
+                      {LEVEL_LABEL[option]}
+                    </button>
+                  )
+                })}
               </div>
             </fieldset>
 
             {failure && <ErrorNote>{failure}</ErrorNote>}
+            {nothingToGenerate && (
+              <p className="home__unavailable" role="status">
+                Ainda não existe caso com essa combinação. Troque o nível ou deixe empresa e tipo em sortear.
+              </p>
+            )}
 
             <div className="home__actions">
-              <button className="btn btn--primary" type="button" disabled={starting} onClick={() => void start()}>
+              <button
+                className="btn btn--primary"
+                type="button"
+                disabled={starting || nothingToGenerate}
+                onClick={() => void start()}
+              >
                 {starting ? 'Gerando' : 'Começar caso'}
               </button>
               {(!sprint || sprint.status !== 'RUNNING') && (
-                <button className="btn btn--quiet" type="button" disabled={starting} onClick={() => void startSprint()}>
+                <button
+                  className="btn btn--quiet"
+                  type="button"
+                  disabled={starting || nothingToGenerate}
+                  onClick={() => void startSprint()}
+                >
                   Sprint de 5 casos em 75 min
                 </button>
               )}

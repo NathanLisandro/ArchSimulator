@@ -1,0 +1,295 @@
+id: ecommerce-slow-query-seller-report
+type: SLOW_QUERY
+company: ecommerce
+levels: [JUNIOR, PLENO, SENIOR]
+competencies: [databases, observability, capacity]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [4000, 16000], step: 500 }
+  sinceHoursAgo: { range: [5, 30] }
+  sellersAffected: { range: [340, 5200], step: 20 }
+  itemsPerSeller: { range: [180000, 900000], step: 10000 }
+  trigger:
+    group:
+      - { trigger: "o portal do seller ganhou um filtro de data que veio ligado por padrão em \"hoje\"", triggerNote: "todo seller que abre o portal dispara a consulta, e não só quem procura um dia específico" }
+      - { trigger: "a squad de seller trocou o relatório mensal por um painel que recarrega a cada 60 segundos", triggerNote: "cada aba aberta vira uma consulta por minuto, o dia inteiro" }
+      - { trigger: "um integrador de ERP passou a consumir a mesma rota para conciliar vendas de vários sellers", triggerNote: "são 12 chamadas em sequência por seller, uma para cada dia da quinzena" }
+derived:
+  p99Seconds: "round(p99 / 1000)"
+  p99Before: "round(p99 / 40)"
+  itemsPerDay: "round(itemsPerSeller / 400)"
+narrative:
+  title: "Portal do seller em {{p99Seconds}}s: o relatório de vendas do dia não abre"
+  symptom: |
+    Desde {{sinceLabel}}, `GET /seller/{id}/sales?day=` no **seller-api** está em **{{p99}}ms no p99**
+    (baseline: {{p99Before}}ms). {{sellersAffected|number}} sellers já reclamaram no canal de suporte, e alguns
+    desistem no meio e recarregam, o que dobra a carga.
+
+    O gatilho: {{trigger}} — {{triggerNote}}.
+
+    A consulta soma os itens vendidos por um seller em um dia. O SQL é este:
+
+    ```sql
+    SELECT i.sku, sum(i.quantity) AS unidades, sum(i.quantity * i.unit_price_cents) AS bruto_cents
+      FROM order_items i
+     WHERE i.seller_id = $1
+       AND (i.created_at AT TIME ZONE 'America/Sao_Paulo')::date = $2
+     GROUP BY i.sku
+     ORDER BY bruto_cents DESC;
+    ```
+  businessContext: |
+    `order_items` tem 3,1 bilhões de linhas, sem particionamento, e é a mesma tabela que o checkout escreve a cada
+    pedido. O índice `idx_items_seller_created (seller_id, created_at)` existe desde o lançamento do portal. Um seller
+    grande acumula na casa de {{itemsPerSeller|compact}} itens vendidos, e vende ~{{itemsPerDay|number}} por dia.
+
+    O portal do seller não é a rota mais crítica da empresa, mas o seller que não enxerga a própria venda abre
+    chamado, reclama no canal público e, no limite, desliga o anúncio. A Black Friday é daqui a sete semanas.
+  hints:
+    - "O índice certo existe. Veja no plano quais colunas dele aparecem em `Index Cond` e quais viram `Filter`."
+    - "Uma expressão aplicada sobre a coluna muda o que o banco consegue procurar no índice."
+    - "Fuso horário não é detalhe aqui: o seller quer o dia dele, não o dia UTC."
+checkpoints:
+  - id: first-look
+    question: "Por onde você começa?"
+    options:
+      - id: explain
+        label: "Rodar EXPLAIN da consulta e olhar o plano"
+        verdict: GOOD
+        feedback: "Certo. O plano responde a pergunta mais importante em segundos: o índice está sendo usado por inteiro ou só em parte? Ler {{itemsPerSeller|compact}} linhas para devolver ~{{itemsPerDay|number}} é a diferença entre {{p99Before}}ms e {{p99}}ms."
+      - id: add-index
+        label: "Criar um índice em `created_at` e medir depois"
+        verdict: RISKY
+        feedback: "O índice que a consulta precisa já existe: `(seller_id, created_at)`. Criar outro em `order_items` custa dezenas de gigabytes e horas, é pago pelo checkout em toda escrita, e do jeito que o filtro está escrito também não seria usado."
+      - id: scale-db
+        label: "Subir a instância do `orders-db`"
+        verdict: BAD
+        feedback: "Uma consulta que lê {{itemsPerSeller|compact}} linhas continua lendo {{itemsPerSeller|compact}} linhas em um servidor maior. Você compraria talvez 30% e pagaria por isso todo mês, com a Black Friday chegando."
+  - id: sargable
+    question: "O plano usa `idx_items_seller_created`, mas só `seller_id` aparece em Index Cond; a condição de data virou Filter. Por quê?"
+    options:
+      - id: function-on-column
+        label: "O filtro aplica uma expressão sobre `created_at`, então o índice só serve para `seller_id`"
+        verdict: GOOD
+        feedback: "Exato. O índice guarda `created_at`, não o resultado de `(created_at AT TIME ZONE ...)::date`. O banco usa a primeira coluna para achar todos os itens do seller, {{itemsPerSeller|compact}} linhas, e calcula a expressão linha a linha para descartar quase todas. É o que chamam de predicado não-sargável."
+      - id: stale-stats
+        label: "As estatísticas estão desatualizadas e o planner errou o custo"
+        verdict: RISKY
+        feedback: "Vale checar `last_analyze`, e estatística velha realmente causa plano ruim. Mas aqui, mesmo com estatística perfeita, a segunda coluna do índice não pode ser usada: o filtro não é sobre a coluna, é sobre uma expressão derivada dela."
+      - id: reindex
+        label: "O índice está inchado e precisa de REINDEX"
+        verdict: RISKY
+        feedback: "Bloat de índice existe e deixa a leitura mais lenta, mas não muda quais colunas entram em Index Cond. O plano estaria igual depois do REINDEX, só um pouco mais rápido."
+  - id: timezone
+    question: "A reescrita precisa continuar entregando o dia do seller, não o dia UTC. Como?"
+    options:
+      - id: half-open-range
+        label: "Converter o dia pedido em um intervalo semiaberto já no fuso certo e comparar `created_at` cru"
+        verdict: GOOD
+        feedback: "É a reescrita correta: `created_at >= $2 AND created_at < $3`, com os dois instantes calculados no fuso do seller pela aplicação. A coluna fica intacta, as duas colunas do índice passam a valer, e o resultado continua sendo o dia certo."
+      - id: between-dates
+        label: "Usar BETWEEN com data inicial e final"
+        verdict: RISKY
+        feedback: "`BETWEEN` é fechado dos dois lados e inclui a fronteira: um pedido às 00:00:00 do dia seguinte entra nos dois relatórios. Prefira o intervalo semiaberto, que não tem essa ambiguidade."
+      - id: keep-utc
+        label: "Aceitar o dia UTC e explicar a diferença para o seller"
+        verdict: BAD
+        feedback: "Isso move três horas de vendas para o dia seguinte, incluindo o pico da noite. O seller confere o número contra o extrato e não bate: você trocou um problema de latência por um problema de confiança."
+solutionPaths:
+  - id: sargable-rewrite
+    name: "Reescrever o filtro de forma sargável"
+    summary: "Trocar a conversão de fuso aplicada à coluna por um intervalo semiaberto calculado na aplicação, para que o índice existente sirva às duas colunas."
+    pros: ["Resolve a causa, não o sintoma", "Sem índice novo nem custo extra de escrita no checkout", "Mudança pequena e reversível"]
+    cons: ["Exige mudar o código da consulta", "A fronteira do dia passa a depender de a aplicação calcular o fuso certo", "Não impede a próxima consulta escrita do mesmo jeito"]
+    bestWhen: "a consulta está sob seu controle e o índice que ela precisa já existe — o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "A causa é o predicado não-sargável: a conversão de fuso aplicada sobre `created_at` impede o uso da segunda coluna do índice."
+          present: "Diagnóstico correto: predicado não-sargável."
+        - id: evidence
+          name: "Plano antes e depois"
+          weight: 25
+          evidence:
+            - { type: investigation, kind: EXPLAIN, target: order_items, min: 2 }
+          missing: "Rode `EXPLAIN` da consulta original e da reescrita: a prova é `created_at` saindo de Filter e entrando em Index Cond."
+          present: "Planos comparados no console."
+        - id: rewrite
+          name: "Reescrita sargável"
+          weight: 30
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)created_at\\s*>=" }
+            - { type: regex, field: proposedSql, pattern: "(?is)created_at\\s*<" }
+          missing: "Escreva o filtro como intervalo semiaberto sobre a coluna crua: `created_at >= $2 AND created_at < $3`."
+          present: "Filtro reescrito de forma sargável."
+        - id: timezone
+          name: "Fuso preservado"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["fuso", "timezone", "time zone", "America/Sao_Paulo", "semiaberto", "UTC"], min: 1 }
+          missing: "Diga onde o fuso passa a ser resolvido: a fronteira do dia do seller precisa continuar correta depois da reescrita."
+          present: "Tratamento de fuso descrito."
+  - id: expression-index
+    name: "Índice por expressão"
+    summary: "Manter a consulta como está e criar um índice sobre a mesma expressão do filtro, para quem não controla o SQL."
+    pros: ["Não exige mudar a aplicação", "Funciona para consultas geradas por ferramenta", "Entrega rápida depois de criado"]
+    cons: ["Duplica o que o índice composto já cobre", "Preso ao fuso escrito na expressão", "Mais um índice caro para o checkout manter em toda escrita"]
+    bestWhen: "o SQL vem de um BI ou de um ERP de terceiro e não pode ser reescrito"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "A causa é o predicado não-sargável."
+          present: "Diagnóstico correto."
+        - id: expression
+          name: "Índice sobre a expressão"
+          weight: 30
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)create\\s+index.*concurrently.*\\(.*\\(" }
+          missing: "O índice precisa ser sobre a mesma expressão do filtro, entre parênteses, e criado com CONCURRENTLY."
+          present: "Índice por expressão proposto."
+        - id: fragility
+          name: "Fragilidade reconhecida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["fuso fixo", "outra expressão", "outra expressao", "frágil", "fragil", "idêntica", "identica", "exatamente igual"], min: 1 }
+          missing: "Reconheça o custo: o índice só vale enquanto a expressão do filtro for idêntica, incluindo o fuso escrito ali dentro."
+          present: "Fragilidade da solução reconhecida."
+        - id: write-cost
+          name: "Custo de escrita"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["escrita", "checkout", "insert", "duplica", "manutenção", "manutencao"], min: 1 }
+          missing: "Todo índice em `order_items` é pago pelo checkout em cada pedido, e este duplica o que já existe. Diga por que vale mesmo assim."
+          present: "Custo de escrita considerado."
+  - id: daily-rollup
+    name: "Tabela diária consolidada"
+    summary: "Agregar venda por seller, dia e SKU em `seller_daily_sales` no fechamento do dia e servir o portal dali."
+    pros: ["Resposta em milissegundos independentemente do volume", "Tira leitura pesada da tabela do checkout", "Serve também o painel e o ERP"]
+    cons: ["O dia corrente precisa de tratamento à parte", "Mais um caminho de escrita para manter correto", "Backfill do histórico"]
+    bestWhen: "o relatório é sempre por dia fechado e o volume por seller cresce mais rápido que o banco"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [NON_SARGABLE_PREDICATE] }
+          missing: "Mesmo indo para consolidação, registre por que a consulta atual não usa o índice por inteiro."
+          present: "Diagnóstico correto."
+        - id: rollup-design
+          name: "Desenho da consolidação"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["seller_daily_sales", "consolidad", "agrega", "rollup", "materializ"], min: 1 }
+          missing: "Descreva a granularidade da tabela consolidada e quando ela é escrita."
+          present: "Consolidação descrita."
+        - id: current-day
+          name: "Dia corrente"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["dia corrente", "dia de hoje", "hoje", "parcial", "tempo real", "incremental"], min: 1 }
+          missing: "O seller quer ver a venda de hoje. Diga como o dia aberto é servido enquanto não fecha."
+          present: "Dia corrente resolvido."
+        - id: backfill
+          name: "Histórico"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["backfill", "histórico", "historico", "reprocess", "migra"], min: 1 }
+          missing: "Diga como os dias antigos entram na tabela nova."
+          present: "Backfill descrito."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: NON_SARGABLE_PREDICATE, label: "Predicado não-sargável: expressão aplicada sobre a coluna filtrada" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: ANALYTICAL_ON_OLTP, label: "Consulta analítica no banco transacional" }
+        - { value: STALE_STATISTICS, label: "Estatísticas desatualizadas" }
+        - { value: BLOAT, label: "Índice inchado" }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: sargable-rewrite, label: "Reescrever o filtro de forma sargável" }
+        - { value: expression-index, label: "Índice por expressão" }
+        - { value: daily-rollup, label: "Tabela diária consolidada" }
+    - id: proposedSql
+      label: "SQL ou DDL proposto"
+      type: SQL
+      required: true
+    - id: explanation
+      label: "Diagnóstico, solução e plano de aplicação"
+      type: MARKDOWN
+      required: true
+      help: "Use seções: ## Diagnóstico, ## Solução, ## Aplicação, ## Risco"
+reference: |
+  ## Diagnóstico
+  `EXPLAIN` mostra `Index Scan using idx_items_seller_created on order_items` com `Index Cond: (i.seller_id = $1)`
+  e a condição de data em `Filter`, com `Rows Removed by Filter` na casa de {{itemsPerSeller|compact}}. O banco usa o
+  índice só pela primeira coluna: busca todos os itens do seller e calcula
+  `(created_at AT TIME ZONE 'America/Sao_Paulo')::date` linha a linha, para ficar com ~{{itemsPerDay|number}}.
+
+  A segunda coluna do índice não entra porque o filtro não é sobre `created_at`. É sobre o resultado de uma conversão
+  de fuso seguida de cast, e um índice B-tree guarda o valor da coluna, não o valor dessa expressão.
+
+  `pg_stat_statements` confirma a rota subindo de {{p99Before}}ms para {{p99}}ms a partir de {{sinceLabel}}, porque
+  {{triggerNote}}.
+
+  ## Solução
+  Reescrever o filtro como intervalo semiaberto sobre a coluna crua. A aplicação converte o dia pedido pelo seller em
+  dois instantes, no fuso dele, e o índice que já existe passa a servir às duas colunas:
+
+  ```sql
+  SELECT i.sku, sum(i.quantity) AS unidades, sum(i.quantity * i.unit_price_cents) AS bruto_cents
+    FROM order_items i
+   WHERE i.seller_id = $1
+     AND i.created_at >= $2   -- 00:00 do dia no fuso do seller, convertido pela aplicação
+     AND i.created_at <  $3   -- 00:00 do dia seguinte
+   GROUP BY i.sku
+   ORDER BY bruto_cents DESC;
+  ```
+
+  No plano novo, `created_at` sai de `Filter` e entra em `Index Cond`, e as linhas lidas caem de
+  {{itemsPerSeller|compact}} para as do dia. O intervalo é semiaberto de propósito: `>=` no começo e `<` no fim não
+  deixa o pedido da meia-noite aparecer em dois dias, que é o que aconteceria com `BETWEEN`.
+
+  ## Aplicação
+  - Nenhum DDL. A mudança é só no código da consulta, publicada atrás de flag.
+  - Comparar o resultado das duas versões para uma amostra de sellers por um dia, incluindo o horário de verão de
+    estados que ainda o adotam, antes de remover a antiga.
+  - Registrar a regra no guia de SQL do time: nada de função ou cast sobre coluna indexada no `WHERE`.
+
+  ## Risco
+  O risco principal é a fronteira do dia: se a aplicação calcular os instantes em UTC, o relatório fica rápido e
+  errado. Por isso a comparação lado a lado antes do corte.
+
+  Um índice de cobertura com `INCLUDE (sku, quantity, unit_price_cents)` evitaria voltar à tabela, mas custa
+  dezenas de gigabytes e é pago pelo checkout em toda escrita, com a Black Friday em sete semanas. Só vale se a leitura
+  pelo índice ainda estiver lenta depois da reescrita, e medindo a latência de `POST /orders` antes e depois.
+scenario:
+  kind: slow-query
+  params:
+    service: seller-api
+    endpoint: "GET /seller/{id}/sales"
+    table: order_items
+    slowSql: "SELECT i.sku, sum(i.quantity) AS unidades, sum(i.quantity * i.unit_price_cents) AS bruto_cents FROM order_items i WHERE i.seller_id = $1 AND (i.created_at AT TIME ZONE 'America/Sao_Paulo')::date = $2 GROUP BY i.sku ORDER BY bruto_cents DESC"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    datastore: orders-db
+recommendation:
+  default: sargable-rewrite
+  rules:
+    - { param: itemsPerSeller, op: ">=", value: 700000, path: daily-rollup, reason: "com {{itemsPerSeller|number}} itens por seller, até a leitura correta pelo índice devolve páginas espalhadas demais: consolidar por dia deixa de ser otimização e vira o desenho certo" }

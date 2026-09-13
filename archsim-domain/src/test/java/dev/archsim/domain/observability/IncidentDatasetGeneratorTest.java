@@ -90,6 +90,14 @@ class IncidentDatasetGeneratorTest {
         assertThat(ds.dbState().sessions()).isNotEmpty();
     }
 
+    /** O teto do gráfico é o pool declarado pela empresa: um caso que diz "25 conexões" não pode mostrar 20. */
+    @Test
+    void poolExhaustionSaturatesAtThePoolSizeTheScenarioDeclares() {
+        ObservabilityDataset ds = factory.generate(incident("POOL_EXHAUSTION", Map.of("poolSize", "25")), bank, new SeededRandom(5L));
+        double peak = ds.series("account-api", "db_pool_in_use").orElseThrow().max();
+        assertThat(peak).isBetween(24.0, 25.0);
+    }
+
     @Test
     void kafkaHotPartitionShowsConsumerLagOnly() {
         ObservabilityDataset ds = factory.generate(incident("KAFKA_HOT_PARTITION", Map.of("broker", "kafka", "topic", "ledger.entries")), bank, new SeededRandom(9L));

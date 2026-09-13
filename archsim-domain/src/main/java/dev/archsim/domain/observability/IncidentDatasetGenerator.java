@@ -167,8 +167,11 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
         }
 
         private void poolExhaustion() {
+            // The ceiling is the pool the company declares; 20 keeps older scenarios unchanged. No noise: a gauge of
+            // connections in use cannot read above the pool size, and a saturated pool shows as a flat line at the max.
+            int pool = Integer.parseInt(sc.paramOr("poolSize", "20"));
             degradeLatency(service);
-            put(service, "db_pool_in_use", "connections", Shape.daily(6, 3, 15).plus(Shape.ramp(onset, rampEnd, 0, 20)).clamp(0, 20), 0.2);
+            put(service, "db_pool_in_use", "connections", Shape.daily(pool * 0.3, pool * 0.15, 15).plus(Shape.ramp(onset, rampEnd, 0, pool)).clamp(0, pool), 0);
             put(service, "db_pool_pending", "threads", Shape.ramp(onset, rampEnd, 0, 45), 4);
             put(service, "error_rate", "%", Shape.constant(0.2).plus(Shape.ramp(onset, rampEnd, 0, 12)), 0.5);
             put(datastore, "active_connections", "connections", Shape.daily(60, 25, 15).plus(Shape.ramp(onset, rampEnd, 0, 900)), 20);
@@ -176,7 +179,7 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
                     "HikariPool-1 - Connection is not available, request timed out after 30000ms",
                     "Connection timeout acquiring connection from pool (waited 30000ms)"), Map.of("status", "503"));
             dominatedTrace("acquireConnection", 30_000, Map.of("db.pool", "HikariPool-1", "http.status_code", "503"));
-            alert("ConnectionPoolSaturated", service, "critical", "pool em 20/20 conexões por mais de 3 minutos");
+            alert("ConnectionPoolSaturated", service, "critical", "pool em " + pool + "/" + pool + " conexões por mais de 3 minutos");
         }
 
         private void kafkaHotPartition() {

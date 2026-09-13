@@ -13,6 +13,8 @@ import org.springframework.mock.web.MockHttpSession;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.nio.charset.StandardCharsets;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -28,7 +30,10 @@ class ApiSmokeTest extends PostgresTestSupport {
 
     @Test
     void fullSlowQueryFlow() throws Exception {
-        mvc.perform(get("/api/attempts/x")).andExpect(status().isUnauthorized());
+        MvcResult denied = mvc.perform(get("/api/attempts/x")).andExpect(status().isUnauthorized()).andReturn();
+        // O corpo do 401 tem acento: sem charset explícito o container serve ISO-8859-1 e o navegador mostra "N?o".
+        assertThat(new String(denied.getResponse().getContentAsByteArray(), StandardCharsets.UTF_8))
+                .contains("Não autenticado");
         mvc.perform(post("/api/users").contentType(MediaType.APPLICATION_JSON).content("{\"username\":\"nathan\",\"displayName\":\"Nathan\",\"password\":\"secret1\"}"))
                 .andExpect(status().isCreated()).andExpect(jsonPath("$.username").value("nathan"));
         MvcResult login = mvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON).content("{\"username\":\"nathan\",\"password\":\"secret1\"}"))
@@ -39,6 +44,11 @@ class ApiSmokeTest extends PostgresTestSupport {
 
         mvc.perform(get("/api/auth/me").session(s)).andExpect(status().isOk()).andExpect(jsonPath("$.displayName").value("Nathan"));
         mvc.perform(get("/api/companies")).andExpect(status().isOk()).andExpect(jsonPath("$[0].id").value("banco-digital"));
+        // O catálogo é o que impede a tela inicial de oferecer uma combinação sem template.
+        mvc.perform(get("/api/catalog").session(s)).andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].companyId").value("banco-digital"))
+                .andExpect(jsonPath("$[0].levels").isArray())
+                .andExpect(jsonPath("$[0].templates").isNumber());
 
         MvcResult started = mvc.perform(post("/api/attempts").session(s).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"companyId\":\"banco-digital\",\"caseType\":\"SLOW_QUERY\",\"level\":\"PLENO\"}"))

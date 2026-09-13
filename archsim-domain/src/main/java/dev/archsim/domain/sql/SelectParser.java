@@ -2,6 +2,8 @@ package dev.archsim.domain.sql;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -14,6 +16,13 @@ public final class SelectParser {
     private static final Pattern PREDICATE = Pattern.compile(
             "(?i)^\\s*(?<fn>[a-z_]+\\s*\\(\\s*)?(?<col>[a-z_][a-z0-9_.]*)(?<cast>\\s*::\\s*[a-z]+)?\\s*\\)?\\s*(?<op>>=|<=|<>|!=|=|>|<|\\bnot\\s+like\\b|\\blike\\b|\\bilike\\b|\\bin\\b|\\bis\\s+null\\b|\\bis\\s+not\\s+null\\b|\\bbetween\\b)\\s*(?<lit>.*)$");
     private static final Pattern PARAM = Pattern.compile("^(\\$\\d+|\\?|:[a-z_0-9]+)$");
+    /** Any expression compared to a literal: `(col AT TIME ZONE 'x')::date = $1`, `date_trunc('day', col) = $1`. */
+    private static final Pattern EXPRESSION = Pattern.compile(
+            "(?is)^(?<expr>.+?)\\s*(?<op>>=|<=|<>|!=|=|>|<|\\bnot\\s+like\\b|\\blike\\b|\\bilike\\b|\\bin\\b|\\bbetween\\b)\\s*(?<lit>[^=<>!]*)$");
+    /** An identifier that is not a function name and is not part of a longer identifier. */
+    private static final Pattern IDENTIFIER = Pattern.compile("(?i)(?<![a-z0-9_.])([a-z_][a-z0-9_]*(?:\\.[a-z_][a-z0-9_]*)?)(?![a-z0-9_]*\\s*\\()");
+    private static final Set<String> SQL_WORDS = Set.of("at", "time", "zone", "date", "timestamp", "timestamptz", "interval", "cast", "as",
+            "text", "numeric", "integer", "int", "bigint", "varchar", "null", "true", "false", "day", "month", "year", "hour", "minute");
 
     public SelectStatement parse(String sql) {
         String cleaned = sql.trim().replaceAll(";\\s*$", "").replaceAll("\\s+", " ");
@@ -47,7 +56,7 @@ public final class SelectParser {
         if (wherePart != null) {
             for (String clause : wherePart.split("(?i)\\s+and\\s+")) {
                 Matcher pm = PREDICATE.matcher(clause.trim());
-                if (!pm.find()) { predicates.add(new Predicate(null, Operator.OTHER, null, false, false, clause.trim())); continue; }
+                if (!pm.find()) { predicates.add(expressionPredicate(clause.trim())); continue; }
                 boolean fn = pm.group("fn") != null || pm.group("cast") != null;
                 String op = pm.group("op").toLowerCase().replaceAll("\\s+", " ");
                 String rawLit = pm.group("lit").trim();
@@ -66,6 +75,26 @@ public final class SelectParser {
         }
         boolean aggregate = selectList.matches("(?is).*\\b(count|sum|avg|min|max)\\s*\\(.*") || rest.matches("(?is).*\\s+group\\s+by\\s+.*");
         return new SelectStatement(List.copyOf(tables), List.copyOf(joins), List.copyOf(predicates), List.copyOf(orderBy), limit, aggregate, selectList);
+    }
+
+    /**
+     * A comparison whose left side is an expression rather than a bare column. The column inside it is kept, so the
+     * planner can render the condition as a Filter; the predicate is always non-sargable, which is the whole point.
+     */
+    private static Predicate expressionPredicate(String clause) {
+        Matcher em = EXPRESSION.matcher(clause);
+        if (!em.matches()) return new Predicate(null, Operator.OTHER, null, false, false, clause);
+        String withoutStrings = em.group("expr").replaceAll("'[^']*'", " ");
+        Matcher im = IDENTIFIER.matcher(withoutStrings);
+        while (im.find()) {
+            String candidate = im.group(1);
+            if (SQL_WORDS.contains(candidate.toLowerCase(Locale.ROOT))) continue;
+            String op = em.group("op").toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+            String rawLit = em.group("lit").trim();
+            String lit = stripQuotes(rawLit);
+            return new Predicate(columnRef(candidate), operatorFor(op, lit), lit, !lit.equals(rawLit), true, clause);
+        }
+        return new Predicate(null, Operator.OTHER, null, false, false, clause);
     }
 
     private static Operator operatorFor(String op, String literal) {

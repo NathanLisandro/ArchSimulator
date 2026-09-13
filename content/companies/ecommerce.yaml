@@ -195,6 +195,7 @@ schema:
         - { name: order_items_pkey, columns: [id], unique: true, sizeMb: 66000 }
         - { name: idx_items_order, columns: [order_id], sizeMb: 71000 }
         - { name: idx_items_sku_created, columns: [sku, created_at], sizeMb: 88000 }
+        - { name: idx_items_seller_created, columns: [seller_id, created_at], sizeMb: 94000 }
     - name: inventory
       rowCount: 14000000
       sizeMb: 4200

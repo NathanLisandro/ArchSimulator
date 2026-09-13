@@ -1,7 +1,9 @@
 package dev.archsim.infrastructure;
 
 import dev.archsim.domain.cases.Case;
+import dev.archsim.domain.cases.CaseType;
 import dev.archsim.domain.cases.Level;
+import dev.archsim.domain.cases.MitigationEffect;
 import dev.archsim.domain.company.Company;
 import dev.archsim.domain.observability.ObservabilityDataset;
 import dev.archsim.domain.observability.ObservabilityDatasetFactory;
@@ -12,6 +14,7 @@ import dev.archsim.domain.observability.SlowQueryDatasetGenerator;
 import dev.archsim.domain.shared.SeededRandom;
 import dev.archsim.domain.template.CaseGenerator;
 import dev.archsim.domain.template.CaseTemplate;
+import dev.archsim.domain.template.CaseTemplateRepository;
 import dev.archsim.infrastructure.content.YamlCaseTemplateRepository;
 import dev.archsim.infrastructure.content.YamlCompanyRepository;
 import dev.archsim.infrastructure.content.YamlDeckRepository;
@@ -102,5 +105,21 @@ class ContentValidationTest {
                 }
             }
         }
+    }
+
+    /**
+     * Todo incidente precisa de uma saída. Sem nenhuma mitigação que resolve o jogador fica preso, e a ordem
+     * não pode ser a dica: em vários templates a opção óbvia é a que só alivia, e é assim de propósito.
+     */
+    @Test
+    void everyIncidentHasAWayOut() {
+        CaseTemplateRepository templates = new YamlCaseTemplateRepository(Path.of("..", "content"));
+        List<CaseTemplate> incidents = templates.findAll().stream().filter(t -> t.type() == CaseType.INCIDENT).toList();
+
+        assertThat(incidents).isNotEmpty();
+        assertThat(incidents).allSatisfy(t ->
+                assertThat(t.mitigations())
+                        .as(t.id() + ": nenhuma mitigação com efeito RESOLVES")
+                        .anyMatch(m -> m.effect() == MitigationEffect.RESOLVES));
     }
 }

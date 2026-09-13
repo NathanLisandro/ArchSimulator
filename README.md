@@ -37,6 +37,7 @@ docker compose up --build
 
 - Aplicação: http://localhost:5173
 - API: http://localhost:8080/api
+- PostgreSQL: localhost:5433 (usuário e senha `archsim`), fora da 5432 para não brigar com um Postgres local
 
 Crie uma conta na primeira tela.
 
@@ -46,12 +47,12 @@ Requisitos: Java 25 (`JAVA_HOME` no JDK 25), Maven 3.8+, Node 20+, Docker (Postg
 
 ```bash
 docker compose up -d postgres
-mvn test                                   # 135 testes; integração via Testcontainers
+mvn test                                   # 143 testes; integração via Testcontainers
 mvn -pl archsim-infrastructure spring-boot:run
 
 cd frontend
 npm install
-npm test                                   # 43 testes de componente e de cliente
+npm test                                   # 47 testes de componente e de cliente
 npm run dev                                # proxy para :8080 já configurado
 ```
 
@@ -63,10 +64,10 @@ npm run dev                                # proxy para :8080 já configurado
 |---|---|
 | Tipos de caso | 8, todos implementados com checkpoints, caminhos e rubricas próprias |
 | Empresas | 4: banco digital, e-commerce, logística e saúde |
-| Templates de conteúdo | 25, incluindo um caso de consequência de segunda ordem |
+| Templates de conteúdo | 27, incluindo um caso de consequência de segunda ordem |
 | Causas raiz de incidente | 12, cada uma com assinatura própria em métricas, logs e traces |
 | Flashcards | 100 de base em 8 decks, mais os gerados por caso resolvido |
-| Testes | 178: 135 no backend (domínio, aplicação, integração) e 43 no frontend |
+| Testes | 190: 143 no backend (domínio, aplicação, integração) e 47 no frontend |
 | Decisões registradas | 9 ADRs em `docs/adr/` |
 
 ### Tipos de caso
@@ -206,7 +207,7 @@ O projeto pratica o que ensina: as decisões estão em `docs/adr/`.
 
 Nada disso bloqueia o uso, mas está mapeado:
 
-- **Mais conteúdo.** São 25 templates, entre dois e cinco por tipo. Mais casos por tipo e por empresa é só escrever
+- **Mais conteúdo.** São 27 templates, entre dois e cinco por tipo. Mais casos por tipo e por empresa é só escrever
   mais YAML: o `ContentValidationTest` gera cada template com 15 sementes em todos os níveis e reprova o que estiver
   inconsistente.
 - **Agentes e RAG como tipo próprio.** O módulo de IA do MBA está coberto por um ADR de busca semântica e por

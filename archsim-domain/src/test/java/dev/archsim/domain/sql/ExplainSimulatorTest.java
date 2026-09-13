@@ -127,4 +127,32 @@ class ExplainSimulatorTest {
         ExplainPlan plan = simulator.explain("SELECT * FROM nope", schema(LEDGER), SqlDialect.POSTGRES);
         assertThat(plan.text()).contains("relation \"nope\" does not exist");
     }
+
+    /**
+     * O índice composto existe, mas a expressão sobre a segunda coluna só deixa usar a primeira: o plano precisa
+     * mostrar isso, porque é exatamente a evidência que o caso pede para o jogador encontrar.
+     */
+    @Test
+    void expressionOnSecondIndexColumnLimitsTheIndexToItsFirstColumn() {
+        Table items = new Table("order_items", 3_100_000_000L, 980_000L,
+                List.of(new Column("seller_id", "bigint", 12_000L, false),
+                        new Column("created_at", "timestamp", 800_000_000L, false),
+                        new Column("sku", "varchar(32)", 4_800_000L, false)),
+                List.of(new Index("idx_items_seller_created", List.of("seller_id", "created_at"), false, "btree", 94_000L)));
+
+        ExplainPlan expression = simulator.explain(
+                "SELECT i.sku FROM order_items i WHERE i.seller_id = 42 "
+                + "AND (i.created_at AT TIME ZONE 'America/Sao_Paulo')::date = '2026-09-12'",
+                schema(items), SqlDialect.POSTGRES);
+        ExplainPlan rewritten = simulator.explain(
+                "SELECT i.sku FROM order_items i WHERE i.seller_id = 42 "
+                + "AND i.created_at >= '2026-09-12 03:00' AND i.created_at < '2026-09-13 03:00'",
+                schema(items), SqlDialect.POSTGRES);
+
+        assertThat(expression.text()).contains("Index Scan using idx_items_seller_created");
+        assertThat(expression.text()).contains("Index Cond: (i.seller_id = 42)");
+        assertThat(expression.text()).contains("Filter: ((i.created_at AT TIME ZONE 'America/Sao_Paulo')::date");
+        assertThat(rewritten.text()).contains("Index Cond: ((i.seller_id = 42) AND (i.created_at >= '2026-09-12 03:00')");
+        assertThat(rewritten.text()).doesNotContain("AT TIME ZONE");
+    }
 }
