@@ -1,0 +1,294 @@
+id: health-slow-query-agenda-availability
+type: SLOW_QUERY
+company: saude
+levels: [JUNIOR, PLENO, SENIOR]
+competencies: [databases, caching, capacity, observability]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [2200, 8000], step: 200 }
+  sinceHoursAgo: { range: [2, 14] }
+  professionals: { range: [8000, 48000], step: 2000 }
+  slotMinutes: { choice: ["10", "15", "20", "30"] }
+  trigger:
+    group:
+      - { trigger: "o app passou a pré-carregar a grade dos próximos 30 dias ao abrir a tela, em vez de só o dia escolhido", triggerNote: "cada abertura de tela virou 30 consultas" }
+      - { trigger: "um plano de saúde grande entrou na plataforma e trouxe 4 mil profissionais de uma vez", triggerNote: "o volume da grade quadruplicou sem mudança de código" }
+      - { trigger: "a busca por especialidade passou a mostrar o próximo horário livre de cada profissional na lista de resultados", triggerNote: "uma busca com 40 resultados dispara 40 cálculos de grade" }
+derived:
+  p99Before: "round(p99 / 16)"
+  slotsPerDay: "round(600 / slotMinutes)"
+narrative:
+  title: "Agenda em {{p99}}ms: ninguém consegue marcar consulta às 7h"
+  symptom: |
+    Desde {{sinceLabel}}, `GET /scheduling/availability?professional={id}&date=` está em **{{p99}}ms no p99**
+    (baseline ~{{p99Before}}ms). O pico de agendamento é entre 7h e 9h, e é exatamente quando a tela trava.
+
+    O gatilho: {{trigger}} — {{triggerNote}}.
+
+    A consulta monta a grade do profissional calculando, para cada horário de {{slotMinutes}} minutos, se há consulta
+    marcada, bloqueio, feriado ou intervalo. São {{slotsPerDay}} horários por dia por profissional.
+  businessContext: |
+    São {{professionals|number}} profissionais ativos em 140 clínicas. Consulta que não é marcada às 7h não é
+    remarcada depois: o paciente vai para outro lugar. O `scheduling-db` é o mesmo que grava a marcação, então a
+    leitura lenta compete com a escrita que realmente importa.
+  hints:
+    - "Quantas vezes a mesma grade é calculada por minuto, para o mesmo profissional?"
+    - "A grade muda a cada quantos segundos, de verdade?"
+    - "Veja se o custo está em uma consulta cara ou em muitas consultas repetidas."
+checkpoints:
+  - id: repetition
+    question: "Primeira medida: a consulta é cara ou é repetida?"
+    options:
+      - id: check-calls
+        label: "Ver `calls` e `mean_exec_time` em pg_stat_statements para separar as duas coisas"
+        verdict: GOOD
+        feedback: "Certo. Uma consulta de 40ms chamada 900 vezes por minuto tem outro tratamento de uma de 4s chamada 5 vezes. Aqui os dois números importam: {{triggerNote}}."
+      - id: assume-slow
+        label: "É cara: otimizar a consulta"
+        verdict: RISKY
+        feedback: "Pode ser, mas assumir sem medir leva a otimizar o que não é gargalo. Se o custo vem da repetição, índice novo melhora pouco e cache melhora muito."
+      - id: add-replica
+        label: "Adicionar réplica de leitura"
+        verdict: RISKY
+        feedback: "Réplica distribui leitura já eficiente. Se a mesma grade é recalculada centenas de vezes por minuto, você está distribuindo desperdício."
+  - id: freshness
+    question: "De quanto em quanto tempo a grade de um profissional realmente muda?"
+    options:
+      - id: seconds-tolerance
+        label: "Muda quando alguém marca ou cancela; a tela pode tolerar alguns segundos de atraso, com verificação na confirmação"
+        verdict: GOOD
+        feedback: "Exato, e isso é o que torna o cache seguro aqui. Mostrar um horário que acabou de ser ocupado é aceitável se a **confirmação** valida de novo e avisa: 'esse horário acabou de ser preenchido'."
+      - id: always-fresh
+        label: "Precisa estar sempre exata: dois pacientes não podem marcar o mesmo horário"
+        verdict: RISKY
+        feedback: "A garantia de não haver dois na mesma vaga é da **escrita**, não da leitura: restrição de unicidade e verificação na confirmação. Exigir leitura sempre exata para evitar conflito confunde as duas camadas e paga caro pela confusão."
+      - id: minutes
+        label: "Pode ficar minutos desatualizada, é só uma grade"
+        verdict: BAD
+        feedback: "Minutos no pico das 7h significa muita gente clicando em horário já ocupado. A frustração é real e o suporte sente. Segundos, sim; minutos, não."
+  - id: write-safety
+    question: "Com cache na leitura, o que impede dois pacientes de marcarem o mesmo horário?"
+    options:
+      - id: unique-constraint
+        label: "Restrição de unicidade em (profissional, horário) e verificação na confirmação"
+        verdict: GOOD
+        feedback: "Sim. O banco decide quem ganhou a vaga, não a tela. O segundo paciente recebe um erro claro e a grade recarrega. `uq_appointments_idempotency` já existe para o retry; falta a garantia de vaga."
+      - id: lock-on-read
+        label: "Bloquear o horário quando o paciente abre a tela"
+        verdict: RISKY
+        feedback: "Reserva temporária existe em vários produtos e pode valer, mas cria outro problema: horário preso por quem só estava olhando. Se fizer, defina TTL curto e libere no abandono."
+      - id: trust-cache
+        label: "Confiar no cache: se a grade mostra livre, está livre"
+        verdict: BAD
+        feedback: "Isso transforma uma otimização de leitura em bug de dados. Duas marcações na mesma vaga em saúde significam paciente chegando na clínica e sendo mandado embora."
+solutionPaths:
+  - id: cache-with-invalidation
+    name: "Cache da grade com invalidação por evento"
+    summary: "Calcular a grade uma vez, guardar no Redis com TTL curto, invalidar na marcação e cancelamento, e validar a vaga na confirmação."
+    pros: ["Ataca a repetição, que é a maior parcela", "Efeito imediato no pico", "Reaproveita o Redis existente"]
+    cons: ["Janela de segundos com grade desatualizada", "Invalidação precisa ser confiável", "Não reduz o custo do primeiro cálculo"]
+    bestWhen: "a mesma grade é lida muitas vezes entre mudanças — o padrão de busca por especialidade"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [REPEATED_COMPUTATION] }
+          missing: "A causa raiz é recálculo repetido da mesma grade: {{triggerNote}}."
+          present: "Causa raiz correta: cálculo repetido."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Mostre `calls` alto em pg_stat_statements e o pico de requisições nas métricas."
+          present: "Repetição comprovada."
+        - id: invalidation
+          name: "Invalidação definida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["invalida", "evento", "marcação", "marcacao", "cancelamento", "ttl"], min: 2 }
+          missing: "Defina o TTL e os eventos que invalidam a chave: marcação, cancelamento, bloqueio de agenda."
+          present: "TTL e invalidação definidos."
+        - id: write-safety
+          name: "Garantia na escrita"
+          weight: 20
+          evidence:
+            - { type: choice, field: writeSafety, anyOf: [unique-constraint] }
+            - { type: keyword, field: explanation, anyOf: ["unicidade", "unique", "confirmação", "confirmacao", "conflito"], min: 1 }
+          missing: "Cache na leitura exige garantia na escrita: restrição de unicidade da vaga e verificação na confirmação."
+          present: "Garantia de vaga na escrita."
+        - id: stampede
+          name: "Proteção contra stampede"
+          weight: 10
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["stampede", "single flight", "jitter", "lock", "ttl escalonado"], min: 1 }
+          missing: "Às 7h muitas chaves expiram juntas: use jitter no TTL ou single-flight para não devolver a carga toda ao banco."
+          present: "Stampede tratado."
+  - id: precompute-grid
+    name: "Materializar a grade em tabela de horários"
+    summary: "Manter uma tabela de vagas por profissional e dia, atualizada por evento, e servir a leitura direto dela."
+    pros: ["Leitura vira consulta indexada simples", "A vaga passa a ter linha própria, o que resolve unicidade", "Permite reservar com TTL"]
+    cons: ["Escrita a mais no caminho da marcação", "Geração das vagas futuras precisa de job", "Mudança de horário de atendimento exige regenerar"]
+    bestWhen: "a grade é consultada o tempo todo e a vaga precisa ser um objeto de primeira classe, não um cálculo"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [REPEATED_COMPUTATION] }
+          missing: "A causa raiz é o recálculo repetido da grade."
+          present: "Causa raiz correta."
+        - id: model
+          name: "Modelo da vaga"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["slot", "vaga", "tabela", "linha por horário", "linha por horario"], min: 1 }
+            - { type: regex, field: proposedSql, pattern: "(?is)(create\\s+table|unique|insert\\s+into)" }
+          missing: "Descreva a tabela de vagas e a restrição que garante uma marcação por vaga."
+          present: "Modelo de vaga definido."
+        - id: generation
+          name: "Geração e manutenção"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["job", "gera", "horizonte", "dias à frente", "dias a frente", "regenera"], min: 1 }
+          missing: "Vagas futuras não existem sozinhas: diga quantos dias à frente são gerados e o que acontece quando o profissional muda o horário de atendimento."
+          present: "Geração e manutenção descritas."
+        - id: migration
+          name: "Migração sem parar"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["sombra", "gradual", "flag", "backfill", "comparar"], min: 1 }
+          missing: "A agenda não pode parar: descreva o corte gradual e a comparação com o cálculo atual."
+          present: "Migração segura descrita."
+  - id: optimize-query
+    name: "Otimizar a consulta e o índice"
+    summary: "Reescrever o cálculo para uma única passada com índice de cobertura por profissional e data, sem mudar a arquitetura."
+    pros: ["Sem peça nova", "Entrega em dias", "Mantém a leitura sempre exata"]
+    cons: ["Não ataca a repetição", "Ganho limitado pelo volume do pico", "Volta a apertar com mais profissionais"]
+    bestWhen: "a consulta é realmente cara por passada e o volume de repetição é baixo"
+    rubric:
+      criteria:
+        - id: measured
+          name: "Decisão baseada em medida"
+          weight: 30
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_statements }
+            - { type: keyword, field: explanation, anyOf: ["calls", "mean_exec_time", "por passada", "repetição", "repeticao"], min: 1 }
+          missing: "Otimizar a consulta só se justifica se o custo está na passada, não na repetição: mostre o número que embasa isso."
+          present: "Escolha embasada em medida."
+        - id: index
+          name: "Índice proposto"
+          weight: 30
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)create\\s+index.*concurrently.*appointments" }
+          missing: "Proponha o índice sobre `appointments`, criado com CONCURRENTLY."
+          present: "Índice correto e online."
+        - id: horizon
+          name: "Horizonte"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["volta a apertar", "horizonte", "não escala", "nao escala", "próxim", "proxim"], min: 1 }
+          missing: "Com {{professionals|number}} profissionais e crescendo, diga por quanto tempo isso resolve."
+          present: "Horizonte assumido."
+        - id: write-safety
+          name: "Garantia na escrita"
+          weight: 20
+          evidence:
+            - { type: choice, field: writeSafety, anyOf: [unique-constraint] }
+          missing: "Independente do caminho, a vaga precisa de restrição de unicidade na escrita."
+          present: "Garantia de vaga na escrita."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: REPEATED_COMPUTATION, label: "Mesma grade recalculada muitas vezes por minuto" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: NON_SARGABLE_PREDICATE, label: "Predicado não-sargável" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+        - { value: POOL_EXHAUSTION, label: "Pool de conexões esgotado" }
+    - id: writeSafety
+      label: "O que garante uma marcação por vaga"
+      type: SELECT
+      required: true
+      options:
+        - { value: unique-constraint, label: "Restrição de unicidade no banco e verificação na confirmação" }
+        - { value: read-lock, label: "Bloqueio ao abrir a tela" }
+        - { value: cache-trust, label: "O que a grade mostrou" }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: cache-with-invalidation, label: "Cache com invalidação por evento" }
+        - { value: precompute-grid, label: "Materializar a grade em vagas" }
+        - { value: optimize-query, label: "Otimizar consulta e índice" }
+    - id: proposedSql
+      label: "SQL ou DDL proposto"
+      type: SQL
+      required: false
+    - id: explanation
+      label: "Diagnóstico, solução, consistência e validação"
+      type: MARKDOWN
+      required: true
+      help: "Use seções: ## Diagnóstico, ## Solução, ## Consistência, ## Validação"
+reference: |
+  ## Diagnóstico
+  `pg_stat_statements` ordenado por `calls` mostra a consulta da grade com volume muito acima de tudo o mais, e
+  `mean_exec_time` de algumas dezenas de milissegundos — cara não é, repetida é. O gatilho foi {{trigger}}, que
+  multiplicou as chamadas sem mudar o custo unitário.
+
+  O efeito visível é p99 de {{p99}}ms no pico das 7h, porque {{slotsPerDay}} horários por profissional multiplicados
+  por muitas chamadas simultâneas saturam o `scheduling-db`, que também recebe a escrita da marcação.
+
+  ## Solução
+  A grade passa a ser calculada uma vez e servida do Redis:
+
+  - **Chave:** `agenda:{professional_id}:{date}`.
+  - **TTL:** 30 segundos, com jitter de ±10s para não expirar tudo junto às 7h.
+  - **Invalidação por evento:** marcação, cancelamento, reagendamento e bloqueio de agenda publicam em
+    `appointments.events`; o consumidor apaga a chave do profissional e da data.
+  - **Single-flight:** quando a chave está vazia, apenas uma requisição recalcula; as demais esperam o resultado.
+
+  ## Consistência
+  Cache na leitura **não** é o que garante a vaga. A garantia é da escrita:
+
+  ```sql
+  ALTER TABLE appointments
+    ADD CONSTRAINT uq_appointments_slot UNIQUE (professional_id, scheduled_at)
+    WHERE status IN ('AGENDADA', 'CONFIRMADA');   -- índice único parcial
+  ```
+
+  Na confirmação, o servidor tenta inserir; se a restrição falhar, o paciente recebe "esse horário acabou de ser
+  preenchido" e a grade recarrega. Isso é melhor experiência do que bloquear vaga de quem só estava olhando, e é o
+  que impede dois pacientes na mesma consulta.
+
+  ## Validação
+  Hit ratio da chave de agenda acima de 80% no pico; `calls` da consulta cai na mesma proporção; p99 do endpoint volta
+  a ~{{p99Before}}ms; conflitos de vaga aparecem como erro tratado, não como duas marcações.
+
+  ## Prevenção
+  Alerta de `calls/min` por statement, e não só de tempo médio — este incidente não move a média. Revisão de contrato
+  do app: pré-carregar 30 dias é decisão de produto com custo de infraestrutura, e precisa ser combinada.
+scenario:
+  kind: slow-query
+  params:
+    service: scheduling-api
+    endpoint: "GET /scheduling/availability"
+    table: appointments
+    slowSql: "SELECT a.scheduled_at, a.status FROM appointments a WHERE a.professional_id = $1 AND a.scheduled_at >= $2 AND a.scheduled_at < $3 ORDER BY a.scheduled_at"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    datastore: scheduling-db
+recommendation:
+  default: cache-with-invalidation
+  rules:
+    - { param: professionals, op: ">=", value: 36000, path: precompute-grid, reason: "com {{professionals|number}} profissionais o recálculo mesmo com cache ainda custa caro no primeiro acesso de cada combinação; nesse volume a vaga merece ser uma linha, não um cálculo" }

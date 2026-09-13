@@ -59,8 +59,8 @@ export const api = {
   companies: () => request<CompanySummary[]>('/api/companies'),
   company: (id: string) => request<CompanySummary>(`/api/companies/${id}`),
 
-  startCase: (companyId?: string, caseType?: string, level?: string) =>
-    post<AttemptView>('/api/attempts', { companyId, caseType, level }),
+  startCase: (companyId?: string, caseType?: string, level?: string, templateId?: string) =>
+    post<AttemptView>('/api/attempts', { companyId, caseType, level, templateId }),
   attempt: (id: string) => request<AttemptView>(`/api/attempts/${id}`),
   answerCheckpoint: (attemptId: string, checkpointId: string, optionId: string, proceedAnyway = false) =>
     post<CheckpointFeedback>(`/api/attempts/${attemptId}/checkpoints/${checkpointId}`, { optionId, proceedAnyway }),

@@ -1,0 +1,246 @@
+id: logistics-tradeoff-modular-monolith
+type: TRADE_OFF
+company: logistica
+levels: [PLENO, SENIOR, STAFF]
+competencies: [microservices, ddd, characteristics, adr, leadership]
+tools: []
+parameters:
+  teamSize: { range: [12, 44], step: 2 }
+  deploysPerWeek: { range: [2, 30], step: 2 }
+  incidentsPerMonth: { range: [3, 18] }
+  services: { range: [6, 14] }
+  context:
+    group:
+      - { context: "a diretoria quer entregar mais rápido e ouviu que microserviços aceleram times", contextNote: "a expectativa declarada é dobrar a frequência de entrega em um trimestre" }
+      - { context: "o time de rastreio quer escalar só a parte que recebe bipagem, sem escalar o resto junto", contextNote: "o custo de infraestrutura subiu 40% no último semestre" }
+      - { context: "duas squads travam uma na outra toda semana esperando merge no mesmo repositório", contextNote: "o lead time de uma mudança pequena está em nove dias" }
+derived:
+  deploysPerTeamPerWeek: "round(deploysPerWeek / max(teamSize / 6, 1))"
+narrative:
+  title: "Escolha forçada: monólito modular ou microserviços na plataforma de rastreio"
+  symptom: |
+    O `parcel-api`, o `hub-scanner` e o `sla-engine` vivem hoje no mesmo repositório e sobem juntos. {{context}} —
+    {{contextNote}}.
+
+    A arquitetura precisa decidir entre duas propostas e você tem de escolher **uma** e defender:
+
+    - **Monólito modular:** um artefato, módulos com fronteiras explícitas, banco único com esquemas separados,
+      dependências entre módulos verificadas no build.
+    - **Microserviços:** {{services}} serviços independentes, cada um com seu repositório, seu pipeline, seu banco e
+      sua equipe responsável.
+  businessContext: |
+    São {{teamSize}} pessoas em {{services}} squads, {{deploysPerWeek}} deploys por semana no total e
+    {{incidentsPerMonth}} incidentes por mês. A operação roda 24 horas, com pico entre 18h e 21h. O `parcel-db` é
+    compartilhado hoje, com 8,9 bilhões de linhas em `parcel_events`. A empresa não tem plataforma interna dedicada:
+    quem escreve o serviço também opera.
+  hints:
+    - "A pergunta não é qual arquitetura é melhor: é qual problema você está tentando resolver."
+    - "Quem opera o que você propõe, às 3 da manhã?"
+    - "Fronteira de módulo mal desenhada vira fronteira de serviço mal desenhada, só que com rede no meio."
+checkpoints:
+  - id: problem
+    question: "Qual problema, exatamente, se está tentando resolver?"
+    options:
+      - id: name-the-problem
+        label: "Autonomia de entrega: squads travando umas nas outras, com lead time alto"
+        verdict: GOOD
+        feedback: "Certo: nomear o problema é o que permite avaliar as duas opções pelo mesmo critério. Se o problema é acoplamento de entrega, tanto módulos com fronteira clara quanto serviços separados atacam — com custos muito diferentes."
+      - id: scalability
+        label: "Escalabilidade: precisamos escalar o rastreio separado"
+        verdict: RISKY
+        feedback: "Vale medir antes. Escalar componente separado é um dos poucos ganhos que só microserviços dão de fato, mas o custo de infraestrutura de {{services}} serviços costuma superar a economia de escalar um deles — e monólito também escala horizontalmente, só que inteiro."
+      - id: modernize
+        label: "Modernização: a arquitetura atual está ultrapassada"
+        verdict: BAD
+        feedback: "Isso não é um problema, é uma preferência. Reorganizar {{teamSize}} pessoas e {{services}} squads sem um problema nomeado é como se compra complexidade sem contrapartida."
+  - id: operations
+    question: "Quem opera {{services}} serviços em produção, às 3 da manhã?"
+    options:
+      - id: same-people
+        label: "As mesmas pessoas que escrevem, e não há plataforma interna dedicada"
+        verdict: GOOD
+        feedback: "Esse é o fator decisivo mais ignorado. Microserviços transferem complexidade do código para a operação: {{services}} pipelines, {{services}} conjuntos de alarme, rastreamento distribuído, versionamento de contrato. Sem plataforma, isso sai do tempo de quem entrega funcionalidade."
+      - id: sre-team
+        label: "Um time de SRE cuidaria disso"
+        verdict: RISKY
+        feedback: "Se esse time existir e for dimensionado, muda a conta. Hoje ele não existe: criar a plataforma junto com a migração é dois projetos ao mesmo tempo, e o segundo costuma ficar pela metade."
+      - id: not-a-problem
+        label: "Ferramentas gerenciadas resolvem"
+        verdict: BAD
+        feedback: "Gerenciado resolve instalação, não operação. Quem correlaciona um incidente que atravessa sete serviços continua sendo gente, e continua sendo de madrugada."
+  - id: data
+    question: "O `parcel-db` é compartilhado. O que acontece com ele em cada opção?"
+    options:
+      - id: data-is-the-hard-part
+        label: "Separar o dado é a parte difícil: sem isso, microserviços viram monólito distribuído com rede no meio"
+        verdict: GOOD
+        feedback: "Exato, e costuma ser onde a migração encalha. Se `sla-engine` continua lendo a tabela do `parcel-api`, você tem o pior dos dois mundos: acoplamento de dados com latência de rede e falha parcial."
+      - id: keep-shared
+        label: "Manter o banco compartilhado e separar só o código"
+        verdict: BAD
+        feedback: "É o monólito distribuído: nenhuma autonomia real, porque uma migração de esquema continua exigindo coordenação entre todas as squads, e agora com deploys independentes que podem se atropelar."
+      - id: split-later
+        label: "Separar o banco depois, em uma segunda fase"
+        verdict: RISKY
+        feedback: "Comum e raramente concluído: sem a separação, a autonomia prometida não chega, a insatisfação aumenta e a segunda fase perde prioridade. Se for por esse caminho, a fase dois precisa de data e dono desde o começo."
+solutionPaths:
+  - id: modular-monolith
+    name: "Monólito modular"
+    summary: "Um artefato, módulos com fronteiras explícitas verificadas no build, esquemas separados no mesmo banco e acesso entre módulos apenas por interface publicada."
+    pros: ["Autonomia de código sem custo operacional de rede", "Refatorar fronteira errada é barato", "Uma implantação, um conjunto de alarmes, um lugar para depurar", "Transação local continua possível"]
+    cons: ["Deploy continua compartilhado sem trabalho extra", "Escala como um bloco", "Disciplina de fronteira depende de verificação automática, senão apodrece"]
+    bestWhen: "as fronteiras de domínio ainda não estão comprovadas, o time não tem plataforma dedicada e o problema é acoplamento de código — o caso aqui"
+    rubric:
+      criteria:
+        - id: choice
+          name: "Escolha declarada"
+          weight: 10
+          evidence:
+            - { type: choice, field: solutionPath, anyOf: [modular-monolith] }
+          missing: "Declare a escolha no campo estruturado."
+          present: "Escolha declarada."
+        - id: problem
+          name: "Problema nomeado"
+          weight: 20
+          evidence:
+            - { type: choice, field: problemSolved, anyOf: [delivery-autonomy] }
+            - { type: keyword, field: justification, anyOf: ["lead time", "acoplamento", "travam", "autonomia", "merge"], min: 1 }
+          missing: "Nomeie o problema que a decisão resolve e mostre o número dele ({{deploysPerWeek}} deploys por semana, lead time de nove dias)."
+          present: "Problema nomeado com número."
+        - id: boundaries
+          name: "Fronteira mantida por verificação"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["archunit", "build quebra", "verifica", "módulo", "modulo", "esquema", "interface publicada"], min: 1 }
+          missing: "Monólito modular sem verificação automática vira monólito comum em seis meses: diga o que impede um módulo de importar o interno do outro."
+          present: "Fronteira sustentada por verificação."
+        - id: operations
+          name: "Custo operacional comparado"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["on-call", "operar", "plataforma", "alarme", "pipeline", "3 da manhã", "3 da manha"], min: 1 }
+          missing: "O argumento mais forte aqui é operacional: compare operar um artefato com operar {{services}} sem plataforma dedicada."
+          present: "Custo operacional comparado."
+        - id: evolution
+          name: "Caminho de evolução"
+          weight: 20
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["extrair", "depois", "quando", "gatilho", "critério", "criterio"], min: 1 }
+          missing: "Defina o gatilho que justificaria extrair um módulo para serviço mais tarde: monólito modular é um degrau, não um destino obrigatório."
+          present: "Evolução prevista com gatilho."
+  - id: microservices
+    name: "Microserviços"
+    summary: "{{services}} serviços independentes, cada um com repositório, pipeline, banco e squad responsável, comunicando por evento e por contrato versionado."
+    pros: ["Autonomia real de deploy e de escala", "Falha de um serviço não derruba os outros, se bem isolado", "Times podem escolher tecnologia por contexto"]
+    cons: ["Operação multiplicada sem plataforma dedicada", "Separar o dado é a parte cara e é pré-requisito", "Transação distribuída substitui transação local", "Depurar incidente que atravessa serviços exige rastreamento maduro"]
+    bestWhen: "as fronteiras já estão comprovadas, existe plataforma e on-call estruturado, e a autonomia de deploy é o gargalo medido"
+    rubric:
+      criteria:
+        - id: choice
+          name: "Escolha declarada"
+          weight: 10
+          evidence:
+            - { type: choice, field: solutionPath, anyOf: [microservices] }
+          missing: "Declare a escolha no campo estruturado."
+          present: "Escolha declarada."
+        - id: data-split
+          name: "Separação do dado enfrentada"
+          weight: 30
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["separar o banco", "banco por serviço", "banco por servico", "esquema", "parcel_events", "dado"], min: 1 }
+          missing: "Sem separar o dado, o resultado é monólito distribuído: descreva como `parcel_events` e `parcels` deixam de ser compartilhados."
+          present: "Separação de dados enfrentada."
+        - id: operations
+          name: "Operação dimensionada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["plataforma", "on-call", "observabilidade", "rastreamento", "investir", "time de"], min: 1 }
+          missing: "Defender microserviços com {{teamSize}} pessoas e sem plataforma exige dizer quem constrói e opera a plataforma, e a que custo."
+          present: "Custo operacional assumido."
+        - id: contracts
+          name: "Contratos e consistência"
+          weight: 20
+          evidence:
+            - { type: keyword, field: justification, anyOf: ["contrato", "versão", "versao", "saga", "eventual", "compensa", "idempot"], min: 1 }
+          missing: "Transação local vira coordenação distribuída: descreva contrato versionado e como a consistência é garantida entre serviços."
+          present: "Contratos e consistência tratados."
+        - id: problem
+          name: "Problema nomeado"
+          weight: 15
+          evidence:
+            - { type: choice, field: problemSolved, anyOf: [delivery-autonomy, independent-scaling] }
+          missing: "Nomeie o problema que justifica o custo: autonomia de entrega ou escala independente, com o número que mostra o gargalo."
+          present: "Problema nomeado."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Sua escolha"
+      type: SELECT
+      required: true
+      options:
+        - { value: modular-monolith, label: "Monólito modular" }
+        - { value: microservices, label: "Microserviços" }
+    - id: problemSolved
+      label: "Problema que a decisão resolve"
+      type: SELECT
+      required: true
+      options:
+        - { value: delivery-autonomy, label: "Autonomia de entrega entre squads" }
+        - { value: independent-scaling, label: "Escala independente de um componente" }
+        - { value: modernization, label: "Modernização da arquitetura" }
+        - { value: cost, label: "Custo de infraestrutura" }
+    - id: justification
+      label: "Justificativa"
+      type: MARKDOWN
+      required: true
+      help: "Defenda com os números do cenário, reconheça o custo e diga o que aconteceria se o contexto fosse outro."
+reference: |
+  ## Escolha: monólito modular
+
+  ### O problema, nomeado
+  O pedido chegou como "queremos microserviços", mas o problema medido é outro: {{context}}, com lead time de nove
+  dias e squads travando umas nas outras. Isso é **acoplamento de entrega**, e tem duas soluções possíveis. A pergunta
+  certa não é qual arquitetura é melhor, é qual delas resolve esse problema pelo menor custo.
+
+  ### Por que modular, e não distribuído
+  Três fatores do contexto decidem:
+
+  1. **Não há plataforma interna.** Com {{teamSize}} pessoas e {{services}} squads, {{services}} serviços significam
+     {{services}} pipelines, {{services}} conjuntos de alarme, rastreamento distribuído e versionamento de contrato —
+     operados pelas mesmas pessoas que entregam funcionalidade, em uma operação que roda 24 horas. Esse custo aparece
+     todo mês, e aparece primeiro no on-call.
+  2. **As fronteiras ainda não estão comprovadas.** `parcel-api`, `hub-scanner` e `sla-engine` compartilham
+     `parcel_events`. Se a fronteira estiver no lugar errado, corrigir dentro de um artefato é uma refatoração;
+     entre serviços, é migração de dados com dois deploys coordenados.
+  3. **O dado é o trabalho difícil.** Separar 8,9 bilhões de linhas de `parcel_events` por domínio é um projeto por si
+     só, e é **pré-requisito** de microserviços de verdade. Sem ele, o resultado é monólito distribuído: mesmo
+     acoplamento, agora com latência de rede e falha parcial.
+
+  ### O que eu proponho, concretamente
+  - Módulos por domínio (`parcels`, `scanning`, `sla`), cada um com seu esquema no `parcel-db` e uma interface
+    publicada. Acesso ao interno de outro módulo **quebra o build**, verificado por teste de arquitetura.
+  - Um pipeline por módulo, com teste isolado: quem mexe em `sla` não espera a suíte de `scanning`.
+  - Eventos internos já no formato que um dia seria de fila, para que a extração futura seja mecânica.
+
+  Isso ataca o lead time sem pagar o custo operacional, e derruba a maior parte do "esperando merge".
+
+  ### O que eu perco, assumido
+  - **Deploy continua compartilhado.** Mitigado por feature flags e pipelines por módulo, mas não eliminado.
+  - **Escala como um bloco.** Se o rastreio precisar escalar sozinho de verdade, esse é o primeiro candidato a sair.
+  - **A disciplina apodrece sem verificação.** Por isso o teste de arquitetura é obrigatório, não opcional.
+
+  ### O gatilho para mudar de ideia
+  Extraio um serviço quando **os três** forem verdade ao mesmo tempo: a fronteira ficou estável por dois trimestres
+  sem mudança de contrato; o módulo tem perfil de carga claramente diferente dos demais; e existe alguém dedicado a
+  operá-lo. O primeiro candidato é o `tracking`, que já tem perfil próprio de escrita e pico distinto.
+
+  ### Quando a resposta seria a outra
+  Com plataforma pronta, on-call por squad já estruturado e fronteiras estáveis, microserviços seriam a escolha:
+  ali o custo operacional já está pago e a autonomia de deploy vem sem contrapartida nova. Não é o caso hoje.
+scenario:
+  kind: none
+recommendation:
+  default: modular-monolith
+  rules:
+    - { param: teamSize, op: ">=", value: 38, path: microservices, reason: "com {{teamSize}} pessoas o custo de coordenação dentro de um artefato passa a superar o custo operacional de serviços separados, e há gente suficiente para sustentar uma plataforma mínima" }

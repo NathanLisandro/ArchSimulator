@@ -1,0 +1,339 @@
+id: health-migration-audit-partitioning
+type: MIGRATION
+company: saude
+levels: [SENIOR, STAFF]
+competencies: [legacy, databases, security, capacity, communication]
+tools: [SQL, METRICS]
+parameters:
+  tableRowsBillions: { range: [3, 9] }
+  auditQuerySeconds: { range: [90, 900], step: 30 }
+  storageTb: { range: [4, 9] }
+  requestsPerMonth: { range: [18, 140], step: 2 }
+  trigger:
+    group:
+      - { trigger: "o titular de um pedido de acesso da LGPD aguarda há 11 dias a lista de quem consultou o prontuário dele; o prazo legal é 15 dias", triggerNote: "são {{requestsPerMonth}} pedidos por mês e crescendo" }
+      - { trigger: "a auditoria anual pediu a trilha de 18 meses de um conjunto de 200 pacientes, e a consulta não terminou em uma madrugada inteira", triggerNote: "o parecer da auditoria depende disso" }
+      - { trigger: "o backup do audit-db passou de 9 horas e não cabe mais na janela noturna", triggerNote: "duas noites no último mês terminaram sem backup completo" }
+derived:
+  auditQueryMinutes: "round(auditQuerySeconds / 60)"
+  monthsHot: "24"
+narrative:
+  title: "Trilha de auditoria: {{tableRowsBillions}} bilhões de linhas e 20 anos pela frente"
+  symptom: |
+    A tabela `access_log` tem **{{tableRowsBillions}} bilhões de linhas**, {{storageTb}} TB, retenção obrigatória de
+    **20 anos** e nenhum particionamento. Uma consulta de auditoria por paciente e período leva
+    **{{auditQueryMinutes}} minutos**.
+
+    O gatilho: {{trigger}} — {{triggerNote}}.
+
+    Desenhe a estratégia de migração: para onde vai o histórico, como as consultas passam a funcionar, como migrar sem
+    parar a gravação que acontece a cada leitura de prontuário, e como provar que nada se perdeu.
+  businessContext: |
+    Toda leitura de dado clínico gera uma linha aqui: é requisito da LGPD e do CFM. A tabela cresce de forma contínua
+    e nunca diminui, por definição. Os acessos consultados na prática se concentram nos últimos meses (investigação
+    de incidente, pedido de titular, apuração interna), mas o dado antigo **não pode ser descartado** antes dos 20
+    anos e precisa ser recuperável quando pedido.
+  hints:
+    - "Nem todo dado tem o mesmo padrão de acesso: o que é consultado de fato?"
+    - "Perder uma linha aqui é incidente regulatório; a migração precisa provar que não perdeu."
+    - "A gravação não pode parar durante a migração."
+artifacts:
+  - id: audit-schema
+    title: "Esquema atual e consulta de auditoria"
+    kind: SQL
+    language: sql
+    content: |
+      -- tabela unica, sem particionamento, append-only por contrato
+      CREATE TABLE access_log (
+          id           bigserial PRIMARY KEY,
+          actor_id     bigint      NOT NULL,
+          patient_id   bigint      NOT NULL,
+          resource     varchar(32) NOT NULL,
+          purpose      varchar(24) NOT NULL,
+          occurred_at  timestamp   NOT NULL
+      );
+      CREATE INDEX idx_access_patient_occurred ON access_log (patient_id, occurred_at);
+      CREATE INDEX idx_access_actor_occurred   ON access_log (actor_id, occurred_at);
+
+      -- consulta do pedido de titular (LGPD): quem acessou o prontuario deste paciente
+      SELECT a.occurred_at, a.resource, a.purpose, p.council_number, p.specialty
+        FROM access_log a
+        JOIN professionals p ON p.id = a.actor_id
+       WHERE a.patient_id = $1
+         AND a.occurred_at >= $2
+       ORDER BY a.occurred_at DESC;
+
+      -- apuracao interna: o que este profissional acessou no periodo
+      SELECT a.patient_id, count(*), min(a.occurred_at), max(a.occurred_at)
+        FROM access_log a
+       WHERE a.actor_id = $1
+         AND a.occurred_at BETWEEN $2 AND $3
+       GROUP BY a.patient_id;
+checkpoints:
+  - id: access-pattern
+    question: "Primeira pergunta: o que é consultado de fato nessa tabela?"
+    options:
+      - id: recent-and-targeted
+        label: "Consultas recentes e dirigidas: um paciente ou um profissional, num período, quase sempre dos últimos meses"
+        verdict: GOOD
+        feedback: "Certo, e isso desenha a solução: uma janela quente pequena que responde rápido e um histórico frio que precisa ser recuperável, não instantâneo. Guardar {{storageTb}} TB em armazenamento caro para servir consultas raras é desperdício."
+      - id: everything
+        label: "Tudo é consultado igualmente: são 20 anos de retenção"
+        verdict: BAD
+        feedback: "Retenção e padrão de acesso são coisas diferentes. Guardar 20 anos é obrigação; responder em milissegundos sobre 20 anos não é. Confundir as duas leva a dimensionar armazenamento caro para dado que ninguém lê."
+      - id: unknown
+        label: "Não dá para saber sem análise longa"
+        verdict: RISKY
+        feedback: "Dá, e rápido: `pg_stat_statements` mostra as consultas reais e os parâmetros típicos. Uma amostra de uma semana já responde se a janela consultada é de meses ou de anos."
+  - id: partition-key
+    question: "Particionando, por qual coluna?"
+    options:
+      - id: by-time
+        label: "Por `occurred_at`, em partições mensais: é a coluna que aparece em toda consulta e a que define o que é frio"
+        verdict: GOOD
+        feedback: "Sim. Tempo é a dimensão que separa quente de frio e a que permite descartar partições inteiras. `patient_id` pareceria natural, mas geraria milhões de partições e não ajudaria na consulta por profissional."
+      - id: by-patient
+        label: "Por `patient_id`, já que a consulta mais comum é por paciente"
+        verdict: BAD
+        feedback: "São 9,2 milhões de pacientes: particionar por hash daria partições que não ajudam a arquivar, e por lista seria inviável. E a consulta por profissional não teria nenhum benefício."
+      - id: by-resource
+        label: "Por `resource`, para separar tipos de acesso"
+        verdict: BAD
+        feedback: "São 24 valores, com distribuição desigual e sem relação com o que é consultado ou arquivado. Não ajuda em nenhuma das duas consultas reais."
+  - id: proof
+    question: "Como provar que a migração não perdeu nenhuma linha?"
+    options:
+      - id: count-and-checksum
+        label: "Contagem e soma de verificação por partição, comparadas antes e depois, com o original mantido até a conferência fechar"
+        verdict: GOOD
+        feedback: "Certo. Em trilha regulatória, 'parece que está tudo lá' não serve: precisa de número reproduzível por partição, arquivado junto com o relatório da migração."
+      - id: spot-check
+        label: "Conferir alguns registros por amostragem"
+        verdict: BAD
+        feedback: "Amostra não prova ausência de perda em {{tableRowsBillions}} bilhões de linhas, e é exatamente isso que a auditoria vai perguntar."
+      - id: trust-tool
+        label: "Confiar na ferramenta de migração"
+        verdict: RISKY
+        feedback: "A ferramenta provavelmente está certa. Mas quem responde à auditoria é a empresa, e a resposta precisa ser um número conferido, não a reputação de um utilitário."
+solutionPaths:
+  - id: partition-and-cold-tier
+    name: "Particionar por mês e mover o frio para camada fria consultável"
+    summary: "Converter em tabela particionada por `occurred_at`, manter {{monthsHot}} meses quentes no banco e exportar as partições antigas para S3 em Parquet, consultáveis sob demanda."
+    pros: ["Consultas recentes passam a usar pruning e respondem em segundos", "Backup e vacuum voltam a caber na janela", "Custo de armazenamento cai por ordem de grandeza no dado frio"]
+    cons: ["Consulta ao histórico antigo passa a ser assíncrona", "Dois lugares para consultar, com uma fachada por cima", "Migração de {{tableRowsBillions}} bilhões de linhas leva semanas"]
+    bestWhen: "o acesso é concentrado no recente e a retenção longa é obrigação legal — o caso aqui"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [PARTITION_AND_ARCHIVE] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: partition-key
+          name: "Chave e pruning"
+          weight: 20
+          evidence:
+            - { type: choice, field: partitionKey, anyOf: [occurred_at] }
+            - { type: keyword, field: plan, anyOf: ["pruning", "mensal", "por mês", "por mes", "range"], min: 1 }
+          missing: "Diga a chave de particionamento e como as consultas passam a descartar partições."
+          present: "Chave e pruning definidos."
+        - id: no-downtime
+          name: "Migração sem parar a gravação"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["attach", "dupla escrita", "gradual", "sem parar", "nova tabela", "janela curta"], min: 1 }
+          missing: "A gravação acontece a cada leitura de prontuário e não pode parar: descreva como a tabela é convertida com o sistema no ar."
+          present: "Migração sem indisponibilidade descrita."
+        - id: proof
+          name: "Prova de integridade"
+          weight: 25
+          evidence:
+            - { type: choice, field: integrityProof, anyOf: [count-and-checksum] }
+            - { type: keyword, field: plan, anyOf: ["contagem", "checksum", "conferência", "conferencia", "relatório", "relatorio"], min: 1 }
+          missing: "Descreva a prova por partição e por quanto tempo o original é mantido antes de ser descartado."
+          present: "Prova de integridade descrita."
+        - id: cold-access
+          name: "Acesso ao frio e prazo legal"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["15 dias", "prazo", "sob demanda", "assíncron", "assincron", "restaur"], min: 1 }
+          missing: "O pedido de titular tem prazo legal de 15 dias: mostre que a consulta ao frio cabe nele, e como o solicitante é avisado."
+          present: "Acesso ao frio compatível com o prazo."
+  - id: partition-only
+    name: "Particionar e manter tudo no banco"
+    summary: "Converter em tabela particionada por mês, sem camada fria, mantendo os 20 anos no mesmo armazenamento."
+    pros: ["Uma única forma de consultar", "Resolve pruning, vacuum e backup por partição", "Menos peças móveis"]
+    cons: ["O custo de armazenamento continua crescendo para sempre", "O banco continua carregando dado que ninguém lê", "Não resolve a conta de longo prazo"]
+    bestWhen: "o volume ainda é administrável e a simplicidade operacional vale mais que o custo de armazenamento"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [PARTITION_ONLY] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: cost
+          name: "Custo de longo prazo enfrentado"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["custo", "20 anos", "cresce", "armazenamento", "projeção", "projecao"], min: 1 }
+          missing: "Com 20 anos de retenção e crescimento contínuo, projete o armazenamento e diga por quanto tempo essa escolha se sustenta."
+          present: "Custo de longo prazo projetado."
+        - id: no-downtime
+          name: "Migração sem parar a gravação"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["attach", "dupla escrita", "gradual", "sem parar"], min: 1 }
+          missing: "Descreva a conversão com o sistema no ar."
+          present: "Migração sem indisponibilidade."
+        - id: proof
+          name: "Prova de integridade"
+          weight: 30
+          evidence:
+            - { type: choice, field: integrityProof, anyOf: [count-and-checksum] }
+          missing: "Descreva a prova de que nenhuma linha se perdeu."
+          present: "Prova descrita."
+  - id: separate-store
+    name: "Mover a trilha para um armazenamento próprio de série temporal"
+    summary: "Tirar `access_log` do banco relacional e levar para um armazenamento dedicado a dado append-only de alto volume, mantendo uma fachada de consulta."
+    pros: ["Modelo de dados adequado ao padrão append-only", "Escrita mais barata em alto volume", "Libera o `audit-db` inteiro"]
+    cons: ["Tecnologia nova para operar em um fluxo regulatório", "Junção com `professionals` deixa de ser SQL", "Migração e prova de integridade mais complexas"]
+    bestWhen: "o volume de escrita já é o gargalo e existe apetite e gente para operar mais uma tecnologia"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [SEPARATE_STORE] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: regulatory-risk
+          name: "Risco regulatório da tecnologia nova"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["regulat", "auditoria", "durabilidade", "imutáv", "imutav", "confiança", "confianca"], min: 1 }
+          missing: "Trilha de auditoria é evidência legal: justifique a durabilidade e a imutabilidade do armazenamento novo, e quem responde se ele falhar."
+          present: "Risco regulatório enfrentado."
+        - id: query
+          name: "Consulta sem SQL"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["fachada", "api", "junção", "juncao", "enriquec", "consulta"], min: 1 }
+          missing: "A consulta de auditoria junta com `professionals`: diga como isso funciona quando a trilha sai do banco relacional."
+          present: "Consulta desenhada."
+        - id: proof
+          name: "Prova de integridade"
+          weight: 30
+          evidence:
+            - { type: choice, field: integrityProof, anyOf: [count-and-checksum] }
+          missing: "Descreva a prova de migração completa entre tecnologias diferentes."
+          present: "Prova descrita."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: strategy
+      label: "Estratégia"
+      type: SELECT
+      required: true
+      options:
+        - { value: PARTITION_AND_ARCHIVE, label: "Particionar e arquivar o frio" }
+        - { value: PARTITION_ONLY, label: "Particionar e manter tudo no banco" }
+        - { value: SEPARATE_STORE, label: "Mover para armazenamento dedicado" }
+        - { value: DELETE_OLD, label: "Apagar o histórico antigo" }
+    - id: partitionKey
+      label: "Chave de particionamento"
+      type: SELECT
+      required: true
+      options:
+        - { value: occurred_at, label: "occurred_at, em partições mensais" }
+        - { value: patient_id, label: "patient_id" }
+        - { value: actor_id, label: "actor_id" }
+        - { value: resource, label: "resource" }
+    - id: integrityProof
+      label: "Como provar que nada se perdeu"
+      type: SELECT
+      required: true
+      options:
+        - { value: count-and-checksum, label: "Contagem e soma de verificação por partição, com o original mantido" }
+        - { value: spot-check, label: "Amostragem de registros" }
+        - { value: tool-trust, label: "Confiança na ferramenta de migração" }
+    - id: solutionPath
+      label: "Destino"
+      type: SELECT
+      required: true
+      options:
+        - { value: partition-and-cold-tier, label: "Particionar com camada fria" }
+        - { value: partition-only, label: "Particionar sem camada fria" }
+        - { value: separate-store, label: "Armazenamento dedicado" }
+    - id: plan
+      label: "Plano de migração"
+      type: MARKDOWN
+      required: true
+      help: "Padrão de acesso, chave, migração sem parada, prova de integridade, acesso ao frio e prazos legais."
+reference: |
+  ## Padrão de acesso
+  `pg_stat_statements` mostra duas consultas dominando: pedido de titular (por `patient_id` e período) e apuração
+  interna (por `actor_id` e período). Em ambas, a janela consultada raramente passa de 18 meses. O restante dos 20
+  anos existe por obrigação legal e é consultado poucas vezes por ano.
+
+  Isso separa dois requisitos que estavam confundidos: **reter 20 anos** e **responder rápido**. O segundo só vale
+  para a janela recente.
+
+  ## Estratégia
+  **Quente:** tabela particionada por `occurred_at`, em partições mensais, com os últimos {{monthsHot}} meses no
+  `audit-db`. As duas consultas passam a descartar partições e respondem em segundos em vez de
+  {{auditQueryMinutes}} minutos.
+
+  **Frio:** partições com mais de {{monthsHot}} meses são exportadas para S3 em Parquet, particionadas por ano e mês,
+  com criptografia e bloqueio de objeto para garantir imutabilidade. Consultáveis sob demanda por um job que restaura
+  o recorte necessário.
+
+  **Fachada:** a API de auditoria decide sozinha se a consulta é quente (responde na hora) ou fria (abre uma
+  solicitação, processa e avisa quando estiver pronta). Quem pede não precisa saber onde o dado está.
+
+  ## Migração sem parar a gravação
+  A escrita acontece a cada leitura de prontuário e não pode parar.
+
+  1. **Tabela nova particionada** criada vazia, ao lado da atual.
+  2. **Dupla escrita** por algumas semanas: o `audit-service` grava nas duas. A leitura continua na antiga.
+  3. **Cópia do histórico** por mês, do mais recente para o mais antigo, em ritmo baixo e fora do pico. Cada mês
+     copiado tem contagem e soma de verificação registradas.
+  4. **Virada da leitura** por feature flag, com a antiga ainda recebendo escrita e servindo de rollback.
+  5. **Desligamento da escrita antiga** 30 dias depois da virada, e da tabela antiga só depois do relatório final de
+     conferência aprovado pelo DPO.
+
+  ## Prova de integridade
+  Por partição: contagem de linhas e soma de verificação sobre `(id, actor_id, patient_id, occurred_at)`,
+  calculadas na origem e no destino, gravadas em um relatório versionado. Nenhuma partição é considerada migrada com
+  divergência de uma linha. O relatório fica arquivado com a documentação de conformidade: é ele que responde à
+  auditoria, não a confiança na ferramenta.
+
+  ## Prazos legais
+  Pedido de titular tem 15 dias. A consulta quente responde no mesmo dia; a fria, que precisa restaurar o recorte,
+  tem alvo de 48 horas e alarme se passar de 5 dias. O solicitante recebe confirmação de recebimento imediata, e não
+  a espera de hoje, de 11 dias sem retorno.
+
+  ## Efeitos colaterais bons
+  Backup por partição volta a caber na janela; `VACUUM` passa a rodar por partição em vez de sobre
+  {{tableRowsBillions}} bilhões de linhas; e o custo de armazenamento do histórico cai por ordem de grandeza ao sair
+  do disco do banco.
+scenario:
+  kind: capacity
+  params:
+    service: audit-service
+    datastore: audit-db
+    growthPercentPerMonth: "7"
+    currentPeakRps: "1400"
+    headroomMetric: storage_used
+    headroomLimit: "12000"
+    headroomNow: "8600"
+    storageNowGb: "8600"
+recommendation:
+  default: partition-and-cold-tier
+  rules:
+    - { param: storageTb, op: "<=", value: 5, path: partition-only, reason: "com {{storageTb}} TB o custo de armazenamento ainda é pequeno perto da complexidade de manter duas camadas; particionar já resolve consulta, backup e vacuum, e a camada fria pode esperar" }

@@ -14,7 +14,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/attempts")
 public class AttemptController {
-    public record StartRequest(String companyId, String caseType, String level) {}
+    public record StartRequest(String companyId, String caseType, String level, String templateId) {}
     public record CheckpointRequest(String optionId, Boolean proceedAnyway) {}
     public record SqlRequest(String sql) {}
     public record LogSearchRequest(String query, Instant from, Instant to) {}
@@ -44,9 +44,10 @@ public class AttemptController {
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public AttemptView start(@RequestBody(required = false) StartRequest req) {
-        StartRequest r = req == null ? new StartRequest(null, null, null) : req;
+        StartRequest r = req == null ? new StartRequest(null, null, null, null) : req;
         Level level = r.level() == null ? null : Level.valueOf(r.level().toUpperCase());
-        return startCase.execute(new StartCase.Command(CurrentUser.id(), blankToNull(r.companyId()), blankToNull(r.caseType()), level));
+        return startCase.execute(new StartCase.Command(CurrentUser.id(), blankToNull(r.companyId()), blankToNull(r.caseType()),
+                level, blankToNull(r.templateId())));
     }
 
     @GetMapping("/{id}")

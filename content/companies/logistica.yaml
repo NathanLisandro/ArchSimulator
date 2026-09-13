@@ -1,0 +1,259 @@
+id: logistica
+name: Rotamax Logística
+domain: logistics
+description: >
+  Operadora logística que faz o last mile de marketplaces e varejo no Brasil. Opera 34 hubs, 11 mil motoristas
+  parceiros e uma frota própria pequena. O coração do sistema é a roteirização diária, que monta as rotas da manhã
+  a partir do que chegou nos hubs durante a madrugada, e o rastreio, que recebe eventos de bipagem dos motoristas
+  pelo app mesmo em área sem sinal. O contrato com os embarcadores tem multa por SLA de entrega descumprido.
+scale:
+  dailyActiveUsers: 640000
+  peakTps: 4200
+  dataVolume: "18 TB no transacional, 96 TB de eventos de rastreio no data lake"
+  growthNote: "Pico entre 18h e 21h, quando os motoristas sincronizam o dia; Black Friday multiplica os volumes por 5 durante duas semanas"
+stack:
+  languages: [Java 21, Go (serviços de borda), Python (otimização)]
+  frameworks: [Spring Boot 3, Gin, OR-Tools]
+  datastores: [PostgreSQL 15 + PostGIS (RDS), Redis (ElastiCache), DynamoDB (posições), S3]
+  messaging: [Kafka (MSK), SQS FIFO]
+  cloud: AWS
+  notes: "App do motorista funciona offline e sincroniza em lote; observabilidade em Grafana Cloud"
+team:
+  developers: 68
+  squads: 9
+  notes: "Squads por etapa da jornada (coleta, roteirização, rastreio, entrega, financeiro do parceiro)"
+regulations:
+  - name: LGPD
+    description: "Endereço do destinatário e posição do motorista são dados pessoais; retenção de posição limitada a 90 dias"
+  - name: "Contrato de SLA com embarcadores"
+    description: "Multa por entrega fora do prazo acordado; a apuração é mensal e auditável, com base no evento de entrega"
+  - name: "Legislação trabalhista de entregadores parceiros"
+    description: "Rastreio de posição não pode ser usado como controle de jornada; a coleta é por evento de rota, não contínua"
+architecture:
+  services:
+    - name: routing-service
+      description: "Monta as rotas do dia a partir dos pacotes no hub; roda otimização com OR-Tools"
+      language: Python
+      dependsOn: [routing-db, geo-service, kafka]
+      datastore: routing-db
+      instances: 6
+    - name: tracking-api
+      description: "Recebe eventos de bipagem e posição do app do motorista, inclusive em lote após reconexão"
+      language: Go
+      dependsOn: [tracking-db, kafka, dynamodb]
+      datastore: tracking-db
+      instances: 24
+    - name: parcel-api
+      description: "Ciclo de vida do pacote: coletado, no hub, em rota, entregue, insucesso"
+      language: Java
+      dependsOn: [parcel-db, kafka]
+      datastore: parcel-db
+      instances: 14
+    - name: geo-service
+      description: "Geocodificação de endereço e cálculo de distância; cache pesado"
+      language: Go
+      dependsOn: [redis-cache, geo-db]
+      datastore: geo-db
+      instances: 10
+    - name: sla-engine
+      description: "Calcula prazo prometido e apura descumprimento para o faturamento"
+      language: Java
+      dependsOn: [parcel-db, kafka]
+      datastore: parcel-db
+      instances: 4
+    - name: driver-app-gateway
+      description: "Borda do app do motorista; autentica, comprime e enfileira a sincronização em lote"
+      language: Go
+      dependsOn: [tracking-api, redis-cache]
+      datastore: null
+      instances: 18
+    - name: hub-scanner
+      description: "Integra os leitores dos hubs; emite evento por bipagem"
+      language: Java
+      dependsOn: [kafka, parcel-api]
+      datastore: parcel-db
+      instances: 8
+    - name: notification-service
+      description: "Avisa o destinatário por push, SMS e WhatsApp"
+      language: Java
+      dependsOn: [kafka, sqs]
+      datastore: notif-db
+      instances: 6
+  datastores:
+    - name: parcel-db
+      engine: postgres
+      description: "Pacotes, eventos de status e apuração de SLA. RDS PostgreSQL 15 Multi-AZ"
+      sizing: "db.r6g.4xlarge (16 vCPU, 128 GB), gp3 16k IOPS, 11 TB"
+    - name: tracking-db
+      engine: postgres
+      description: "Eventos brutos de bipagem e posição, particionado por dia"
+      sizing: "db.r6g.2xlarge, 5 TB"
+    - name: routing-db
+      engine: postgres
+      description: "Rotas do dia, paradas e sequência; usa PostGIS"
+      sizing: "db.r6g.2xlarge"
+    - name: geo-db
+      engine: postgres
+      description: "Base de endereços geocodificados"
+      sizing: "db.r6g.xlarge"
+    - name: notif-db
+      engine: postgres
+      description: "Histórico de avisos ao destinatário"
+      sizing: "db.t4g.medium"
+  brokers:
+    - name: kafka
+      type: kafka
+      topics: [parcel.events, tracking.raw, tracking.enriched, routing.assigned, sla.breach, notifications.outbound]
+    - name: sqs
+      type: sqs
+      topics: [sms-outbound, whatsapp-outbound, notifications-dlq]
+  caches:
+    - name: redis-cache
+      type: redis
+      usage: "Geocodificação (TTL 30 dias), sessão do motorista, deduplicação de bipagem, rate limit do gateway"
+infra:
+  resources:
+    - { id: alb-public, type: aws.alb, name: "ALB público", properties: { listeners: "443", targetGroups: "driver-app-gateway,tracking-api,parcel-api" } }
+    - { id: eks-main, type: aws.eks, name: "EKS prod", properties: { nodes: "36", instanceType: "c6i.2xlarge", version: "1.30" } }
+    - { id: rds-parcel, type: aws.rds.postgres, name: "RDS parcel-db", properties: { instanceClass: "db.r6g.4xlarge", multiAz: "true", storage: "11TB gp3", iops: "16000", maxConnections: "3000", readReplicas: "1" } }
+    - { id: rds-tracking, type: aws.rds.postgres, name: "RDS tracking-db", properties: { instanceClass: "db.r6g.2xlarge", storage: "5TB gp3", partitioning: "por dia" } }
+    - { id: rds-routing, type: aws.rds.postgres, name: "RDS routing-db", properties: { instanceClass: "db.r6g.2xlarge", extensions: "postgis" } }
+    - { id: redis-main, type: aws.elasticache.redis, name: "ElastiCache", properties: { nodeType: "cache.r6g.xlarge", shards: "2", replicas: "1", maxmemoryPolicy: "allkeys-lru" } }
+    - { id: msk-main, type: aws.msk, name: "MSK", properties: { brokers: "6", instanceType: "kafka.m5.xlarge", partitionsDefault: "48" } }
+    - { id: ddb-positions, type: aws.dynamodb, name: "DynamoDB posições", properties: { billing: "on-demand", ttl: "90 dias" } }
+    - { id: sqs-notif, type: aws.sqs, name: "SQS notificações", properties: { queues: "sms-outbound,whatsapp-outbound", dlq: "notifications-dlq" } }
+    - { id: s3-lake, type: aws.s3, name: "S3 data lake", properties: { buckets: "tracking-raw,manifests,evidencias-entrega" } }
+    - { id: nat-gw, type: aws.nat, name: "NAT gateway", properties: { azs: "3" } }
+    - { id: maps-provider, type: external, name: "Provedor de mapas", properties: { protocol: "HTTPS", slaMs: "800", quota: "4M chamadas/mês" } }
+  edges:
+    - { from: alb-public, to: eks-main, label: "HTTPS" }
+    - { from: eks-main, to: rds-parcel, label: "JDBC (pool 20/pod)" }
+    - { from: eks-main, to: rds-tracking, label: "JDBC" }
+    - { from: eks-main, to: rds-routing, label: "JDBC" }
+    - { from: eks-main, to: redis-main, label: "Redis" }
+    - { from: eks-main, to: msk-main, label: "Kafka" }
+    - { from: eks-main, to: ddb-positions, label: "DynamoDB" }
+    - { from: eks-main, to: sqs-notif, label: "SQS" }
+    - { from: eks-main, to: nat-gw, label: "egress" }
+    - { from: nat-gw, to: maps-provider, label: "geocodificação" }
+    - { from: eks-main, to: s3-lake, label: "eventos brutos" }
+schema:
+  dialect: POSTGRES
+  tables:
+    - name: parcels
+      rowCount: 1400000000
+      sizeMb: 520000
+      columns:
+        - { name: id, type: bigint, distinct: 1400000000 }
+        - { name: tracking_code, type: varchar(20), distinct: 1400000000 }
+        - { name: shipper_id, type: bigint, distinct: 2400 }
+        - { name: recipient_document, type: varchar(14), distinct: 74000000 }
+        - { name: destination_zip, type: varchar(8), distinct: 890000 }
+        - { name: hub_id, type: integer, distinct: 34 }
+        - { name: status, type: varchar(24), distinct: 11 }
+        - { name: promised_at, type: timestamp, distinct: 900000000 }
+        - { name: delivered_at, type: timestamp, distinct: 800000000, nullable: true }
+        - { name: created_at, type: timestamp, distinct: 1300000000 }
+      indexes:
+        - { name: parcels_pkey, columns: [id], unique: true, sizeMb: 30000 }
+        - { name: uq_parcels_tracking, columns: [tracking_code], unique: true, sizeMb: 61000 }
+        - { name: idx_parcels_shipper_created, columns: [shipper_id, created_at], sizeMb: 42000 }
+        - { name: idx_parcels_status, columns: [status], sizeMb: 14000 }
+        - { name: idx_parcels_hub_status, columns: [hub_id, status], sizeMb: 19000 }
+    - name: parcel_events
+      rowCount: 8900000000
+      sizeMb: 1900000
+      columns:
+        - { name: id, type: bigint, distinct: 8900000000 }
+        - { name: parcel_id, type: bigint, distinct: 1400000000 }
+        - { name: event_type, type: varchar(24), distinct: 18 }
+        - { name: hub_id, type: integer, distinct: 34, nullable: true }
+        - { name: driver_id, type: bigint, distinct: 11000, nullable: true }
+        - { name: occurred_at, type: timestamp, distinct: 8000000000 }
+        - { name: received_at, type: timestamp, distinct: 8000000000 }
+        - { name: idempotency_key, type: varchar(64), distinct: 8900000000 }
+      indexes:
+        - { name: parcel_events_pkey, columns: [id], unique: true, sizeMb: 190000 }
+        - { name: idx_events_parcel_occurred, columns: [parcel_id, occurred_at], sizeMb: 240000 }
+        - { name: uq_events_idempotency, columns: [idempotency_key], unique: true, sizeMb: 310000 }
+    - name: routes
+      rowCount: 74000000
+      sizeMb: 41000
+      columns:
+        - { name: id, type: bigint, distinct: 74000000 }
+        - { name: route_date, type: date, distinct: 1800 }
+        - { name: hub_id, type: integer, distinct: 34 }
+        - { name: driver_id, type: bigint, distinct: 11000 }
+        - { name: stops, type: integer, distinct: 180 }
+        - { name: status, type: varchar(16), distinct: 6 }
+        - { name: optimized_at, type: timestamp, distinct: 70000000 }
+      indexes:
+        - { name: routes_pkey, columns: [id], unique: true, sizeMb: 1600 }
+        - { name: idx_routes_date_hub, columns: [route_date, hub_id], sizeMb: 2400 }
+        - { name: idx_routes_driver_date, columns: [driver_id, route_date], sizeMb: 2900 }
+    - name: route_stops
+      rowCount: 2100000000
+      sizeMb: 380000
+      columns:
+        - { name: id, type: bigint, distinct: 2100000000 }
+        - { name: route_id, type: bigint, distinct: 74000000 }
+        - { name: parcel_id, type: bigint, distinct: 1400000000 }
+        - { name: sequence, type: integer, distinct: 180 }
+        - { name: eta, type: timestamp, distinct: 1900000000 }
+        - { name: outcome, type: varchar(16), distinct: 7, nullable: true }
+      indexes:
+        - { name: route_stops_pkey, columns: [id], unique: true, sizeMb: 45000 }
+        - { name: idx_stops_route_sequence, columns: [route_id, sequence], sizeMb: 61000 }
+        - { name: idx_stops_parcel, columns: [parcel_id], sizeMb: 58000 }
+    - name: drivers
+      rowCount: 11000
+      sizeMb: 24
+      columns:
+        - { name: id, type: bigint, distinct: 11000 }
+        - { name: document, type: varchar(14), distinct: 11000 }
+        - { name: hub_id, type: integer, distinct: 34 }
+        - { name: vehicle_type, type: varchar(16), distinct: 5 }
+        - { name: active, type: boolean, distinct: 2 }
+      indexes:
+        - { name: drivers_pkey, columns: [id], unique: true, sizeMb: 2 }
+        - { name: uq_drivers_document, columns: [document], unique: true, sizeMb: 3 }
+    - name: addresses
+      rowCount: 128000000
+      sizeMb: 62000
+      columns:
+        - { name: id, type: bigint, distinct: 128000000 }
+        - { name: zip, type: varchar(8), distinct: 890000 }
+        - { name: street, type: varchar(160), distinct: 42000000 }
+        - { name: number, type: varchar(12), distinct: 90000 }
+        - { name: latitude, type: numeric(9,6), distinct: 120000000, nullable: true }
+        - { name: longitude, type: numeric(9,6), distinct: 120000000, nullable: true }
+        - { name: geocoded_at, type: timestamp, distinct: 90000000, nullable: true }
+      indexes:
+        - { name: addresses_pkey, columns: [id], unique: true, sizeMb: 2800 }
+        - { name: idx_addresses_zip, columns: [zip], sizeMb: 3600 }
+    - name: sla_breaches
+      rowCount: 96000000
+      sizeMb: 22000
+      columns:
+        - { name: id, type: bigint, distinct: 96000000 }
+        - { name: parcel_id, type: bigint, distinct: 96000000 }
+        - { name: shipper_id, type: bigint, distinct: 2400 }
+        - { name: promised_at, type: timestamp, distinct: 80000000 }
+        - { name: delivered_at, type: timestamp, distinct: 80000000, nullable: true }
+        - { name: hours_late, type: integer, distinct: 400 }
+        - { name: penalty_cents, type: bigint, distinct: 90000 }
+        - { name: billing_month, type: varchar(7), distinct: 60 }
+      indexes:
+        - { name: sla_breaches_pkey, columns: [id], unique: true, sizeMb: 2100 }
+        - { name: idx_breaches_shipper_month, columns: [shipper_id, billing_month], sizeMb: 3400 }
+techDebts:
+  - title: "Roteirização é um job monolítico de 3h que não pode falhar no meio"
+    description: "routing-service processa os 34 hubs em sequência num único processo; se cair no hub 20, recomeça do zero e a rota da manhã atrasa"
+  - title: "Eventos de rastreio chegam fora de ordem e sem janela definida"
+    description: "O app sincroniza em lote depois de horas offline; a ordenação por occurred_at existe, mas o consumidor aplica na ordem de chegada"
+  - title: "parcel_events tem 8,9 bilhões de linhas sem particionamento"
+    description: "A consulta de histórico de um pacote usa índice, mas manutenção e backup não cabem mais na janela"
+  - title: "Geocodificação sem invalidação e sem limite de quota"
+    description: "Cache de 30 dias no Redis; quando o cache esfria, o provedor de mapas recebe pico e a quota mensal estoura no dia 20"
+  - title: "Apuração de SLA lê a tabela de eventos inteira no fechamento do mês"
+    description: "sla-engine roda uma varredura mensal de parcel_events para reconstruir o prazo; o faturamento depende dela"

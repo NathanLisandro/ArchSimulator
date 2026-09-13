@@ -31,7 +31,7 @@ public class SearchLogs {
 
     public LogSearchView execute(Command cmd) {
         var loaded = AttemptAccess.load(attempts, cases, cmd.userId(), cmd.attemptId());
-        List<LogEntry> logs = datasets.datasetFor(loaded.theCase()).logs().stream()
+        List<LogEntry> logs = datasets.datasetFor(loaded.theCase(), loaded.attempt().resolvedAt().orElse(null)).logs().stream()
                 .filter(l -> cmd.from() == null || !l.timestamp().isBefore(cmd.from()))
                 .filter(l -> cmd.to() == null || !l.timestamp().isAfter(cmd.to()))
                 .toList();

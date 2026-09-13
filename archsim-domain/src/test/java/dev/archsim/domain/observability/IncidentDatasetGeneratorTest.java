@@ -132,6 +132,49 @@ class IncidentDatasetGeneratorTest {
     }
 
     @Test
+    void appliedMitigationBringsTheMetricsBackToBaseline() {
+        Case c = incident("N_PLUS_ONE", Map.of());
+        Instant recovered = ONSET.plus(Duration.ofMinutes(12));
+        ObservabilityDataset before = factory.generate(c, bank, new SeededRandom(77L));
+        ObservabilityDataset after = factory.generate(c, bank, new SeededRandom(77L), recovered);
+
+        MetricSeries stillBroken = before.series("account-api", "latency_p99").orElseThrow();
+        MetricSeries healed = after.series("account-api", "latency_p99").orElseThrow();
+
+        // até a mitigação, os dois datasets são idênticos: o passado não muda
+        assertThat(avgBetween(healed, ds -> true, ONSET.minus(Duration.ofHours(1)), ONSET))
+                .isCloseTo(avgBetween(stillBroken, ds -> true, ONSET.minus(Duration.ofHours(1)), ONSET), org.assertj.core.data.Offset.offset(1.0));
+
+        // no pico do incidente, os dois estão degradados
+        assertThat(avgBetween(healed, ds -> true, ONSET.plus(Duration.ofMinutes(9)), recovered)).isGreaterThan(3000);
+
+        // depois da mitigação, só o dataset com recuperação volta ao normal
+        double afterRecovery = avgBetween(healed, ds -> true, recovered.plus(Duration.ofMinutes(6)), NOW);
+        double withoutRecovery = avgBetween(stillBroken, ds -> true, recovered.plus(Duration.ofMinutes(6)), NOW);
+        assertThat(afterRecovery).isLessThan(600);
+        assertThat(withoutRecovery).isGreaterThan(3000);
+    }
+
+    @Test
+    void errorLogsStopAfterTheIncidentIsMitigated() {
+        Case c = incident("POOL_EXHAUSTION", Map.of());
+        Instant recovered = ONSET.plus(Duration.ofMinutes(10));
+        ObservabilityDataset after = factory.generate(c, bank, new SeededRandom(5L), recovered);
+
+        long errorsWhileBroken = after.logs().stream()
+                .filter(l -> l.level().equals("ERROR") && l.service().equals("account-api"))
+                .filter(l -> l.timestamp().isAfter(ONSET) && l.timestamp().isBefore(recovered))
+                .count();
+        long errorsAfterFix = after.logs().stream()
+                .filter(l -> l.level().equals("ERROR") && l.service().equals("account-api"))
+                .filter(l -> l.timestamp().isAfter(recovered.plus(Duration.ofMinutes(3))))
+                .count();
+
+        assertThat(errorsWhileBroken).isGreaterThan(20);
+        assertThat(errorsAfterFix).isLessThan(errorsWhileBroken / 4);
+    }
+
+    @Test
     void unknownRootCauseFailsLoudly() {
         assertThatThrownBy(() -> factory.generate(incident("NOT_A_CAUSE", Map.of()), bank, new SeededRandom(1L)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("NOT_A_CAUSE");
@@ -139,5 +182,9 @@ class IncidentDatasetGeneratorTest {
 
     private static double avgBetween(MetricSeries s, Instant from, Instant to) {
         return s.points().stream().filter(p -> !p.at().isBefore(from) && !p.at().isAfter(to)).mapToDouble(MetricPoint::value).average().orElseThrow();
+    }
+
+    private static double avgBetween(MetricSeries s, java.util.function.Predicate<MetricSeries> ignored, Instant from, Instant to) {
+        return avgBetween(s, from, to);
     }
 }

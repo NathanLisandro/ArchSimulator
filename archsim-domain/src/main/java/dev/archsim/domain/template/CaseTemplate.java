@@ -17,7 +17,18 @@ public record CaseTemplate(String id, CaseType type, CompanyId companyId, List<L
                            Narrative narrative, List<Checkpoint> checkpoints, List<SolutionPath> solutionPaths, AnswerForm answerForm,
                            String referenceMarkdown, ScenarioSpec scenario, String defaultPathId, List<RecommendationRule> rules,
                            Set<ConsoleTool> tools, List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages,
-                           List<CaseArtifact> artifacts) {
+                           List<CaseArtifact> artifacts, List<FollowUp> followUps) {
+
+    /** Templates without second-order follow-up. */
+    public CaseTemplate(String id, CaseType type, CompanyId companyId, List<Level> levels, List<String> competencies,
+                        Map<String, ParameterSpec> parameters, Map<String, String> derived, Narrative narrative,
+                        List<Checkpoint> checkpoints, List<SolutionPath> solutionPaths, AnswerForm answerForm,
+                        String referenceMarkdown, ScenarioSpec scenario, String defaultPathId, List<RecommendationRule> rules,
+                        Set<ConsoleTool> tools, List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages,
+                        List<CaseArtifact> artifacts) {
+        this(id, type, companyId, levels, competencies, parameters, derived, narrative, checkpoints, solutionPaths, answerForm,
+                referenceMarkdown, scenario, defaultPathId, rules, tools, mitigations, stakeholderMessages, artifacts, List.of());
+    }
 
     /** Templates with incident response but no artifacts. */
     public CaseTemplate(String id, CaseType type, CompanyId companyId, List<Level> levels, List<String> competencies,
@@ -26,7 +37,7 @@ public record CaseTemplate(String id, CaseType type, CompanyId companyId, List<L
                         String referenceMarkdown, ScenarioSpec scenario, String defaultPathId, List<RecommendationRule> rules,
                         Set<ConsoleTool> tools, List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages) {
         this(id, type, companyId, levels, competencies, parameters, derived, narrative, checkpoints, solutionPaths, answerForm,
-                referenceMarkdown, scenario, defaultPathId, rules, tools, mitigations, stakeholderMessages, List.of());
+                referenceMarkdown, scenario, defaultPathId, rules, tools, mitigations, stakeholderMessages, List.of(), List.of());
     }
 
     /** Templates without incident response declare neither mitigations nor stakeholder pressure. */

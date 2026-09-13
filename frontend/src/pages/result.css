@@ -172,6 +172,37 @@
   overflow-y: auto;
 }
 
+/* O caso de acompanhamento é a consequência da decisão que acabou de ser tomada: merece destaque próprio. */
+.follow-up {
+  margin-top: var(--gap-5);
+  padding: var(--gap-5);
+  background: var(--graphite);
+  color: var(--paper);
+  border-radius: var(--radius-lg);
+}
+
+.follow-up__title {
+  font-size: var(--step-1);
+  margin-bottom: var(--gap-2);
+}
+
+.follow-up__teaser {
+  max-width: 68ch;
+  margin-bottom: var(--gap-4);
+  color: #cfd8de;
+}
+
+.follow-up .btn--primary {
+  background: var(--signal);
+  border-color: var(--signal);
+  color: var(--ink-900);
+  font-weight: 600;
+}
+
+.follow-up .btn--primary:hover:not(:disabled) {
+  background: #35b5ab;
+}
+
 .result__actions {
   display: flex;
   flex-wrap: wrap;

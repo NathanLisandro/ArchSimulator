@@ -1,0 +1,278 @@
+id: saude
+name: Vitalis Saúde Digital
+domain: healthcare
+description: >
+  Plataforma de telemedicina e prontuário eletrônico usada por 140 clínicas e dois planos de saúde. Faz agendamento,
+  atendimento por vídeo, prescrição digital assinada, prontuário longitudinal e integração com laboratórios para
+  pedido e resultado de exame. É um sistema onde o dado errado tem consequência clínica, o acesso indevido tem
+  consequência legal, e a indisponibilidade cancela consultas que já foram pagas.
+scale:
+  dailyActiveUsers: 480000
+  peakTps: 900
+  dataVolume: "26 TB no prontuário, 310 TB de imagens e anexos no S3"
+  growthNote: "Pico entre 7h e 9h (agendamento) e 19h e 22h (atendimento); segunda-feira tem o dobro da média semanal"
+stack:
+  languages: [Java 21, TypeScript (Node), Kotlin]
+  frameworks: [Spring Boot 3, NestJS, HL7 FHIR (HAPI)]
+  datastores: [PostgreSQL 15 (RDS), MongoDB (documentos clínicos), Redis, S3, OpenSearch]
+  messaging: [Kafka (MSK), SQS]
+  cloud: AWS
+  notes: "Vídeo por WebRTC com SFU gerenciado; auditoria de acesso obrigatória em todo dado clínico"
+team:
+  developers: 95
+  squads: 12
+  notes: "Squads por jornada (agendamento, atendimento, prontuário, prescrição, integrações, faturamento)"
+regulations:
+  - name: LGPD
+    description: "Dado de saúde é dado pessoal sensível: exige base legal específica, registro de acesso e minimização"
+  - name: "Resolução CFM 2.314/2022"
+    description: "Telemedicina exige identificação do profissional, consentimento registrado e guarda do prontuário por 20 anos"
+  - name: "Prescrição digital (ICP-Brasil)"
+    description: "Receita e atestado precisam de assinatura digital qualificada e verificação pública do documento"
+  - name: "Interoperabilidade HL7 FHIR"
+    description: "Troca de resultado de exame com laboratórios segue perfis FHIR; divergência de identificador gera resultado no paciente errado"
+architecture:
+  services:
+    - name: scheduling-api
+      description: "Agenda de profissionais, encaixe, cancelamento e reagendamento"
+      language: Java
+      dependsOn: [scheduling-db, redis-cache, kafka]
+      datastore: scheduling-db
+      instances: 12
+    - name: consultation-api
+      description: "Ciclo da consulta: sala de espera, início, término, evolução clínica"
+      language: Java
+      dependsOn: [ehr-db, video-gateway, kafka]
+      datastore: ehr-db
+      instances: 14
+    - name: ehr-service
+      description: "Prontuário longitudinal: evoluções, alergias, condições, medicações"
+      language: Java
+      dependsOn: [ehr-db, mongo-clinical, kafka]
+      datastore: ehr-db
+      instances: 16
+    - name: prescription-api
+      description: "Prescrição digital assinada e verificação pública do documento"
+      language: Kotlin
+      dependsOn: [ehr-db, signing-provider, kafka]
+      datastore: ehr-db
+      instances: 6
+    - name: lab-integration
+      description: "Pedido e resultado de exame com 23 laboratórios, em FHIR e em arquivos legados"
+      language: Java
+      dependsOn: [lab-db, kafka, s3]
+      datastore: lab-db
+      instances: 8
+    - name: video-gateway
+      description: "Cria e encerra salas de vídeo, mede qualidade da chamada"
+      language: TypeScript
+      dependsOn: [redis-cache, sfu-provider]
+      datastore: null
+      instances: 10
+    - name: audit-service
+      description: "Registra todo acesso a dado clínico; é requisito regulatório, não opcional"
+      language: Java
+      dependsOn: [audit-db, kafka]
+      datastore: audit-db
+      instances: 6
+    - name: billing-api
+      description: "Faturamento para planos e cobrança particular"
+      language: Java
+      dependsOn: [billing-db, kafka]
+      datastore: billing-db
+      instances: 6
+    - name: notification-service
+      description: "Lembrete de consulta, resultado disponível, receita emitida"
+      language: TypeScript
+      dependsOn: [kafka, sqs]
+      datastore: notif-db
+      instances: 6
+  datastores:
+    - name: ehr-db
+      engine: postgres
+      description: "Prontuário estruturado, consultas e prescrições. RDS PostgreSQL 15 Multi-AZ com criptografia"
+      sizing: "db.r6g.4xlarge (16 vCPU, 128 GB), gp3 12k IOPS, 9 TB"
+    - name: scheduling-db
+      engine: postgres
+      description: "Agenda, disponibilidade e bloqueios"
+      sizing: "db.r6g.2xlarge"
+    - name: lab-db
+      engine: postgres
+      description: "Pedidos, resultados e mapeamento de identificadores por laboratório"
+      sizing: "db.r6g.2xlarge"
+    - name: audit-db
+      engine: postgres
+      description: "Trilha de auditoria de acesso, append-only, retenção de 20 anos"
+      sizing: "db.r6g.2xlarge, 6 TB"
+    - name: billing-db
+      engine: postgres
+      description: "Faturamento e glosas"
+      sizing: "db.r6g.xlarge"
+    - name: notif-db
+      engine: postgres
+      description: "Histórico de avisos"
+      sizing: "db.t4g.medium"
+    - name: mongo-clinical
+      engine: mongodb
+      description: "Documentos clínicos livres, anexos indexados e questionários"
+      sizing: "3 nós M40, 4 TB"
+  brokers:
+    - name: kafka
+      type: kafka
+      topics: [appointments.events, consultations.events, ehr.updated, lab.results, prescriptions.issued, audit.access, notifications.outbound]
+    - name: sqs
+      type: sqs
+      topics: [sms-outbound, email-outbound, lab-file-ingest, lab-file-dlq]
+  caches:
+    - name: redis-cache
+      type: redis
+      usage: "Disponibilidade da agenda (TTL 30s), sessão, sala de vídeo ativa, rate limit por CPF"
+infra:
+  resources:
+    - { id: waf, type: aws.cloudfront, name: "CloudFront + WAF", properties: { rules: "OWASP, rate limit por IP", cacheHitRate: "0.41" } }
+    - { id: alb-public, type: aws.alb, name: "ALB público", properties: { listeners: "443", targetGroups: "scheduling-api,consultation-api,video-gateway" } }
+    - { id: eks-main, type: aws.eks, name: "EKS prod", properties: { nodes: "28", instanceType: "m6i.2xlarge", version: "1.30" } }
+    - { id: rds-ehr, type: aws.rds.postgres, name: "RDS ehr-db", properties: { instanceClass: "db.r6g.4xlarge", multiAz: "true", storage: "9TB gp3", iops: "12000", maxConnections: "3000", encryption: "KMS", readReplicas: "2" } }
+    - { id: rds-scheduling, type: aws.rds.postgres, name: "RDS scheduling-db", properties: { instanceClass: "db.r6g.2xlarge", multiAz: "true" } }
+    - { id: rds-audit, type: aws.rds.postgres, name: "RDS audit-db", properties: { instanceClass: "db.r6g.2xlarge", storage: "6TB gp3", retention: "20 anos" } }
+    - { id: redis-main, type: aws.elasticache.redis, name: "ElastiCache", properties: { nodeType: "cache.r6g.large", shards: "2", replicas: "1" } }
+    - { id: msk-main, type: aws.msk, name: "MSK", properties: { brokers: "6", instanceType: "kafka.m5.xlarge", partitionsDefault: "24" } }
+    - { id: s3-clinical, type: aws.s3, name: "S3 clínico", properties: { buckets: "exames,anexos,receitas", encryption: "SSE-KMS", versioning: "on" } }
+    - { id: sqs-labs, type: aws.sqs, name: "SQS laboratórios", properties: { queues: "lab-file-ingest", dlq: "lab-file-dlq" } }
+    - { id: sfu-provider, type: external, name: "SFU de vídeo", properties: { protocol: "WebRTC", slaMs: "200" } }
+    - { id: signing-provider, type: external, name: "Assinatura ICP-Brasil", properties: { protocol: "HTTPS", slaMs: "2500" } }
+    - { id: lab-partners, type: external, name: "Laboratórios (23)", properties: { protocol: "FHIR R4 e SFTP legado", slaMs: "5000" } }
+  edges:
+    - { from: waf, to: alb-public, label: "HTTPS" }
+    - { from: alb-public, to: eks-main, label: "HTTPS" }
+    - { from: eks-main, to: rds-ehr, label: "JDBC (pool 18/pod)" }
+    - { from: eks-main, to: rds-scheduling, label: "JDBC" }
+    - { from: eks-main, to: rds-audit, label: "JDBC (append-only)" }
+    - { from: eks-main, to: redis-main, label: "Redis" }
+    - { from: eks-main, to: msk-main, label: "Kafka" }
+    - { from: eks-main, to: s3-clinical, label: "anexos" }
+    - { from: eks-main, to: sqs-labs, label: "SQS" }
+    - { from: eks-main, to: sfu-provider, label: "WebRTC" }
+    - { from: eks-main, to: signing-provider, label: "assinatura" }
+    - { from: eks-main, to: lab-partners, label: "FHIR / SFTP" }
+schema:
+  dialect: POSTGRES
+  tables:
+    - name: patients
+      rowCount: 9200000
+      sizeMb: 6400
+      columns:
+        - { name: id, type: bigint, distinct: 9200000 }
+        - { name: document, type: varchar(14), distinct: 9200000 }
+        - { name: cns, type: varchar(15), distinct: 8900000, nullable: true }
+        - { name: full_name, type: varchar(160), distinct: 8700000 }
+        - { name: birth_date, type: date, distinct: 32000 }
+        - { name: created_at, type: timestamp, distinct: 9000000 }
+      indexes:
+        - { name: patients_pkey, columns: [id], unique: true, sizeMb: 210 }
+        - { name: uq_patients_document, columns: [document], unique: true, sizeMb: 290 }
+        - { name: idx_patients_cns, columns: [cns], sizeMb: 260 }
+    - name: appointments
+      rowCount: 310000000
+      sizeMb: 128000
+      columns:
+        - { name: id, type: bigint, distinct: 310000000 }
+        - { name: patient_id, type: bigint, distinct: 9200000 }
+        - { name: professional_id, type: bigint, distinct: 48000 }
+        - { name: clinic_id, type: integer, distinct: 140 }
+        - { name: scheduled_at, type: timestamp, distinct: 280000000 }
+        - { name: status, type: varchar(20), distinct: 8 }
+        - { name: modality, type: varchar(12), distinct: 3 }
+        - { name: idempotency_key, type: varchar(64), distinct: 310000000 }
+        - { name: created_at, type: timestamp, distinct: 300000000 }
+      indexes:
+        - { name: appointments_pkey, columns: [id], unique: true, sizeMb: 6600 }
+        - { name: uq_appointments_idempotency, columns: [idempotency_key], unique: true, sizeMb: 18000 }
+        - { name: idx_appointments_professional_at, columns: [professional_id, scheduled_at], sizeMb: 14000 }
+        - { name: idx_appointments_patient_at, columns: [patient_id, scheduled_at], sizeMb: 13000 }
+        - { name: idx_appointments_status, columns: [status], sizeMb: 4200 }
+    - name: encounters
+      rowCount: 240000000
+      sizeMb: 196000
+      columns:
+        - { name: id, type: bigint, distinct: 240000000 }
+        - { name: appointment_id, type: bigint, distinct: 240000000 }
+        - { name: patient_id, type: bigint, distinct: 9200000 }
+        - { name: professional_id, type: bigint, distinct: 48000 }
+        - { name: started_at, type: timestamp, distinct: 230000000 }
+        - { name: ended_at, type: timestamp, distinct: 230000000, nullable: true }
+        - { name: chief_complaint, type: varchar(400), distinct: 90000000 }
+        - { name: assessment, type: text, distinct: 210000000 }
+      indexes:
+        - { name: encounters_pkey, columns: [id], unique: true, sizeMb: 5100 }
+        - { name: idx_encounters_patient_started, columns: [patient_id, started_at], sizeMb: 11000 }
+        - { name: idx_encounters_professional, columns: [professional_id], sizeMb: 8800 }
+    - name: lab_orders
+      rowCount: 420000000
+      sizeMb: 141000
+      columns:
+        - { name: id, type: bigint, distinct: 420000000 }
+        - { name: patient_id, type: bigint, distinct: 9200000 }
+        - { name: lab_id, type: integer, distinct: 23 }
+        - { name: external_id, type: varchar(48), distinct: 418000000 }
+        - { name: panel_code, type: varchar(16), distinct: 2100 }
+        - { name: status, type: varchar(16), distinct: 6 }
+        - { name: requested_at, type: timestamp, distinct: 400000000 }
+        - { name: resulted_at, type: timestamp, distinct: 380000000, nullable: true }
+      indexes:
+        - { name: lab_orders_pkey, columns: [id], unique: true, sizeMb: 9000 }
+        - { name: idx_lab_orders_patient_requested, columns: [patient_id, requested_at], sizeMb: 16000 }
+        - { name: idx_lab_orders_lab_external, columns: [lab_id, external_id], sizeMb: 22000 }
+        - { name: idx_lab_orders_status, columns: [status], sizeMb: 5600 }
+    - name: prescriptions
+      rowCount: 186000000
+      sizeMb: 84000
+      columns:
+        - { name: id, type: bigint, distinct: 186000000 }
+        - { name: encounter_id, type: bigint, distinct: 180000000 }
+        - { name: patient_id, type: bigint, distinct: 9200000 }
+        - { name: professional_id, type: bigint, distinct: 48000 }
+        - { name: signature_id, type: varchar(64), distinct: 186000000, nullable: true }
+        - { name: verification_code, type: varchar(24), distinct: 186000000 }
+        - { name: issued_at, type: timestamp, distinct: 180000000 }
+      indexes:
+        - { name: prescriptions_pkey, columns: [id], unique: true, sizeMb: 4000 }
+        - { name: uq_prescriptions_verification, columns: [verification_code], unique: true, sizeMb: 9800 }
+        - { name: idx_prescriptions_patient_issued, columns: [patient_id, issued_at], sizeMb: 8200 }
+    - name: access_log
+      rowCount: 4100000000
+      sizeMb: 720000
+      columns:
+        - { name: id, type: bigint, distinct: 4100000000 }
+        - { name: actor_id, type: bigint, distinct: 52000 }
+        - { name: patient_id, type: bigint, distinct: 9200000 }
+        - { name: resource, type: varchar(32), distinct: 24 }
+        - { name: purpose, type: varchar(24), distinct: 9 }
+        - { name: occurred_at, type: timestamp, distinct: 3900000000 }
+      indexes:
+        - { name: access_log_pkey, columns: [id], unique: true, sizeMb: 88000 }
+        - { name: idx_access_patient_occurred, columns: [patient_id, occurred_at], sizeMb: 140000 }
+        - { name: idx_access_actor_occurred, columns: [actor_id, occurred_at], sizeMb: 132000 }
+    - name: professionals
+      rowCount: 48000
+      sizeMb: 96
+      columns:
+        - { name: id, type: bigint, distinct: 48000 }
+        - { name: council_number, type: varchar(20), distinct: 48000 }
+        - { name: specialty, type: varchar(48), distinct: 61 }
+        - { name: clinic_id, type: integer, distinct: 140 }
+        - { name: active, type: boolean, distinct: 2 }
+      indexes:
+        - { name: professionals_pkey, columns: [id], unique: true, sizeMb: 9 }
+        - { name: uq_professionals_council, columns: [council_number], unique: true, sizeMb: 12 }
+techDebts:
+  - title: "Disponibilidade da agenda é calculada a cada requisição"
+    description: "scheduling-api varre bloqueios e consultas do profissional para montar a grade; no pico das 7h isso é 60% da carga do scheduling-db"
+  - title: "Mapeamento de identificador de paciente por laboratório é manual"
+    description: "Cada laboratório tem um identificador próprio; a conciliação usa uma tabela mantida à mão e já gerou resultado anexado ao paciente errado"
+  - title: "Trilha de auditoria grava de forma síncrona no caminho da leitura"
+    description: "Toda leitura de prontuário abre transação no audit-db antes de responder; auditoria lenta derruba o atendimento"
+  - title: "access_log com 4,1 bilhões de linhas e retenção de 20 anos"
+    description: "Sem particionamento nem camada fria; a consulta de auditoria por paciente já leva minutos"
+  - title: "Arquivos legados de laboratório são processados sem validação de esquema"
+    description: "23 laboratórios, 4 ainda enviam arquivo posicional por SFTP; o parser falha em silêncio e o resultado some na DLQ"

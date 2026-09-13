@@ -1,0 +1,358 @@
+id: health-code-review-lab-parser
+type: CODE_REVIEW
+company: saude
+levels: [PLENO, SENIOR, STAFF]
+competencies: [solid, clean-arch, security, eda, communication]
+tools: []
+parameters:
+  labsLegacy: { range: [3, 8] }
+  filesPerDay: { range: [900, 6400], step: 100 }
+  dlqPending: { range: [120, 3400], step: 20 }
+  author:
+    group:
+      - { author: "uma pessoa do time de integrações, sob pressão para ligar o laboratório novo até sexta", reviewContext: "o contrato com o laboratório prevê multa por atraso na integração" }
+      - { author: "um desenvolvedor que herdou o serviço há duas semanas e está seguindo o padrão dos parsers existentes", reviewContext: "o padrão que ele copiou tem o mesmo defeito, e ninguém percebeu até agora" }
+      - { author: "o tech lead das integrações, que escreveu o parser original há três anos", reviewContext: "é o código que ele mesmo criou, e a conversa precisa separar a pessoa do padrão" }
+derived:
+  resultsPerDay: "filesPerDay * 34"
+narrative:
+  title: "Code review: parser de resultado de exame com {{dlqPending|number}} mensagens na DLQ"
+  symptom: |
+    Chegou para revisão o parser abaixo, escrito por {{author}} — {{reviewContext}}.
+
+    Ele processa os arquivos posicionais que {{labsLegacy}} laboratórios ainda enviam por SFTP: cerca de
+    **{{filesPerDay|number}} arquivos por dia**, com ~{{resultsPerDay|compact}} resultados. A DLQ
+    `lab-file-dlq` está com **{{dlqPending|number}} mensagens** e ninguém sabe desde quando.
+
+    O código passa nos testes com o arquivo de exemplo do laboratório. Aponte os problemas e escreva o comentário
+    de revisão.
+  businessContext: |
+    Resultado de exame anexado ao paciente errado é evento adverso com consequência clínica e notificação obrigatória.
+    Cada laboratório usa um identificador próprio de paciente, e a conciliação hoje passa por uma tabela mantida à
+    mão. O `lab-integration` roda em 8 pods e consome de `lab-file-ingest`.
+  hints:
+    - "Procure o que acontece quando uma linha do arquivo não está no formato esperado."
+    - "Como o código decide de qual paciente é aquele resultado?"
+    - "O que a DLQ está guardando, e quem descobre isso?"
+artifacts:
+  - id: lab-parser
+    title: "LabResultProcessor.java (do pull request)"
+    kind: CODE
+    language: java
+    content: |
+      @Component
+      public class LabResultProcessor {
+
+          @Autowired private PatientRepository patients;
+          @Autowired private LabOrderRepository orders;
+          @Autowired private EhrClient ehr;
+          @Autowired private NotificationClient notifications;
+
+          @SqsListener("lab-file-ingest")
+          public void process(String s3Key) {
+              String content = s3.download(s3Key);
+              String[] lines = content.split("\n");
+
+              for (String line : lines) {
+                  try {
+                      // layout posicional do laboratorio: nome 0-40, documento 40-51, exame 51-57, valor 57-70
+                      String name = line.substring(0, 40).trim();
+                      String document = line.substring(40, 51).trim();
+                      String panel = line.substring(51, 57).trim();
+                      String value = line.substring(57, 70).trim();
+
+                      Patient patient = patients.findByDocument(document);
+                      if (patient == null) {
+                          // documento nao bate: tenta pelo nome
+                          List<Patient> byName = patients.findByFullName(name);
+                          if (byName.size() > 0) {
+                              patient = byName.get(0);
+                          } else {
+                              continue;          // sem paciente, pula a linha
+                          }
+                      }
+
+                      LabOrder order = orders.findFirstByPatientIdAndPanelCode(patient.getId(), panel);
+                      order.setStatus("RESULTED");
+                      order.setResultedAt(new Date());
+                      orders.save(order);
+
+                      ehr.attachResult(patient.getId(), panel, value);
+                      notifications.send(patient.getId(), "Seu resultado de exame ja esta disponivel");
+
+                  } catch (Exception e) {
+                      System.out.println("erro na linha: " + line);   // segue para a proxima
+                  }
+              }
+          }
+      }
+checkpoints:
+  - id: worst
+    question: "Qual é o problema mais grave deste código?"
+    options:
+      - id: name-fallback
+        label: "O fallback por nome pode anexar o resultado ao paciente errado"
+        verdict: GOOD
+        feedback: "Esse é o mais grave, e por larga margem. `findByFullName` devolvendo homônimos e o código pegando o primeiro significa exame de uma pessoa no prontuário de outra. É evento adverso com consequência clínica, não um bug de integração."
+      - id: swallow
+        label: "O `catch (Exception)` engole tudo e segue"
+        verdict: RISKY
+        feedback: "Problema sério: a linha some sem rastro e o `println` não é alarme. Mas ele causa dado faltando, que é recuperável. O fallback por nome causa dado **errado** no paciente, que é pior e mais difícil de descobrir."
+      - id: substring
+        label: "O `substring` quebra em linha curta"
+        verdict: RISKY
+        feedback: "Quebra mesmo, e vira `StringIndexOutOfBoundsException` engolida pelo catch. Mas o efeito é perder a linha; o fallback por nome coloca resultado no prontuário errado."
+      - id: npe
+        label: "`order` pode ser nulo e estourar"
+        verdict: RISKY
+        feedback: "Sim: `findFirstByPatientIdAndPanelCode` pode não achar pedido, e `order.setStatus` estoura — engolido pelo catch. Ainda assim, perder é menos grave que atribuir errado."
+  - id: idempotency
+    question: "A mensagem é reprocessada pela fila. O que acontece?"
+    options:
+      - id: duplicate-effects
+        label: "O resultado é anexado de novo e o paciente recebe outra notificação"
+        verdict: GOOD
+        feedback: "Certo. SQS entrega ao menos uma vez, e aqui não há nada que torne o processamento idempotente. O paciente recebe 'seu resultado está disponível' várias vezes, e o prontuário acumula anexos repetidos."
+      - id: sqs-guarantees
+        label: "O SQS garante entrega única"
+        verdict: BAD
+        feedback: "Fila padrão do SQS entrega ao menos uma vez por projeto. Mesmo fila FIFO garante isso apenas dentro de uma janela de deduplicação. A idempotência é responsabilidade do consumidor."
+      - id: db-prevents
+        label: "O banco impede pela chave primária"
+        verdict: BAD
+        feedback: "`orders.save` é atualização de um pedido existente, não inserção: rodar de novo simplesmente sobrescreve e dispara os efeitos colaterais outra vez."
+  - id: dlq
+    question: "A DLQ tem {{dlqPending|number}} mensagens e ninguém sabe desde quando. O que isso indica?"
+    options:
+      - id: no-owner
+        label: "A DLQ não tem alarme nem dono: falha virou perda de dado com etapa extra"
+        verdict: GOOD
+        feedback: "Exato. DLQ sem alarme por quantidade e por idade da mensagem mais antiga é um lugar onde resultado de exame desaparece em silêncio, e alguém só descobre quando o paciente cobra."
+      - id: normal
+        label: "É normal ter mensagens na DLQ"
+        verdict: BAD
+        feedback: "Em integração clínica não é. Cada mensagem ali é potencialmente um resultado que o médico não vê. Normal é DLQ vazia, com alarme quando deixa de estar."
+      - id: purge
+        label: "Limpar a DLQ e seguir"
+        verdict: BAD
+        feedback: "Apagar {{dlqPending|number}} mensagens é descartar resultados de exame sem saber de quem eram. Além do risco clínico, destrói a evidência para entender a causa."
+solutionPaths:
+  - id: structural-review
+    name: "Review estrutural: identidade, idempotência e falha visível"
+    summary: "Apontar as classes de problema com prioridade clínica, propondo identidade por identificador do laboratório, processamento idempotente e falha que aparece."
+    pros: ["Prioriza pelo risco ao paciente", "Ensina o padrão para os outros parsers", "Deixa o PR pronto para correção completa"]
+    cons: ["Review longo", "Exige cuidado no tom, porque o padrão é do time inteiro"]
+    bestWhen: "o defeito é de padrão e se repete nos outros parsers — o caso aqui"
+    rubric:
+      criteria:
+        - id: identity
+          name: "Identidade do paciente"
+          weight: 25
+          evidence:
+            - { type: choice, field: worstIssue, anyOf: [WRONG_PATIENT_MATCH] }
+            - { type: keyword, field: review, anyOf: ["homônim", "homonim", "nome", "identificador", "external_id", "conciliação", "conciliacao"], min: 1 }
+          missing: "O risco maior é anexar resultado ao paciente errado por causa do fallback por nome: proponha casar pelo identificador do laboratório e recusar quando não houver correspondência inequívoca."
+          present: "Risco de identidade tratado como prioridade."
+        - id: fail-visible
+          name: "Falha que aparece"
+          weight: 20
+          evidence:
+            - { type: keyword, field: review, anyOf: ["catch", "engole", "dlq", "alarme", "alerta", "log estruturado"], min: 2 }
+          missing: "O `catch (Exception)` com `println` esconde a falha. Proponha exceção específica, log estruturado, e alarme na DLQ por quantidade e idade."
+          present: "Falha visível e monitorada."
+        - id: idempotency
+          name: "Idempotência"
+          weight: 20
+          evidence:
+            - { type: keyword, field: review, anyOf: ["idempot", "reprocess", "duplicad", "ao menos uma vez", "dedup"], min: 1 }
+          missing: "A fila entrega ao menos uma vez: o processamento precisa ser idempotente, inclusive na notificação ao paciente."
+          present: "Idempotência apontada."
+        - id: parsing
+          name: "Leitura defensiva do arquivo"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["substring", "tamanho", "validação", "validacao", "esquema", "layout", "linha curta"], min: 1 }
+          missing: "Layout posicional sem validação de tamanho e de tipo quebra na primeira linha fora do padrão: proponha validação explícita do layout."
+          present: "Leitura defensiva proposta."
+        - id: clinical-safety
+          name: "Segurança clínica e privacidade"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["log", "dado sensível", "dado sensivel", "lgpd", "conteúdo da linha", "conteudo da linha"], min: 1 }
+          missing: "O log imprime a linha inteira, que contém nome, documento e resultado de exame: dado pessoal sensível em log é violação de LGPD."
+          present: "Vazamento de dado sensível apontado."
+        - id: tone
+          name: "Tom do review"
+          weight: 5
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "podemos", "vamos", "proponho", "que acha", "obrigad"], min: 1 }
+          missing: "{{reviewContext}} — escreva o comentário como convite a mudar o padrão, não como acusação."
+          present: "Tom construtivo."
+  - id: block-and-fix-pattern
+    name: "Bloquear e corrigir o padrão em todos os parsers"
+    summary: "Reprovar o PR, tratar o defeito como sistêmico e propor uma biblioteca comum de ingestão com identidade, idempotência e validação."
+    pros: ["Corrige a classe inteira de problema", "Evita repetir o defeito no próximo laboratório", "Cria um único lugar para auditar"]
+    cons: ["Atrasa a integração contratada", "Projeto maior que o PR", "Exige alinhamento com outras squads"]
+    bestWhen: "o mesmo defeito já existe em vários parsers e a próxima integração vai copiá-lo de novo"
+    rubric:
+      criteria:
+        - id: systemic
+          name: "Defeito tratado como sistêmico"
+          weight: 30
+          evidence:
+            - { type: keyword, field: review, anyOf: ["outros parsers", "padrão", "padrao", "biblioteca", "comum", "todos os laborat"], min: 1 }
+          missing: "Se o padrão se repete, apontar só neste PR resolve um caso e deixa os outros: trate como defeito de classe."
+          present: "Defeito tratado como sistêmico."
+        - id: identity
+          name: "Identidade do paciente"
+          weight: 25
+          evidence:
+            - { type: choice, field: worstIssue, anyOf: [WRONG_PATIENT_MATCH] }
+          missing: "O risco maior continua sendo anexar resultado ao paciente errado."
+          present: "Risco de identidade priorizado."
+        - id: deadline
+          name: "Prazo contratado enfrentado"
+          weight: 25
+          evidence:
+            - { type: keyword, field: review, anyOf: ["prazo", "contrato", "sexta", "negoci", "multa", "escopo mínimo", "escopo minimo"], min: 1 }
+          missing: "Existe prazo contratado com multa: bloquear exige propor o escopo mínimo que entra agora e o que fica para depois."
+          present: "Prazo enfrentado com proposta de escopo."
+        - id: tone
+          name: "Tom"
+          weight: 20
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "proponho", "vamos", "podemos", "alinhar"], min: 1 }
+          missing: "Bloquear um PR com prazo exige tom de negociação."
+          present: "Tom de negociação."
+  - id: minimum-safe-merge
+    name: "Aprovar com o mínimo seguro e ticket de follow-up"
+    summary: "Exigir no PR apenas o que evita dano ao paciente e perda de dado, registrando o resto como dívida com dono e prazo."
+    pros: ["Cumpre o prazo sem aceitar risco clínico", "Separa o inegociável do desejável", "Entrega valor rápido"]
+    cons: ["Entra em produção com dívida conhecida", "Follow-up pode não acontecer", "O padrão segue errado nos outros parsers"]
+    bestWhen: "o prazo é imexível e existe um subconjunto pequeno de correções que elimina o risco clínico"
+    rubric:
+      criteria:
+        - id: must-fix
+          name: "Mínimo inegociável"
+          weight: 35
+          evidence:
+            - { type: keyword, field: review, anyOf: ["homônim", "homonim", "nome", "identificador"], min: 1 }
+            - { type: keyword, field: review, anyOf: ["dlq", "alarme", "alerta"], min: 1 }
+            - { type: keyword, field: review, anyOf: ["log", "sensível", "sensivel"], min: 1 }
+          missing: "O mínimo que não entra em produção: casamento por nome, DLQ sem alarme e dado sensível em log."
+          present: "Mínimo inegociável bem delimitado."
+        - id: debt
+          name: "Dívida registrada com dono e prazo"
+          weight: 30
+          evidence:
+            - { type: keyword, field: review, anyOf: ["ticket", "prazo", "dono", "backlog", "follow"], min: 1 }
+          missing: "Dívida sem dono e sem data é esquecimento: registre ticket, responsável e prazo."
+          present: "Dívida registrada."
+        - id: identity
+          name: "Identidade do paciente"
+          weight: 20
+          evidence:
+            - { type: choice, field: worstIssue, anyOf: [WRONG_PATIENT_MATCH] }
+          missing: "O risco maior é o casamento por nome."
+          present: "Risco priorizado."
+        - id: tone
+          name: "Tom"
+          weight: 15
+          evidence:
+            - { type: keyword, field: review, anyOf: ["sugiro", "podemos", "vamos", "proponho", "obrigad"], min: 1 }
+          missing: "Mantenha o tom construtivo."
+          present: "Tom construtivo."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: worstIssue
+      label: "Problema mais grave"
+      type: SELECT
+      required: true
+      options:
+        - { value: WRONG_PATIENT_MATCH, label: "Fallback por nome pode anexar resultado ao paciente errado" }
+        - { value: SWALLOWED_EXCEPTION, label: "Exceção engolida: linha some sem rastro" }
+        - { value: MISSING_IDEMPOTENCY, label: "Reprocessamento duplica efeitos" }
+        - { value: FRAGILE_PARSING, label: "Leitura posicional sem validação" }
+        - { value: SENSITIVE_LOG, label: "Dado clínico em log" }
+    - id: matchingStrategy
+      label: "Como o resultado deve ser associado ao paciente"
+      type: SELECT
+      required: true
+      options:
+        - { value: lab-external-id, label: "Pelo identificador do laboratório, com recusa quando não houver correspondência" }
+        - { value: document-then-name, label: "Documento e, se falhar, nome" }
+        - { value: name-only, label: "Nome do paciente" }
+    - id: solutionPath
+      label: "Postura no review"
+      type: SELECT
+      required: true
+      options:
+        - { value: structural-review, label: "Review estrutural com prioridades" }
+        - { value: block-and-fix-pattern, label: "Bloquear e corrigir o padrão" }
+        - { value: minimum-safe-merge, label: "Aprovar com o mínimo seguro" }
+    - id: review
+      label: "Comentário de revisão"
+      type: MARKDOWN
+      required: true
+      help: "Escreva como deixaria no PR: o que muda, por que, e com qual prioridade."
+reference: |
+  ## Comentário de revisão
+
+  Obrigado por atacar essa integração, e desculpa o comentário longo: parte do que está aqui é do padrão que a gente
+  usa nos outros parsers, não do seu PR. Vale corrigir nos dois lugares.
+
+  ### 1. Bloqueante, risco clínico: casamento por nome
+  ```java
+  List<Patient> byName = patients.findByFullName(name);
+  if (byName.size() > 0) { patient = byName.get(0); }
+  ```
+  Com 9,2 milhões de pacientes, homônimo não é exceção: é rotina. Pegar o primeiro significa anexar exame de uma
+  pessoa ao prontuário de outra, que é evento adverso com notificação obrigatória — e que só aparece quando alguém
+  percebe um resultado impossível.
+
+  Sugiro casar pelo identificador do laboratório (`lab_orders.external_id` com `lab_id`), que é o único par
+  inequívoco que temos. Quando não houver correspondência, a linha vai para revisão manual com o motivo, e **não**
+  é anexada a ninguém. É melhor um resultado pendente do que um resultado no paciente errado.
+
+  ### 2. Bloqueante: a falha desaparece
+  ```java
+  } catch (Exception e) { System.out.println("erro na linha: " + line); }
+  ```
+  Três problemas em uma linha: o `catch (Exception)` engole inclusive erro de programação; o `println` não é alarme e
+  ninguém lê; e a linha impressa contém nome, documento e resultado de exame, ou seja, dado pessoal sensível em log,
+  o que é violação de LGPD.
+
+  Sugiro: exceções específicas por tipo de falha, log estruturado sem conteúdo clínico (só identificadores internos),
+  e a mensagem indo para a DLQ de propósito, não por acidente.
+
+  ### 3. Bloqueante: a DLQ não tem dono
+  São {{dlqPending|number}} mensagens acumuladas e ninguém sabe desde quando. Cada uma pode ser um resultado que o
+  médico não viu. Precisa de alarme por **quantidade** e por **idade da mensagem mais antiga**, runbook de
+  reprocessamento e um responsável nomeado.
+
+  ### 4. Importante: reprocessamento duplica efeitos
+  A fila entrega ao menos uma vez. Hoje, reprocessar anexa o resultado de novo e manda outra notificação ao paciente.
+  Sugiro chave de idempotência por `(lab_id, external_id, panel_code)` persistida com restrição de unicidade, e a
+  notificação disparada só quando o pedido muda de estado de fato.
+
+  ### 5. Importante: leitura posicional sem validação
+  `line.substring(0, 40)` estoura em qualquer linha mais curta — cabeçalho, rodapé, linha em branco no fim do arquivo.
+  Sugiro validar o tamanho e o formato de cada campo antes de usar, com mensagem clara de qual posição falhou.
+
+  ### Menores
+  - `new Date()` em vez do relógio injetado que o resto do serviço usa.
+  - `@Autowired` em campo dificulta teste; prefira construtor.
+  - `content.split("\n")` quebra com arquivo em CRLF, que é o formato mais provável vindo de sistema de laboratório.
+  - Ler o arquivo inteiro na memória: alguns desses arquivos passam de 100 MB em dia de pico.
+
+  ### Sobre o prazo
+  Sei do compromisso desta semana. Proponho o seguinte corte: os itens 1, 2 e 3 entram agora, porque são risco
+  clínico e de privacidade. O 4 e o 5 viram ticket para a semana seguinte, com meu nome junto. Se ajudar, eu pareio
+  contigo amanhã de manhã no item 1, que é o que mais muda o código.
+scenario:
+  kind: none
+recommendation:
+  default: structural-review
+  rules:
+    - { param: dlqPending, op: ">=", value: 2000, path: block-and-fix-pattern, reason: "com {{dlqPending|number}} mensagens paradas o defeito claramente já está nos outros parsers; corrigir só este PR deixa o mesmo risco de paciente errado nos {{labsLegacy}} laboratórios legados" }

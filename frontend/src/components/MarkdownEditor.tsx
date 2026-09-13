@@ -2,6 +2,18 @@ import { useState } from 'react'
 import { Markdown } from './Markdown'
 import './editor.css'
 
+/** Conta palavras do texto, não da marcação: marcadores de título, lista e ênfase não são palavras escritas. */
+function countWords(text: string): number {
+  const prose = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, ' ')
+    .replace(/^\s*[-*+]\s+/gm, ' ')
+    .replace(/^\s*\d+[.)]\s+/gm, ' ')
+    .replace(/[*_`>|]/g, ' ')
+    .trim()
+  return prose ? prose.split(/\s+/).length : 0
+}
+
 /**
  * Editor de markdown com pré-visualização. As seções obrigatórias (## Impacto, ## Decisão…) aparecem como
  * atalhos porque a rubrica avalia presença de seção: o atalho ensina o formato esperado enquanto se escreve.
@@ -22,7 +34,7 @@ export function MarkdownEditor({
   id?: string
 }) {
   const [preview, setPreview] = useState(false)
-  const words = value.trim() ? value.trim().split(/\s+/).length : 0
+  const words = countWords(value)
 
   function appendSection(name: string) {
     const heading = `## ${name}`

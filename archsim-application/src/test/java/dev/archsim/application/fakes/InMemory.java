@@ -84,8 +84,8 @@ public final class InMemory {
         private final CompanyRepository companies;
         private final ObservabilityDatasetFactory factory = new ObservabilityDatasetFactory(List.of(new SlowQueryDatasetGenerator(), new IncidentDatasetGenerator(), new CapacityDatasetGenerator(), new EmptyDatasetGenerator()));
         public Datasets(CompanyRepository companies) { this.companies = companies; }
-        @Override public ObservabilityDataset datasetFor(Case c) {
-            return factory.generate(c, companies.findById(c.companyId()).orElseThrow(), new SeededRandom(c.seed()));
+        @Override public ObservabilityDataset datasetFor(Case c, java.time.Instant recoveredAt) {
+            return factory.generate(c, companies.findById(c.companyId()).orElseThrow(), new SeededRandom(c.seed()), recoveredAt);
         }
     }
     public static final class RecordingSandbox implements SqlSandbox {

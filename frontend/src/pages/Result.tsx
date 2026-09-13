@@ -12,6 +12,7 @@ export function Result({ attempt }: { attempt: AttemptView }) {
   const evaluation = attempt.evaluation
   const theCase = attempt.theCase
   const [showReference, setShowReference] = useState(false)
+  const [startingFollowUp, setStartingFollowUp] = useState(false)
 
   if (!evaluation) {
     return (
@@ -152,6 +153,27 @@ export function Result({ attempt }: { attempt: AttemptView }) {
         <Panel title="O que você escreveu">
           <Markdown>{longestText(attempt)}</Markdown>
         </Panel>
+      )}
+
+      {attempt.followUp && (
+        <section className="follow-up">
+          <h2 className="follow-up__title">Duas semanas depois</h2>
+          <p className="follow-up__teaser">{attempt.followUp.teaser}</p>
+          <button
+            className="btn btn--primary"
+            type="button"
+            disabled={startingFollowUp}
+            onClick={() => {
+              setStartingFollowUp(true)
+              void api
+                .startCase(undefined, undefined, theCase.level, attempt.followUp!.templateId)
+                .then((next) => navigate(`/caso/${next.id}`))
+                .catch(() => setStartingFollowUp(false))
+            }}
+          >
+            {startingFollowUp ? 'Abrindo' : 'Ver a consequência'}
+          </button>
+        </section>
       )}
 
       <div className="result__actions">

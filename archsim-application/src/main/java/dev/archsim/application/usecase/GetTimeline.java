@@ -29,7 +29,7 @@ public class GetTimeline {
 
     public TimelineView execute(Command cmd) {
         var loaded = AttemptAccess.load(attempts, cases, cmd.userId(), cmd.attemptId());
-        ObservabilityDataset ds = datasets.datasetFor(loaded.theCase());
+        ObservabilityDataset ds = datasets.datasetFor(loaded.theCase(), loaded.attempt().resolvedAt().orElse(null));
         Company company = companies.findById(loaded.theCase().companyId()).orElseThrow();
         loaded.attempt().recordConsoleAction(new ConsoleAction(ConsoleActionKind.DEPLOYS_VIEW, "timeline", "deploys/flags/alerts/infra", clock.now()));
         attempts.save(loaded.attempt());

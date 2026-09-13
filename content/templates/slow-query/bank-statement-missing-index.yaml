@@ -293,6 +293,14 @@ scenario:
     sinceAt: "{{sinceHoursAgoAt}}"
     dropIndex: idx_ledger_account_created
     datastore: core-db
+followUps:
+  - path: cache-mitigation
+    template: bank-followup-cache-stale-statement
+    teaser: "Você escolheu servir o extrato do cache enquanto o índice era reconstruído. Duas semanas depois, o suporte começou a receber ligações sobre saldo errado. Quer ver o que aconteceu?"
+  - path: query-rewrite
+    template: bank-followup-cache-stale-statement
+    teaser: "A reescrita segurou a janela, e o time acabou adicionando cache por cima para dar conta do pico. Semanas depois isso cobrou o preço. Quer ver?"
+
 recommendation:
   default: composite-index
   rules:

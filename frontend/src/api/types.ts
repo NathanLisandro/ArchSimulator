@@ -175,6 +175,7 @@ export interface AttemptView {
   pendingStakeholderMessages: StakeholderMessage[]
   resolvedAt: string | null
   elapsedSeconds: number
+  followUp: { templateId: string; teaser: string } | null
 }
 
 export interface CompanySummary {

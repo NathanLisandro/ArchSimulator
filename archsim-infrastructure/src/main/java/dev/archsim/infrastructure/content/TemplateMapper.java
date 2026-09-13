@@ -62,6 +62,9 @@ final class TemplateMapper {
         List<CaseArtifact> artifacts = list(n, "artifacts").stream().map(a -> new CaseArtifact(req(a, "id", w), req(a, "title", w),
                 ArtifactKind.valueOf(opt(a, "kind", "CODE").toUpperCase()), opt(a, "language", "text"), req(a, "content", w))).toList();
 
+        List<FollowUp> followUps = list(n, "followUps").stream()
+                .map(f -> new FollowUp(req(f, "path", w), req(f, "template", w), req(f, "teaser", w))).toList();
+
         Set<ConsoleTool> tools = new LinkedHashSet<>();
         strings(n, "tools").forEach(t -> tools.add(ConsoleTool.valueOf(t.toUpperCase())));
         List<Level> levels = strings(n, "levels").stream().map(l -> Level.valueOf(l.toUpperCase())).toList();
@@ -69,7 +72,7 @@ final class TemplateMapper {
 
         return new CaseTemplate(id, CaseType.valueOf(req(n, "type", w).toUpperCase()), new CompanyId(req(n, "company", w)), levels,
                 strings(n, "competencies"), params, derived, narrative, checkpoints, paths, answerForm, opt(n, "reference", ""), scenario,
-                defaultPath, rules, tools, mitigations, stakeholders, artifacts);
+                defaultPath, rules, tools, mitigations, stakeholders, artifacts, followUps);
     }
 
     private ParameterSpec parameter(JsonNode v, String w) {

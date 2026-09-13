@@ -46,9 +46,13 @@ Requisitos: Java 25 (`JAVA_HOME` no JDK 25), Maven 3.8+, Node 20+, Docker (Postg
 
 ```bash
 docker compose up -d postgres
-mvn test                                   # 132 testes; integração via Testcontainers
+mvn test                                   # 135 testes; integração via Testcontainers
 mvn -pl archsim-infrastructure spring-boot:run
-cd frontend && npm install && npm run dev  # proxy para :8080 já configurado
+
+cd frontend
+npm install
+npm test                                   # 43 testes de componente e de cliente
+npm run dev                                # proxy para :8080 já configurado
 ```
 
 ---
@@ -58,24 +62,25 @@ cd frontend && npm install && npm run dev  # proxy para :8080 já configurado
 | | |
 |---|---|
 | Tipos de caso | 8, todos implementados com checkpoints, caminhos e rubricas próprias |
-| Templates de conteúdo | 11, em 2 empresas |
+| Empresas | 4: banco digital, e-commerce, logística e saúde |
+| Templates de conteúdo | 25, incluindo um caso de consequência de segunda ordem |
 | Causas raiz de incidente | 12, cada uma com assinatura própria em métricas, logs e traces |
 | Flashcards | 100 de base em 8 decks, mais os gerados por caso resolvido |
-| Testes | 132 (94 domínio, 19 aplicação, 19 infraestrutura) |
+| Testes | 178: 135 no backend (domínio, aplicação, integração) e 43 no frontend |
 | Decisões registradas | 9 ADRs em `docs/adr/` |
 
 ### Tipos de caso
 
 | Tipo | Console disponível | Conteúdo atual |
 |---|---|---|
-| Query lenta | SQL, métricas | índice removido no extrato, predicado não-sargável na agenda, cast implícito no PIX |
-| Incidente | logs, métricas, traces, SQL, deploys, infra | N+1 após deploy, lock longo da conciliação, retry storm no PIX |
-| ADR | — | agenda de recebíveis em tempo real |
-| Trade-off forçado | — | outbox contra commit em duas fases |
-| Design de solução | métricas | reserva de estoque no checkout na Black Friday |
-| Code review | — | controller de checkout com seis classes de problema |
-| Capacity planning | métricas de 90 dias, SQL, infra | teto de conexões do banco, com projeção composta |
-| Migração | SQL, métricas | batch noturno em stored procedure para processamento contínuo |
+| Query lenta | SQL, métricas | índice removido, predicado não-sargável, cast implícito, apuração de SLA analítica no transacional, grade de agenda recalculada por requisição |
+| Incidente | logs, métricas, traces, SQL, deploys, infra | N+1 após deploy, lock longo da conciliação, retry storm no PIX, hot partition na sincronização do app de motorista, auditoria síncrona travando o prontuário, cache servindo saldo velho |
+| ADR | — | agenda de recebíveis em tempo real, busca semântica com modelo de linguagem |
+| Trade-off forçado | — | outbox contra commit em duas fases, monólito modular contra microserviços |
+| Design de solução | métricas | reserva de estoque no checkout, ingestão de exames de 23 laboratórios sem trocar o paciente |
+| Code review | — | controller de checkout, parser de resultado de exame com risco clínico |
+| Capacity planning | métricas de 90 dias, SQL, infra | teto de conexões do banco, quota do provedor de mapas, Black Friday |
+| Migração | SQL, métricas | batch noturno em stored procedure, roteirização monolítica de 3h, trilha de auditoria de bilhões de linhas |
 
 ### Causas raiz de incidente
 
@@ -88,9 +93,27 @@ e erros de fundo em todos os serviços. A causa tem de ser encontrada, não adiv
 
 ### Empresas
 
-**Meridian Bank** (banco digital: PIX, cartão, ledger de 2,1 bilhões de linhas, conciliação D+1 com a CIP) e
-**Pangeia Commerce** (marketplace: catálogo, checkout, estoque, Black Friday). Logística e saúde entram como novos
-arquivos em `content/companies/`, sem mudar código.
+| Empresa | Domínio | O que a torna difícil |
+|---|---|---|
+| **Meridian Bank** | banco digital | PIX com SLA regulatório, ledger de 2,1 bilhões de linhas, conciliação D+1 com a CIP |
+| **Pangeia Commerce** | marketplace | catálogo volátil, checkout na Black Friday, estoque com item disputado |
+| **Rotamax Logística** | last mile | roteirização diária que não pode atrasar, app offline-first, multa por SLA de entrega |
+| **Vitalis Saúde Digital** | telemedicina | dado clínico com consequência, auditoria obrigatória, 23 laboratórios com identificadores próprios |
+
+Uma empresa nova é um arquivo novo em `content/companies/`, sem mudar código.
+
+### Consequências de segunda ordem
+
+Alguns caminhos têm continuação. Quem escolhe servir o extrato do cache durante a reconstrução do índice recebe, na
+tela de resultado, o convite para ver o que aconteceu duas semanas depois: o cache servindo saldo que não existe mais,
+porque a invalidação ficou pendente. A lição não é sobre cache; é sobre mitigação que vira permanente sem o alarme que
+ela exigia.
+
+### Mitigação muda a telemetria
+
+Em incidentes, aplicar uma mitigação que resolve faz os gráficos se recuperarem e os erros pararem, a partir daquele
+instante. O pico do incidente continua no gráfico: o passado não muda, e é ele que vai para a linha do tempo do
+post-mortem.
 
 ### Mini-linguagem de logs
 
@@ -183,14 +206,11 @@ O projeto pratica o que ensina: as decisões estão em `docs/adr/`.
 
 Nada disso bloqueia o uso, mas está mapeado:
 
-- **Conteúdo.** Duas empresas de quatro (faltam logística e saúde) e 11 templates. A meta de cinco templates por tipo
-  por contexto pede outros 40 ou mais arquivos YAML. Não exige código.
-- **Casos de segunda ordem.** Gerar um caso de acompanhamento a partir da decisão anterior ("você escolheu cache; duas
-  semanas depois…").
-- **Mitigações que alteram os gráficos.** Hoje a mitigação muda o estado e o texto do feedback; os gráficos ainda não
-  refletem a recuperação em tempo real.
-- **Módulo de IA do currículo.** O MBA cobre RAG, agentes e custo de tokens; os flashcards tocam no tema, mas ainda não
-  há tipo de caso dedicado.
+- **Mais conteúdo.** São 25 templates, entre dois e cinco por tipo. Mais casos por tipo e por empresa é só escrever
+  mais YAML: o `ContentValidationTest` gera cada template com 15 sementes em todos os níveis e reprova o que estiver
+  inconsistente.
+- **Agentes e RAG como tipo próprio.** O módulo de IA do MBA está coberto por um ADR de busca semântica e por
+  flashcards de custo de token e segurança, mas não há tipo de caso dedicado a arquitetura de agentes.
 - **Autenticação.** Usuário e senha locais com sessão. Sem recuperação de senha nem OAuth, por escolha.
-- **Testes de frontend.** O backend tem 132 testes; a interface foi verificada manualmente e por captura de tela, sem
-  suíte automatizada.
+- **Teste de ponta a ponta automatizado.** O fluxo completo foi verificado no navegador a cada fase, com capturas de
+  tela, mas não há suíte de navegador no CI.

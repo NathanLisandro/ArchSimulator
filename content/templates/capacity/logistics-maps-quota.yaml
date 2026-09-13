@@ -1,0 +1,293 @@
+id: logistics-capacity-maps-quota
+type: CAPACITY_PLANNING
+company: logistica
+levels: [PLENO, SENIOR, STAFF]
+competencies: [capacity, caching, cloud, system-design]
+tools: [METRICS, SQL, INFRA]
+parameters:
+  growthPercent: { range: [5, 16], step: 1 }
+  monthlyCalls: { range: [2600000, 3900000], step: 100000 }
+  hitRate: { range: [58, 88], step: 2 }
+  costPerThousand: { range: [4, 14], step: 1 }
+  horizonMonths: { range: [6, 15], step: 3 }
+derived:
+  quota: "4000000"
+  monthsToQuota: "round(horizonMonths / 3)"
+  overageCost: "round(monthlyCalls * costPerThousand / 1000)"
+  addressesMissing: "round(monthlyCalls / 8)"
+narrative:
+  title: "Quota de geocodificação: {{monthlyCalls|compact}} chamadas de um teto de 4M"
+  symptom: |
+    O contrato com o provedor de mapas dá **4 milhões de chamadas por mês**. Em setembro foram
+    **{{monthlyCalls|number}}**, e no dia 20 o consumo já passava de 80% — no ano passado isso levou a uma fatura de
+    excedente de R$ {{overageCost|number}} e um dia com geocodificação desligada.
+
+    O cache do `geo-service` está com hit ratio de **{{hitRate}}%** e TTL de 30 dias. O volume de pacotes cresce
+    **{{growthPercent}}% ao mês**.
+
+    Entregue o plano para os próximos {{horizonMonths}} meses: quando o teto é estourado, quanto custa, e o que fazer.
+  businessContext: |
+    Endereço sem coordenada não entra na roteirização: o pacote fica no hub e vira atraso de SLA, com multa
+    contratual. Hoje há {{addressesMissing|compact}} endereços novos por mês, a maioria variação de um endereço que
+    já existe (complemento, abreviação, CEP com formato diferente). A tabela `addresses` tem 128 milhões de linhas,
+    com 90 milhões já geocodificadas.
+  hints:
+    - "Nem toda chamada ao provedor é inevitável: veja quantas são do mesmo endereço escrito de formas diferentes."
+    - "Hit ratio de cache e taxa de endereço novo são coisas diferentes; qual delas explica o volume?"
+    - "Compare o custo do excedente com o custo de guardar o resultado para sempre."
+checkpoints:
+  - id: decompose
+    question: "Por onde começa a análise do consumo?"
+    options:
+      - id: decompose-calls
+        label: "Separar as chamadas: endereço realmente novo, variação de endereço conhecido e miss de cache expirado"
+        verdict: GOOD
+        feedback: "Certo. As três têm soluções diferentes: endereço novo é inevitável, variação se resolve com normalização, e miss por expiração se resolve mudando onde o resultado é guardado. Sem separar, você compra quota a mais."
+      - id: raise-quota
+        label: "Negociar quota maior com o provedor"
+        verdict: RISKY
+        feedback: "É uma saída, e às vezes a certa. Mas com {{growthPercent}}% ao mês você renegocia de novo em poucos meses, e paga por chamadas que não precisaria fazer."
+      - id: increase-ttl
+        label: "Aumentar o TTL do cache de 30 para 90 dias"
+        verdict: RISKY
+        feedback: "Ajuda, e é barato. Mas coordenada de endereço não expira: o problema não é o TTL ser curto, é o resultado estar em cache volátil em vez de persistido."
+  - id: projection
+    question: "Com {{monthlyCalls|number}} chamadas e {{growthPercent}}% ao mês, quando o teto de 4M é estourado?"
+    options:
+      - id: compound
+        label: "Composto: chamadas × (1 + taxa)^meses, e some o efeito sazonal da Black Friday"
+        verdict: GOOD
+        feedback: "Sim. E aqui a sazonalidade importa tanto quanto a tendência: a Black Friday multiplica o volume por 5 durante duas semanas, então o estouro chega antes do que a curva suave sugere."
+      - id: linear
+        label: "Linear: soma {{growthPercent}}% do valor de hoje a cada mês"
+        verdict: BAD
+        feedback: "Linear subestima e ignora o pico sazonal. Você planejaria para o mês errado, e justamente o mês em que a operação menos pode parar."
+      - id: no-projection
+        label: "Esperar o alerta de 90% da quota"
+        verdict: BAD
+        feedback: "Do alerta de 90% até o teto sobram dias. Persistir geocodificação e normalizar endereço são mudanças de semanas, não de horas."
+  - id: failure-mode
+    question: "A quota estoura no dia 22. O que acontece com a operação?"
+    options:
+      - id: degrade-known
+        label: "Roteirizar com o que já está geocodificado e enfileirar o resto para quando a quota renovar"
+        verdict: GOOD
+        feedback: "Boa: degradação explícita e previsível. O pacote de endereço conhecido segue normal, e o operador do hub sabe exatamente quais ficaram parados e por quê."
+      - id: block-all
+        label: "Bloquear a roteirização até a quota renovar"
+        verdict: BAD
+        feedback: "Isso para a operação inteira por causa de {{addressesMissing|compact}} endereços novos, quando 90 milhões já estão resolvidos. A falha precisa ser proporcional ao que falta."
+      - id: silent-fail
+        label: "Deixar a chamada falhar e seguir sem coordenada"
+        verdict: BAD
+        feedback: "Pacote sem coordenada entra na rota errada ou some da sequência, e a falha só aparece na entrega. Falha silenciosa em roteirização vira multa de SLA sem ninguém entender o motivo."
+solutionPaths:
+  - id: persist-and-normalize
+    name: "Persistir a geocodificação e normalizar o endereço"
+    summary: "Gravar a coordenada em `addresses` para sempre, normalizar o endereço antes de consultar e usar o cache só como camada quente."
+    pros: ["Reduz o volume na origem, não o custo por chamada", "Coordenada não expira: guardar é barato", "Normalização derruba as variações do mesmo endereço"]
+    cons: ["Precisa de estratégia para endereço que muda de fato", "Normalização é código com casos de borda", "Backfill do que já foi consultado"]
+    bestWhen: "boa parte das chamadas é variação de endereço já conhecido — o padrão em base de CEP brasileiro"
+    rubric:
+      criteria:
+        - id: decomposition
+          name: "Consumo decomposto"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["variação", "variacao", "normaliz", "endereço novo", "endereco novo", "miss"], min: 2 }
+          missing: "Separe as chamadas em endereço novo, variação de endereço conhecido e miss de cache: cada uma tem solução diferente."
+          present: "Consumo decomposto por origem."
+        - id: projection
+          name: "Projeção com sazonalidade"
+          weight: 20
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToQuota", tolerance: 0.6 }
+            - { type: keyword, field: plan, anyOf: ["black friday", "sazonal", "pico", "composto"], min: 1 }
+          missing: "Projete com crescimento composto e inclua o pico sazonal, que antecipa o estouro."
+          present: "Projeção composta com sazonalidade."
+        - id: persistence
+          name: "Persistência da coordenada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["addresses", "persist", "grava", "permanente", "não expira", "nao expira"], min: 1 }
+          missing: "Coordenada de endereço não expira: descreva onde ela passa a ser guardada de forma permanente."
+          present: "Persistência definida."
+        - id: degradation
+          name: "Degradação quando faltar"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["degrada", "enfileira", "parcial", "fila", "operador"], min: 1 }
+          missing: "Defina o comportamento quando a quota acabar ou o provedor cair, e como o operador do hub fica sabendo."
+          present: "Degradação explícita definida."
+        - id: cost
+          name: "Custo comparado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["custo", "r$", "excedente", "fatura", "economia"], min: 1 }
+          missing: "Compare o custo do excedente (R$ {{overageCost|number}} no ano passado) com o esforço da mudança."
+          present: "Custo comparado."
+  - id: negotiate-quota
+    name: "Renegociar a quota com o provedor"
+    summary: "Ampliar o contrato para o volume projetado do horizonte e manter a arquitetura atual."
+    pros: ["Resolve em uma negociação", "Nenhuma mudança de código", "Previsível no orçamento"]
+    cons: ["Paga por chamadas evitáveis", "Renegociação recorrente com {{growthPercent}}% ao mês", "Não reduz a dependência de um fornecedor único"]
+    bestWhen: "o time não tem capacidade para a mudança agora e o custo da quota maior é menor que o do atraso"
+    rubric:
+      criteria:
+        - id: projection
+          name: "Projeção que embasa a negociação"
+          weight: 30
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToQuota", tolerance: 0.6 }
+            - { type: keyword, field: plan, anyOf: ["composto", "pico", "sazonal", "horizonte"], min: 1 }
+          missing: "Negociar sem projeção é chutar: mostre o volume esperado no horizonte, com sazonalidade."
+          present: "Projeção sólida para a negociação."
+        - id: waste
+          name: "Desperdício reconhecido"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["evitáv", "evitav", "variação", "variacao", "desperdíc", "desperdic", "normaliz"], min: 1 }
+          missing: "Reconheça quanto do volume é evitável: você vai pagar por isso pelos próximos {{horizonMonths}} meses."
+          present: "Desperdício quantificado."
+        - id: lock-in
+          name: "Dependência do fornecedor"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["fornecedor", "provedor", "alternativ", "lock", "segundo"], min: 1 }
+          missing: "Um fornecedor único para função crítica é risco: registre a alternativa ou por que ela não vale."
+          present: "Risco de fornecedor considerado."
+        - id: degradation
+          name: "Degradação quando faltar"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["degrada", "enfileira", "fila", "parcial"], min: 1 }
+          missing: "Mesmo com quota maior, defina o que acontece quando o provedor cair."
+          present: "Degradação definida."
+  - id: second-provider
+    name: "Segundo provedor com roteamento por custo"
+    summary: "Adicionar um provedor alternativo e distribuir as chamadas por custo, disponibilidade e qualidade do resultado."
+    pros: ["Elimina o fornecedor único", "Absorve o pico sem excedente", "Cria referência de qualidade"]
+    cons: ["Duas integrações para manter", "Coordenadas divergentes entre provedores", "Complexidade no roteamento"]
+    bestWhen: "a dependência do fornecedor único já causou parada e o volume justifica manter dois contratos"
+    rubric:
+      criteria:
+        - id: divergence
+          name: "Divergência entre provedores"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["diverg", "qualidade", "comparar", "precisão", "precisao", "conflito"], min: 1 }
+          missing: "Dois provedores devolvem coordenadas diferentes para o mesmo endereço: diga qual vale e como isso é medido."
+          present: "Divergência tratada."
+        - id: routing
+          name: "Critério de roteamento"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["custo", "disponibilidade", "fallback", "roteamento", "percentual"], min: 1 }
+          missing: "Descreva o critério que decide qual provedor recebe cada chamada."
+          present: "Critério de roteamento definido."
+        - id: projection
+          name: "Projeção"
+          weight: 25
+          evidence:
+            - { type: number, field: monthsToLimit, expected: "monthsToQuota", tolerance: 0.6 }
+          missing: "Declare quando o teto atual é estourado, com crescimento composto."
+          present: "Projeção declarada."
+        - id: still-reduce
+          name: "Redução de volume também"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["normaliz", "persist", "cache", "reduzir"], min: 1 }
+          missing: "Dois provedores sem reduzir volume dobra o contrato e mantém o desperdício."
+          present: "Redução de volume prevista."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: bottleneck
+      label: "Primeiro limite a ser atingido"
+      type: SELECT
+      required: true
+      options:
+        - { value: maps-quota, label: "Quota mensal do provedor de mapas" }
+        - { value: redis-memory, label: "Memória do Redis" }
+        - { value: geo-db-cpu, label: "CPU do geo-db" }
+        - { value: routing-window, label: "Janela do job de roteirização" }
+    - id: monthsToLimit
+      label: "Meses até estourar a quota"
+      type: NUMBER
+      required: true
+    - id: avoidableShare
+      label: "Percentual do volume que você considera evitável"
+      type: NUMBER
+      required: true
+    - id: solutionPath
+      label: "Plano principal"
+      type: SELECT
+      required: true
+      options:
+        - { value: persist-and-normalize, label: "Persistir e normalizar" }
+        - { value: negotiate-quota, label: "Renegociar a quota" }
+        - { value: second-provider, label: "Segundo provedor" }
+    - id: plan
+      label: "Plano de capacidade"
+      type: MARKDOWN
+      required: true
+      help: "Decomposição do consumo, projeção, ação, degradação e custo."
+reference: |
+  ## Decomposição do consumo
+  Das {{monthlyCalls|number}} chamadas do mês, três origens:
+
+  | Origem | Parcela aproximada | Evitável? |
+  |---|---|---|
+  | Endereço realmente novo | ~15% | Não |
+  | Variação de endereço já conhecido (complemento, abreviação, CEP com máscara diferente) | ~55% | Sim, com normalização |
+  | Miss de cache por expiração de TTL de um endereço já geocodificado | ~30% | Sim, persistindo o resultado |
+
+  O hit ratio de {{hitRate}}% engana: ele mede acerto no Redis, não acerto no que já sabemos. A coluna `geocoded_at`
+  em `addresses` mostra 90 milhões de endereços já resolvidos, mas o serviço consulta o provedor de novo quando a
+  chave do cache não bate exatamente.
+
+  ## Projeção
+  `chamadas(m) = {{monthlyCalls}} × (1 + {{growthPercent}}/100)^m`, cruzando 4 milhões por volta do mês
+  **{{monthsToQuota}}**. Mas a Black Friday multiplica o volume por 5 por duas semanas: se ela cair antes disso, o
+  estouro acontece lá, não na data da curva suave. Planeje para o pico, não para a média.
+
+  ## Plano
+  **Semanas 1 e 2 — normalização.** Chave canônica de endereço: CEP sem máscara, logradouro sem abreviação, número
+  separado do complemento. A consulta ao cache e a `addresses` passa a usar essa chave. Sozinha, derruba a maior
+  parcela evitável.
+
+  **Semanas 2 e 3 — persistência.** A coordenada vai para `addresses.latitude/longitude` com `geocoded_at`, e o Redis
+  vira camada quente com TTL curto. Coordenada não expira; o que expira é a confiança, e para isso basta um job que
+  revalide endereços com mais de dois anos, em ritmo baixo.
+
+  **Semana 4 — degradação explícita.** Sem quota ou com o provedor fora: roteiriza com o que está geocodificado,
+  enfileira o restante em `lab-file-ingest` equivalente para geo, e o painel do hub mostra "N pacotes aguardando
+  endereço", com o motivo.
+
+  **Contínuo — gatilhos.**
+
+  | Métrica | Gatilho | Ação |
+  |---|---|---|
+  | Consumo da quota | > 60% no dia 15 | acionar plano de contenção |
+  | Parcela evitável | > 25% após a normalização | revisar a chave canônica |
+  | Falha do provedor | > 1% por 10 min | degradar para fila e avisar operação |
+
+  ## Custo
+  Excedente do ano passado: R$ {{overageCost|number}}. A normalização e a persistência custam cerca de três semanas
+  de uma pessoa e derrubam o volume abaixo do teto contratado, sem renegociação. Se ainda assim faltar, a quota maior
+  passa a ser uma decisão de orçamento e não de emergência.
+scenario:
+  kind: capacity
+  params:
+    service: geo-service
+    datastore: geo-db
+    growthPercentPerMonth: "{{growthPercent}}"
+    currentPeakRps: "420"
+    headroomMetric: read_iops
+    headroomLimit: "12000"
+    headroomNow: "6400"
+    storageNowGb: "1800"
+recommendation:
+  default: persist-and-normalize
+  rules:
+    - { param: hitRate, op: ">=", value: 82, path: negotiate-quota, reason: "com hit ratio de {{hitRate}}% a margem de otimização já é pequena; o volume vem de endereço novo de verdade, e aí a quota maior é a resposta honesta" }

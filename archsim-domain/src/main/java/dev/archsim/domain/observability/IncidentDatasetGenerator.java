@@ -23,16 +23,25 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
     private static final Duration WINDOW = Duration.ofHours(6);
     private static final Duration STEP = Duration.ofMinutes(1);
     private static final int BASELINE_LOG_LINES_PER_SERVICE = 1200;
+    /** Quanto tempo a telemetria leva para voltar ao normal depois de uma mitigação que resolve. */
+    private static final Duration RECOVERY = Duration.ofMinutes(4);
 
     @Override public String kind() { return "incident"; }
 
     @Override
     public ObservabilityDataset generate(Case theCase, Company company, RandomSource random) {
+        return generate(theCase, company, random, null);
+    }
+
+    @Override
+    public ObservabilityDataset generate(Case theCase, Company company, RandomSource random, Instant recoveredAt) {
         ScenarioSpec sc = theCase.scenario();
         IncidentRootCause cause = IncidentRootCause.of(sc.param("rootCause"));
         Instant now = theCase.generatedAt();
         Instant onset = Instant.parse(sc.param("onsetAt"));
-        TimeWindow window = new TimeWindow(now.minus(WINDOW), now);
+        // O tempo anda enquanto o incidente é respondido: quando há mitigação, a janela avança para mostrar a recuperação.
+        Instant end = recoveredAt == null ? now : latest(now, recoveredAt.plus(RECOVERY).plus(Duration.ofMinutes(6)));
+        TimeWindow window = new TimeWindow(end.minus(WINDOW), end);
         String service = sc.param("service");
         String datastore = sc.paramOr("datastore", company.architecture().datastores().isEmpty() ? "core-db" : company.architecture().datastores().getFirst().name());
         double p99Before = Double.parseDouble(sc.paramOr("p99Before", "180"));
@@ -49,7 +58,7 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
         List<Alert> alerts = new ArrayList<>();
 
         Signature signature = new Signature(sc, cause, company, window, builder, metrics, logs, traces, logLines, traceList, alerts,
-                random.fork("signature"), onset, service, datastore, p99Before, p99After, now);
+                random.fork("signature"), onset, service, datastore, p99Before, p99After, now, recoveredAt);
         signature.paint();
 
         // Healthy traces so the slow ones have to be found, not just read.
@@ -97,15 +106,17 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
         private final double p99After;
         private final Instant now;
         private final Instant rampEnd;
+        /** Instante em que a mitigação do usuário resolveu o incidente; nulo enquanto ele segue aberto. */
+        private final Instant recoveredAt;
 
         Signature(ScenarioSpec sc, IncidentRootCause cause, Company company, TimeWindow window, SeriesBuilder builder,
                   Map<String, MetricSeries> metrics, LogGenerator logs, TraceGenerator traces, List<LogEntry> logLines,
                   List<Trace> traceList, List<Alert> alerts, RandomSource random, Instant onset, String service,
-                  String datastore, double p99Before, double p99After, Instant now) {
+                  String datastore, double p99Before, double p99After, Instant now, Instant recoveredAt) {
             this.sc = sc; this.cause = cause; this.company = company; this.window = window; this.builder = builder;
             this.metrics = metrics; this.logs = logs; this.traces = traces; this.logLines = logLines; this.traceList = traceList;
             this.alerts = alerts; this.random = random; this.onset = onset; this.service = service; this.datastore = datastore;
-            this.p99Before = p99Before; this.p99After = p99After; this.now = now;
+            this.p99Before = p99Before; this.p99After = p99After; this.now = now; this.recoveredAt = recoveredAt;
             this.rampEnd = onset.plus(Duration.ofMinutes(8));
         }
 
@@ -286,8 +297,15 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
             put(svc, "latency_p50", "ms", Shape.ramp(onset, rampEnd, p99Before * 0.3, p99After * 0.35), p99Before * 0.15);
         }
 
+        /**
+         * Toda métrica degradada passa por aqui. Quando o incidente foi mitigado, a forma volta ao valor que ela
+         * tinha logo antes do início — é assim que a ação do usuário aparece no gráfico.
+         */
         private void put(String svc, String metric, String unit, Shape shape, double noise) {
-            MetricSeries s = builder.series(svc, metric, unit, shape, noise);
+            Shape painted = recoveredAt == null
+                    ? shape
+                    : shape.recoveringTo(Shape.constant(shape.valueAt(onset.minusSeconds(60))), recoveredAt, RECOVERY);
+            MetricSeries s = builder.series(svc, metric, unit, painted, noise);
             metrics.put(s.key(), s);
         }
 
@@ -295,8 +313,11 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
             Map<String, String> all = new LinkedHashMap<>(fields);
             all.putIfAbsent("pod", service + "-" + random.nextInt(1, 4));
             all.putIfAbsent("endpoint", sc.paramOr("endpoint", "/v1/resource"));
-            logLines.addAll(logs.incidentLines(service, onset, perMinute, level, messages, Math.round(p99After), Map.copyOf(all), List.of()));
+            Instant until = recoveredAt == null ? window.to() : min(window.to(), recoveredAt.plus(RECOVERY));
+            logLines.addAll(logs.incidentLines(service, onset, until, perMinute, level, messages, Math.round(p99After), Map.copyOf(all), List.of()));
         }
+
+        private static Instant min(Instant a, Instant b) { return a.isBefore(b) ? a : b; }
 
         private void dominatedTrace(String slowOperation, long slowMs, Map<String, String> tags) {
             long seconds = Math.max(60, Duration.between(onset, now).getSeconds());
@@ -311,6 +332,8 @@ public final class IncidentDatasetGenerator implements ScenarioDatasetGenerator 
             alerts.add(new Alert(onset.plus(Duration.ofMinutes(random.nextInt(2, 6))), name, svc, severity, description, null));
         }
     }
+
+    private static Instant latest(Instant a, Instant b) { return a.isAfter(b) ? a : b; }
 
     /** The endpoint in the scenario may already carry the verb ("GET /accounts/{id}/statement"). */
     private static String operationName(ScenarioSpec sc) {

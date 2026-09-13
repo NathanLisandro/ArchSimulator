@@ -1,0 +1,320 @@
+id: health-design-lab-integration
+type: SOLUTION_DESIGN
+company: saude
+levels: [PLENO, SENIOR, STAFF]
+competencies: [system-design, eda, microservices, security, ddd]
+tools: [METRICS]
+parameters:
+  labs: { range: [23, 60], step: 1 }
+  resultsPerDay: { range: [180000, 900000], step: 20000 }
+  legacyShare: { range: [15, 45] }
+  mismatchPerWeek: { range: [4, 60], step: 2 }
+  driver:
+    group:
+      - { driver: "a expansão contratada leva a plataforma de 23 para {{labs}} laboratórios em seis meses, e o padrão atual não escala", driverNote: "cada integração nova leva hoje seis semanas de trabalho manual" }
+      - { driver: "um resultado foi anexado ao paciente errado e virou notificação de evento adverso; a diretoria pediu um desenho que impeça isso por construção", driverNote: "a auditoria quer rastreabilidade de ponta a ponta" }
+      - { driver: "o maior laboratório vai migrar de arquivo por SFTP para FHIR, e os outros vão seguir em ritmos diferentes", driverNote: "os dois formatos vão conviver por pelo menos um ano" }
+derived:
+  resultsPerSecond: "round(resultsPerDay / 43200)"
+  legacyLabs: "round(labs * legacyShare / 100)"
+narrative:
+  title: "Design: ingestão de resultados de {{labs}} laboratórios sem trocar o paciente"
+  symptom: |
+    Hoje cada laboratório tem um parser próprio, com identificador de paciente próprio, e a conciliação passa por uma
+    tabela mantida à mão. São **{{mismatchPerWeek}} divergências de identidade por semana** que chegam à revisão
+    manual, e pelo menos uma delas por mês é descoberta tarde demais.
+
+    O gatilho: {{driver}} — {{driverNote}}.
+
+    Desenhe a solução de ingestão: como o resultado entra, como o paciente é identificado, o que acontece quando a
+    identificação é ambígua, e como o médico fica sabendo. Entregue o desenho e a descrição.
+  businessContext: |
+    São ~{{resultsPerDay|number}} resultados por dia ({{resultsPerSecond}} por segundo no horário comercial), sendo
+    {{legacyShare}}% em arquivo posicional por SFTP de cerca de {{legacyLabs}} laboratórios, e o restante em FHIR R4.
+    Resultado anexado ao paciente errado é evento adverso com notificação obrigatória. Resultado que não chega é
+    exame refeito e consulta remarcada. As duas falhas têm custo clínico, e são falhas diferentes.
+  hints:
+    - "Identificar o paciente e processar o resultado são problemas separados; misturá-los é o que gera o erro de hoje."
+    - "O que o sistema deve fazer quando a identificação é ambígua? A resposta 'escolher o mais provável' tem um custo."
+    - "Formato do laboratório é detalhe de fronteira; o miolo não deveria conhecê-lo."
+checkpoints:
+  - id: boundary
+    question: "Onde entra a diferença entre arquivo posicional e FHIR?"
+    options:
+      - id: adapter-boundary
+        label: "Só na borda: cada laboratório tem um adaptador que traduz para um modelo canônico interno"
+        verdict: GOOD
+        feedback: "Certo. Com {{labs}} laboratórios e dois formatos convivendo, o miolo precisa falar uma língua só. Adaptador por laboratório é o único lugar que conhece o layout, e integrar o próximo vira escrever um adaptador, não tocar no fluxo."
+      - id: everywhere
+        label: "No fluxo inteiro: cada formato tem seu caminho até o prontuário"
+        verdict: BAD
+        feedback: "É o padrão de hoje, e é o que faz cada integração custar seis semanas e repetir os mesmos defeitos. A regra clínica passa a existir em {{labs}} versões levemente diferentes."
+      - id: convert-all
+        label: "Converter tudo para FHIR na entrada, inclusive o legado"
+        verdict: RISKY
+        feedback: "Defensável, e tem a vantagem de usar um padrão conhecido. O risco é FHIR ser mais rico do que o arquivo legado permite preencher: você acaba com documentos válidos e incompletos, e a falta aparece depois, no prontuário."
+  - id: identity
+    question: "Como o resultado é ligado ao paciente?"
+    options:
+      - id: explicit-mapping
+        label: "Por um vínculo explícito criado no pedido do exame: o identificador do laboratório é registrado quando o pedido é feito"
+        verdict: GOOD
+        feedback: "Essa é a inversão que resolve o problema por construção. Se o vínculo nasce no **pedido**, o resultado só precisa devolvê-lo. Não há adivinhação na volta, e o caso ambíguo deixa de existir no caminho feliz."
+      - id: document-match
+        label: "Pelo documento do paciente, com nome como reserva"
+        verdict: BAD
+        feedback: "É o que existe hoje, e é a origem das {{mismatchPerWeek}} divergências semanais. Documento vem com formatação diferente por laboratório, e nome tem homônimo: a reserva por nome é exatamente onde o resultado vai para o paciente errado."
+      - id: probabilistic
+        label: "Casamento probabilístico com pontuação de similaridade"
+        verdict: RISKY
+        feedback: "Funciona para conciliação em massa de bases legadas, com revisão humana. Como caminho principal de um resultado clínico, transforma uma dúvida em decisão silenciosa: o sistema escolhe e ninguém sabe que houve escolha."
+  - id: ambiguity
+    question: "A identificação é ambígua mesmo assim. O que o sistema faz?"
+    options:
+      - id: quarantine
+        label: "Coloca em quarentena com motivo, avisa o laboratório e a clínica, e não anexa a ninguém"
+        verdict: GOOD
+        feedback: "Sim. Em saúde, não anexar é sempre mais seguro que anexar errado. A quarentena precisa ter fila visível, prazo e responsável, senão vira a DLQ silenciosa de hoje."
+      - id: best-guess
+        label: "Anexa ao mais provável e marca para revisão"
+        verdict: BAD
+        feedback: "O resultado já está no prontuário quando a revisão acontece, e o médico pode tê-lo lido. A marcação não desfaz a decisão clínica tomada com base no dado errado."
+      - id: discard
+        label: "Descarta e espera o laboratório reenviar"
+        verdict: BAD
+        feedback: "Descartar é perder exame que o paciente já fez. Ele vai ser refeito, ou pior, o médico decide sem ele. Quarentena guarda o dado e torna a falha visível."
+solutionPaths:
+  - id: canonical-with-order-link
+    name: "Modelo canônico com vínculo criado no pedido"
+    summary: "Adaptador por laboratório traduz para um evento canônico; o identificador do laboratório é registrado no momento do pedido, e o resultado só o devolve. Ambiguidade vai para quarentena."
+    pros: ["Elimina a adivinhação no caminho feliz", "Integrar laboratório novo vira escrever adaptador", "Falha fica visível e recuperável"]
+    cons: ["Depende de o laboratório devolver o identificador do pedido", "Exige quarentena operada de verdade", "Migração dos laboratórios atuais é gradual"]
+    bestWhen: "existe um pedido de exame antes do resultado, o que é o caso em praticamente toda telemedicina"
+    rubric:
+      criteria:
+        - id: boundary
+          name: "Fronteira no desenho"
+          weight: 20
+          evidence:
+            - { type: graph, check: NODE_OF_TYPE, value: queue, min: 1 }
+            - { type: graph, check: NO_SYNC_EDGE, from: lab, to: ehr }
+          missing: "O desenho precisa de uma fila entre a ingestão e o prontuário, e nenhum caminho síncrono do laboratório direto para o prontuário."
+          present: "Fronteira e desacoplamento presentes no desenho."
+        - id: identity
+          name: "Identidade por vínculo"
+          weight: 25
+          evidence:
+            - { type: choice, field: identityStrategy, anyOf: [order-link] }
+            - { type: keyword, field: design, anyOf: ["pedido", "external_id", "vínculo", "vinculo", "na ida"], min: 1 }
+          missing: "Descreva o vínculo criado no pedido do exame e como o resultado o devolve, em vez de ser reconciliado na volta."
+          present: "Identidade resolvida por vínculo no pedido."
+        - id: ambiguity
+          name: "Quarentena operada"
+          weight: 20
+          evidence:
+            - { type: choice, field: ambiguityPolicy, anyOf: [quarantine] }
+            - { type: keyword, field: design, anyOf: ["quarentena", "revisão", "revisao", "prazo", "responsáv", "responsav", "fila visível", "fila visivel"], min: 1 }
+          missing: "Quarentena sem dono e sem prazo vira DLQ silenciosa: diga quem olha, em quanto tempo e como o laboratório é avisado."
+          present: "Quarentena com dono e prazo."
+        - id: idempotency
+          name: "Idempotência e ordem"
+          weight: 15
+          evidence:
+            - { type: keyword, field: design, anyOf: ["idempot", "dedup", "reenvi", "retificação", "retificacao", "versão", "versao"], min: 1 }
+          missing: "Laboratório reenvia e retifica resultado: descreva a idempotência e o que acontece quando chega uma versão corrigida."
+          present: "Reenvio e retificação tratados."
+        - id: notification
+          name: "Quem fica sabendo"
+          weight: 10
+          evidence:
+            - { type: keyword, field: design, anyOf: ["médico", "medico", "notifica", "paciente", "avisa", "prontuário", "prontuario"], min: 1 }
+          missing: "Resultado que chega sem ninguém ver é resultado perdido: descreva como médico e paciente são avisados."
+          present: "Avisos definidos."
+        - id: resilience
+          name: "Resiliência"
+          weight: 10
+          evidence:
+            - { type: keyword, field: design, anyOf: ["retry", "dlq", "alarme", "timeout", "reprocess"], min: 2 }
+          missing: "Descreva retry, DLQ com alarme e reprocessamento."
+          present: "Resiliência descrita."
+  - id: fhir-normalization
+    name: "Normalizar tudo para FHIR na borda"
+    summary: "Converter o legado para FHIR R4 no adaptador e usar o próprio padrão como modelo canônico, com identificadores FHIR para paciente e pedido."
+    pros: ["Padrão de mercado, com ferramentas e validação prontas", "Facilita interoperabilidade futura", "Um único vocabulário clínico"]
+    cons: ["Arquivo legado não tem tudo o que o FHIR espera", "Perfis e extensões viram trabalho de modelagem", "Curva de aprendizado do time"]
+    bestWhen: "a maior parte do volume já é FHIR e a interoperabilidade externa é requisito declarado"
+    rubric:
+      criteria:
+        - id: gaps
+          name: "Lacunas do legado enfrentadas"
+          weight: 30
+          evidence:
+            - { type: keyword, field: design, anyOf: ["falta", "lacuna", "incomplet", "obrigatóri", "obrigatori", "extensão", "extensao"], min: 1 }
+          missing: "Converter arquivo posicional em FHIR gera documento válido e incompleto: diga o que falta e como isso fica explícito em vez de virar campo vazio."
+          present: "Lacunas do legado tratadas."
+        - id: identity
+          name: "Identidade"
+          weight: 25
+          evidence:
+            - { type: choice, field: identityStrategy, anyOf: [order-link] }
+          missing: "Mesmo em FHIR, a identidade precisa vir do vínculo criado no pedido, não de casamento na volta."
+          present: "Identidade por vínculo."
+        - id: boundary
+          name: "Desacoplamento no desenho"
+          weight: 25
+          evidence:
+            - { type: graph, check: NODE_OF_TYPE, value: queue, min: 1 }
+          missing: "O desenho precisa de fila entre ingestão e prontuário."
+          present: "Desacoplamento presente."
+        - id: ambiguity
+          name: "Ambiguidade"
+          weight: 20
+          evidence:
+            - { type: choice, field: ambiguityPolicy, anyOf: [quarantine] }
+          missing: "Defina a quarentena para o caso ambíguo."
+          present: "Quarentena definida."
+  - id: incremental-adapters
+    name: "Adaptadores incrementais sobre o fluxo atual"
+    summary: "Manter o fluxo existente e extrair, um laboratório por vez, um adaptador que produz o evento canônico, começando pelos que mais geram divergência."
+    pros: ["Risco baixo por etapa", "Ganho mensurável desde o primeiro laboratório", "Não exige parar a expansão"]
+    cons: ["Dois fluxos convivendo por meses", "O problema de identidade só some quando o vínculo no pedido existir", "Exige disciplina para terminar"]
+    bestWhen: "a operação não pode parar e a divergência se concentra em poucos laboratórios"
+    rubric:
+      criteria:
+        - id: order
+          name: "Ordem justificada por dados"
+          weight: 30
+          evidence:
+            - { type: keyword, field: design, anyOf: ["divergência", "divergencia", "volume", "prioriza", "começa por", "comeca por"], min: 1 }
+          missing: "Diga por qual laboratório começa e por quê: quem gera mais divergência ou mais volume."
+          present: "Ordem de migração justificada."
+        - id: identity
+          name: "Identidade"
+          weight: 25
+          evidence:
+            - { type: choice, field: identityStrategy, anyOf: [order-link] }
+          missing: "O vínculo no pedido é o que resolve a identidade; sem ele, o adaptador só troca o formato do erro."
+          present: "Identidade por vínculo."
+        - id: coexistence
+          name: "Convivência dos dois fluxos"
+          weight: 25
+          evidence:
+            - { type: keyword, field: design, anyOf: ["conviv", "flag", "gradual", "dois fluxos", "paralelo"], min: 1 }
+          missing: "Descreva como os dois caminhos convivem e como se sabe qual laboratório está em qual."
+          present: "Convivência descrita."
+        - id: ambiguity
+          name: "Ambiguidade"
+          weight: 20
+          evidence:
+            - { type: choice, field: ambiguityPolicy, anyOf: [quarantine] }
+          missing: "Defina a quarentena para o caso ambíguo."
+          present: "Quarentena definida."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Abordagem"
+      type: SELECT
+      required: true
+      options:
+        - { value: canonical-with-order-link, label: "Modelo canônico com vínculo no pedido" }
+        - { value: fhir-normalization, label: "Normalizar tudo para FHIR na borda" }
+        - { value: incremental-adapters, label: "Adaptadores incrementais" }
+    - id: identityStrategy
+      label: "Como o paciente é identificado"
+      type: SELECT
+      required: true
+      options:
+        - { value: order-link, label: "Vínculo registrado no pedido do exame" }
+        - { value: document-match, label: "Documento, com nome como reserva" }
+        - { value: probabilistic, label: "Casamento probabilístico" }
+    - id: ambiguityPolicy
+      label: "O que fazer quando a identificação é ambígua"
+      type: SELECT
+      required: true
+      options:
+        - { value: quarantine, label: "Quarentena com motivo, aviso e prazo" }
+        - { value: best-guess, label: "Anexar ao mais provável e marcar para revisão" }
+        - { value: discard, label: "Descartar e aguardar reenvio" }
+    - id: diagram
+      label: "Desenho da solução"
+      type: DIAGRAM
+      required: false
+      help: "Arraste os componentes ou escreva um flowchart Mermaid. Ligações pontilhadas representam assincronia."
+    - id: design
+      label: "Descrição da solução"
+      type: MARKDOWN
+      required: true
+      help: "Fronteira, identidade, ambiguidade, idempotência, avisos e resiliência."
+reference: |
+  ## Desenho
+
+  ```mermaid
+  flowchart LR
+    lab[Laboratórios] -.->|arquivo ou FHIR| adapter[lab-adapter por laboratório]
+    adapter -.->|ResultReceived canônico| topic[[lab.results]]
+    topic -.-> ingest[lab-integration]
+    ingest --> ldb[(lab-db)]
+    ingest -.->|resultado vinculado| ehrTopic[[ehr.updated]]
+    ehrTopic -.-> ehr[ehr-service]
+    ingest -.->|ambíguo| quarantine[[lab.quarantine]]
+    quarantine -.-> review[Painel de revisão]
+    ingest -.-> notify[notification-service]
+  ```
+
+  ## Fronteira
+  Cada laboratório tem um **adaptador** que conhece o formato dele e mais nada. Ele traduz para um evento canônico
+  `ResultReceived` com: identificador do pedido no laboratório, código do painel, valores, unidade, faixa de
+  referência e instante da coleta. Integrar o laboratório {{labs}} passa a ser escrever um adaptador e um teste, sem
+  tocar no fluxo clínico. Os {{legacyLabs}} laboratórios em SFTP e os que já falam FHIR chegam ao mesmo evento.
+
+  ## Identidade, resolvida na ida
+  A causa das {{mismatchPerWeek}} divergências semanais é tentar descobrir o paciente **na volta**. O desenho inverte:
+
+  1. Quando o pedido de exame é criado, o `lab-integration` chama o laboratório e recebe o identificador dele,
+     gravando em `lab_orders.external_id` com `lab_id`. O vínculo nasce ali, com o paciente conhecido.
+  2. O resultado chega com esse identificador. A associação é uma busca exata em `idx_lab_orders_lab_external`.
+  3. Não há casamento por nome em lugar nenhum do fluxo.
+
+  Para os laboratórios que ainda não devolvem o identificador do pedido, o adaptador tenta o documento **normalizado**
+  (só dígitos) e, se não houver correspondência única, manda para quarentena. Nunca por nome.
+
+  ## Ambiguidade
+  Quarentena é uma fila com dono, prazo e painel: motivo da retenção, dados recebidos, candidatos possíveis e o
+  laboratório de origem. Prazo de 4 horas em horário comercial. O laboratório é notificado no mesmo movimento, porque
+  em boa parte dos casos a correção é dele. O resultado **não** entra no prontuário até a identidade ser resolvida.
+
+  ## Idempotência e retificação
+  Chave de idempotência por `(lab_id, external_id, panel_code, versão)`. Reenvio do mesmo resultado não duplica nada.
+  Retificação vem com versão maior: o prontuário guarda as duas, exibe a vigente e sinaliza que houve correção — em
+  saúde, apagar o valor anterior é perder informação clínica relevante.
+
+  ## Avisos
+  Resultado vinculado publica em `ehr.updated`; o `notification-service` avisa o paciente e coloca o resultado na
+  fila do médico solicitante. Resultado crítico (fora da faixa em painéis marcados) gera aviso imediato ao
+  profissional, não só a entrada no prontuário.
+
+  ## Resiliência
+  Retry com backoff no adaptador, DLQ por laboratório com alarme de quantidade **e** de idade da mensagem mais antiga,
+  e reprocessamento a partir do arquivo original guardado no S3. Alerta quando um laboratório para de enviar: silêncio
+  em integração clínica é tão grave quanto erro, e é mais difícil de perceber.
+
+  ## Capacidade
+  {{resultsPerDay|number}} resultados por dia dão ~{{resultsPerSecond}} por segundo em horário comercial. O gargalo
+  não é vazão, é o pico de arquivos grandes chegando juntos à noite: os adaptadores processam em streaming, linha a
+  linha, sem carregar o arquivo inteiro na memória.
+scenario:
+  kind: capacity
+  params:
+    service: lab-integration
+    datastore: lab-db
+    growthPercentPerMonth: "9"
+    currentPeakRps: "{{resultsPerSecond}}"
+    headroomMetric: active_connections
+    headroomLimit: "1600"
+    headroomNow: "780"
+    storageNowGb: "9000"
+recommendation:
+  default: canonical-with-order-link
+  rules:
+    - { param: legacyShare, op: ">=", value: 38, path: incremental-adapters, reason: "com {{legacyShare}}% do volume ainda em arquivo posicional, uma virada única exige que {{legacyLabs}} laboratórios mudem ao mesmo tempo; migrar um por vez entrega valor desde a primeira semana" }

@@ -28,7 +28,7 @@ public class GetTraces {
 
     public TracesView execute(Command cmd) {
         var loaded = AttemptAccess.load(attempts, cases, cmd.userId(), cmd.attemptId());
-        List<Trace> all = datasets.datasetFor(loaded.theCase()).traces();
+        List<Trace> all = datasets.datasetFor(loaded.theCase(), loaded.attempt().resolvedAt().orElse(null)).traces();
         List<Trace> selected = all.stream()
                 .filter(t -> cmd.traceId() == null || t.traceId().equals(cmd.traceId()))
                 .filter(t -> cmd.service() == null || t.rootService().equals(cmd.service())

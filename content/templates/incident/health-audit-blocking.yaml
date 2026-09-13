@@ -1,0 +1,347 @@
+id: health-incident-audit-blocking
+type: INCIDENT
+company: saude
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, characteristics, sre, security, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [3500, 14000], step: 500 }
+  onsetMinutesAgo: { range: [12, 40], step: 4 }
+  consultationsNow: { range: [900, 4200], step: 100 }
+  cause:
+    group:
+      - { causeText: "o `audit-db` entrou em autovacuum agressivo na tabela `access_log` de 4,1 bilhões de linhas, e a latência de escrita saiu de 3ms para 900ms", causeSource: "audit-db" }
+      - { causeText: "uma auditoria da LGPD pediu extração dos acessos dos últimos 6 meses, e a consulta está rodando no mesmo banco que recebe a gravação de auditoria", causeSource: "extração LGPD" }
+      - { causeText: "o `audit-service` subiu com o pool de conexões reduzido por engano de 40 para 4 em um ajuste de configuração", causeSource: "audit-service config" }
+derived:
+  p99Before: "round(p99 / 35)"
+  patientsWaiting: "round(consultationsNow / 3)"
+narrative:
+  title: "Prontuário travado: a auditoria está segurando o atendimento"
+  symptom: |
+    **{{onsetLabel}}** — o `ehr-service` está com p99 de **{{p99}}ms** (baseline ~{{p99Before}}ms) em
+    `GET /ehr/patients/{id}/summary`. Médicos em consulta por vídeo relatam que o prontuário "não abre".
+
+    Há **{{consultationsNow|number}} consultas em andamento** e cerca de {{patientsWaiting|number}} pacientes na sala
+    de espera virtual. O `scheduling-api` e o `video-gateway` estão normais.
+
+    {{causeText}}
+  businessContext: |
+    Toda leitura de dado clínico grava uma linha em `access_log` **antes** de responder: é requisito da LGPD e do CFM,
+    não opcional. A tabela tem 4,1 bilhões de linhas, retenção de 20 anos e nenhum particionamento. Consulta que não
+    acontece por falha do sistema é consulta paga que precisa ser reembolsada, e o médico já está com o paciente na tela.
+  hints:
+    - "Um serviço lento e os outros normais: o que os dois têm em comum que o resto não tem?"
+    - "Veja onde o tempo é gasto dentro de um request do prontuário."
+    - "Auditoria é obrigatória. A pergunta não é se grava, é quando e onde."
+checkpoints:
+  - id: where-time
+    question: "O prontuário está lento e o agendamento não. Qual o primeiro movimento?"
+    options:
+      - id: trace-first
+        label: "Abrir um trace do endpoint do prontuário para ver onde o tempo é gasto"
+        verdict: GOOD
+        feedback: "Certo. O trace mostra em segundos que a maior parte dos {{p99}}ms está em um span de escrita no `audit-db`, e não na leitura do prontuário. Isso redireciona toda a investigação."
+      - id: ehr-db
+        label: "Investigar o `ehr-db`, que é o banco do prontuário"
+        verdict: RISKY
+        feedback: "Instinto razoável, mas o dado aponta para outro lado: o `scheduling-api` também usa banco e está normal. Um trace custa 30 segundos e evita meia hora no banco errado."
+      - id: restart-ehr
+        label: "Reiniciar o `ehr-service`"
+        verdict: BAD
+        feedback: "Com {{consultationsNow|number}} consultas em andamento, reiniciar derruba sessões de vídeo em curso e não muda a dependência lenta. Médico e paciente perdem a consulta no meio."
+  - id: dependency
+    question: "O trace mostra 92% do tempo em `INSERT INTO access_log`. O que isso significa?"
+    options:
+      - id: sync-audit
+        label: "A auditoria é gravada de forma síncrona no caminho da leitura: a latência dela é a latência do prontuário"
+        verdict: GOOD
+        feedback: "Exato, e é a dívida técnica conhecida. Auditoria obrigatória não precisa ser síncrona: precisa ser garantida. São coisas diferentes, e confundi-las é o que coloca um banco de 4,1 bilhões de linhas no caminho crítico do atendimento."
+      - id: ehr-slow
+        label: "O prontuário está escrevendo demais"
+        verdict: BAD
+        feedback: "A escrita não é do prontuário: é da trilha de auditoria, em outro banco. O `ehr-db` está normal nas métricas."
+      - id: network
+        label: "Problema de rede entre os serviços"
+        verdict: RISKY
+        feedback: "Vale descartar, mas o span mostra o tempo **dentro** da operação de banco, não no trânsito. E o `scheduling-api` fala com a mesma rede sem degradar."
+  - id: regulatory
+    question: "Alguém sugere desligar a auditoria para destravar. O que você responde?"
+    options:
+      - id: no-but-async
+        label: "Não se desliga: torna-se assíncrona com garantia de entrega, e se a garantia falhar, o acesso é bloqueado"
+        verdict: GOOD
+        feedback: "Essa é a resposta certa. O requisito é que todo acesso fique registrado, não que o registro aconteça antes da resposta. Fila durável com confirmação preserva o requisito e tira o banco do caminho crítico."
+      - id: turn-off
+        label: "Desligar por 30 minutos e religar depois"
+        verdict: BAD
+        feedback: "Acesso a dado clínico sem registro é descumprimento de LGPD e do CFM, e cria um buraco na trilha que a auditoria vai encontrar. O incidente de disponibilidade viraria incidente regulatório, que é pior."
+      - id: sample
+        label: "Amostrar: registrar só 10% dos acessos enquanto durar"
+        verdict: BAD
+        feedback: "Amostragem serve para telemetria, não para trilha de auditoria. Noventa por cento dos acessos ficariam sem registro, e não há como saber depois quem viu o quê."
+mitigations:
+  - id: async-audit-buffer
+    label: "Gravar a auditoria em fila durável e confirmar de forma assíncrona"
+    description: "O acesso publica em `audit.access` com confirmação do broker; o consumidor grava no `audit-db`"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "O prontuário volta a ~{{p99Before}}ms em segundos e nenhum acesso deixa de ser registrado: a publicação é confirmada antes da resposta, e a gravação no banco acontece logo depois. Se o broker recusar, o acesso é negado, e isso é o comportamento correto."
+  - id: kill-extraction
+    label: "Encerrar a consulta de extração que roda no `audit-db`"
+    description: "pg_terminate_backend na sessão da extração"
+    verdict: GOOD
+    effect: PARTIAL
+    requiresDiagnosis: true
+    feedback: "Se a extração é a origem da lentidão, encerrar libera o banco em segundos. Combine com reprogramar a extração para a réplica: ela vai ser pedida de novo."
+  - id: scale-audit
+    label: "Escalar verticalmente o `audit-db`"
+    description: "Troca de classe com failover Multi-AZ"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "O failover derruba as conexões por 60 a 120 segundos. Com a auditoria no caminho crítico, isso significa prontuário indisponível para todo mundo, agora, para talvez melhorar depois."
+  - id: disable-audit
+    label: "Desativar temporariamente o registro de auditoria"
+    description: "Feature flag que pula a gravação"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Transforma um incidente de disponibilidade em um incidente regulatório. Acesso a prontuário sem registro é exatamente o que a LGPD e o CFM proíbem, e o buraco na trilha é permanente."
+  - id: queue-consultations
+    label: "Pausar novas entradas na sala de espera e avisar quem está na fila"
+    description: "Segura o ingresso de novas consultas, mantendo as em andamento"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Protege quem já está em atendimento e evita que mais pacientes entrem numa consulta que vai travar. Custa agendamentos perdidos, então precisa vir com mensagem clara e remarcação automática."
+  - id: restart-ehr
+    label: "Reiniciar os pods do `ehr-service`"
+    description: "Rollout restart"
+    verdict: BAD
+    effect: NONE
+    feedback: "Os pods esperam a dependência; reiniciá-los derruba consultas de vídeo em andamento e não altera a latência do `audit-db`."
+stakeholders:
+  - id: cmo
+    from: "Dra. Helena (Diretora médica)"
+    afterSeconds: 200
+    text: "Tenho médicos com paciente na tela sem conseguir ver o prontuário. Isso tem risco clínico. Qual a situação?"
+  - id: dpo
+    from: "Rafael (DPO)"
+    afterSeconds: 540
+    text: "Ouvi falar em desligar a auditoria. Preciso deixar claro: se um acesso não for registrado, temos incidente reportável. Confirma que não vamos fazer isso?"
+  - id: suporte
+    from: "Camila (Suporte)"
+    afterSeconds: 900
+    text: "As clínicas estão ligando. Posso orientar a remarcar ou digo para esperar?"
+solutionPaths:
+  - id: async-audit
+    name: "Auditoria assíncrona com garantia de entrega"
+    summary: "Publicar o evento de acesso em fila durável com confirmação antes da resposta, gravar no `audit-db` de forma assíncrona e negar o acesso se a publicação falhar."
+    pros: ["Tira o banco de 4,1 bilhões de linhas do caminho crítico", "Preserva integralmente o requisito regulatório", "Absorve picos de latência da auditoria"]
+    cons: ["Janela de segundos entre o acesso e a linha no banco", "Uma peça a mais no caminho de um requisito regulatório", "Exige reconciliação para provar que nada se perdeu"]
+    bestWhen: "o requisito é registrar tudo, não registrar antes de responder — o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [SYNC_AUDIT_IN_PATH] }
+          missing: "A causa raiz é a auditoria síncrona no caminho da leitura: a latência do `audit-db` vira a latência do prontuário."
+          present: "Causa raiz correta."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: TRACE_VIEW }
+            - { type: investigation, kind: METRICS_VIEW }
+          missing: "Mostre o span de escrita dominando o trace e o contraste com os serviços que não dependem da auditoria."
+          present: "Dependência comprovada por trace e métrica."
+        - id: guarantee
+          name: "Garantia preservada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["confirmação", "confirmacao", "ack", "durável", "duravel", "nega o acesso", "não perde", "nao perde"], min: 1 }
+            - { type: keyword, field: postMortem, anyOf: ["reconcilia", "conferência", "conferencia", "contagem", "auditoria da auditoria"], min: 1 }
+          missing: "Assíncrono não pode virar 'talvez': descreva a confirmação antes da resposta, o que acontece se ela falhar, e como se prova depois que nenhum acesso ficou sem registro."
+          present: "Garantia de registro preservada e verificável."
+        - id: mitigation
+          name: "Mitigação informada"
+          weight: 15
+          evidence:
+            - { type: mitigation, effect: RESOLVES, informed: true }
+          missing: "Faltou aplicar a mitigação que tira a auditoria do caminho crítico, depois de confirmar o diagnóstico."
+          present: "Mitigação aplicada com diagnóstico."
+        - id: communication
+          name: "Comunicação, inclusive com o DPO"
+          weight: 20
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+            - { type: keyword, field: postMortem, anyOf: ["dpo", "regulat", "lgpd", "cfm", "não desligamos", "nao desligamos"], min: 1 }
+          missing: "Com risco clínico e regulatório, comunique rápido e deixe registrado que a auditoria não foi desligada."
+          present: "Comunicação clínica e regulatória feita."
+  - id: isolate-audit-db
+    name: "Isolar a carga de leitura do `audit-db`"
+    summary: "Encerrar a extração no primário, mover consultas de auditoria para réplica e manter a gravação síncrona por enquanto."
+    pros: ["Alívio em segundos", "Nenhuma mudança no fluxo regulatório", "Baixo risco"]
+    cons: ["A auditoria continua no caminho crítico", "Qualquer lentidão futura do `audit-db` repete o incidente", "Não trata a tabela de 4,1 bilhões de linhas"]
+    bestWhen: "a origem é uma consulta pontual e o time precisa estabilizar antes de mudar um fluxo regulatório"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [SYNC_AUDIT_IN_PATH] }
+          missing: "O gatilho foi a carga no `audit-db`, mas a causa do impacto é a auditoria estar no caminho crítico."
+          present: "Causa raiz correta."
+        - id: mitigation
+          name: "Isolamento aplicado"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique o isolamento de fato (encerrar a extração, pausar ingresso), não apenas descreva."
+          present: "Isolamento aplicado."
+        - id: recurrence
+          name: "Recorrência reconhecida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["volta a acontecer", "recorr", "caminho crítico", "caminho critico", "temporár", "temporar"], min: 1 }
+          missing: "Reconheça que isso repete: enquanto a gravação for síncrona, qualquer lentidão do `audit-db` para o atendimento."
+          present: "Recorrência reconhecida com plano."
+        - id: evidence
+          name: "Evidência"
+          weight: 15
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat_activity }
+          missing: "Mostre a sessão da extração ou o estado do `audit-db` no console SQL."
+          present: "Evidência coletada."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "Faltaram status updates com risco clínico em curso."
+          present: "Stakeholders informados."
+  - id: partition-audit
+    name: "Particionar `access_log` e separar a camada fria"
+    summary: "Particionar por mês, manter quente apenas a janela recente e mover o histórico de 20 anos para armazenamento consultável sob demanda."
+    pros: ["Trata a causa de fundo do banco lento", "Resolve também backup, vacuum e retenção", "Deixa a consulta de auditoria viável"]
+    cons: ["Projeto de semanas", "Não resolve o incidente de agora", "A auditoria continua síncrona se nada mais mudar"]
+    bestWhen: "como ação estrutural depois do incidente, junto com tirar a auditoria do caminho crítico"
+    rubric:
+      criteria:
+        - id: immediate
+          name: "Resposta imediata também definida"
+          weight: 30
+          evidence:
+            - { type: mitigation, effect: RESOLVES }
+          missing: "Particionar é para depois; o atendimento parado agora exige uma ação que resolva hoje."
+          present: "Resposta imediata aplicada."
+        - id: partition-design
+          name: "Desenho do particionamento"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["por mês", "por mes", "occurred_at", "pruning", "attach", "camada fria"], min: 1 }
+          missing: "Diga a chave de particionamento, como as consultas descartam partições e para onde vai o histórico frio."
+          present: "Particionamento desenhado."
+        - id: retention
+          name: "Retenção regulatória preservada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["20 anos", "retenção", "retencao", "glacier", "recuper", "consultável", "consultavel"], min: 1 }
+          missing: "Vinte anos de retenção é requisito: mostre que o dado frio continua recuperável e em quanto tempo."
+          present: "Retenção preservada."
+        - id: communication
+          name: "Comunicação"
+          weight: 20
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 420 }
+          missing: "Faltaram status updates."
+          present: "Stakeholders informados."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: SYNC_AUDIT_IN_PATH, label: "Auditoria síncrona no caminho crítico da leitura" }
+        - { value: LONG_LOCK, label: "Transação longa segurando lock" }
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool" }
+        - { value: N_PLUS_ONE, label: "N+1 no prontuário" }
+        - { value: THIRD_PARTY, label: "Lentidão de terceiro" }
+    - id: regulatoryStance
+      label: "Posição sobre desligar a auditoria"
+      type: SELECT
+      required: true
+      options:
+        - { value: keep-guaranteed, label: "Não desligar: tornar assíncrona com garantia de entrega" }
+        - { value: disable-temporarily, label: "Desligar temporariamente" }
+        - { value: sample, label: "Amostrar os acessos" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: async-audit, label: "Auditoria assíncrona com garantia" }
+        - { value: isolate-audit-db, label: "Isolar a carga do audit-db" }
+        - { value: partition-audit, label: "Particionar access_log" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até a mitigação: prontuário em {{p99}}ms contra baseline de {{p99Before}}ms, com
+  {{consultationsNow|number}} consultas em andamento e ~{{patientsWaiting|number}} pacientes esperando. Risco clínico:
+  médico em atendimento sem acesso a alergias e medicações em uso. Sem incidente regulatório: nenhum acesso deixou de
+  ser registrado.
+
+  ## Linha do tempo
+  - **{{onsetLabel}}** — {{causeText}}
+  - **+2min** — p99 do `ehr-service` começa a subir; `scheduling-api` e `video-gateway` seguem normais.
+  - **+5min** — alerta de latência dispara; a diferença entre os serviços afastou a hipótese de rede e de EKS.
+  - **+9min** — trace do endpoint do prontuário mostra 92% do tempo em `INSERT INTO access_log`, no `audit-db`.
+  - **+14min** — decisão: publicar o acesso em fila durável com confirmação, em vez de gravar direto no banco.
+  - **+18min** — p99 volta a ~{{p99Before}}ms; a fila drena no `audit-db` nos minutos seguintes.
+
+  ## Causa raiz
+  A trilha de auditoria era gravada **de forma síncrona antes de responder** toda leitura de dado clínico. O requisito
+  regulatório é que todo acesso fique registrado; ele nunca exigiu que o registro fosse anterior à resposta. Essa
+  confusão colocou um banco com 4,1 bilhões de linhas e retenção de 20 anos no caminho crítico do atendimento.
+
+  ## Ações
+  1. **Imediata:** o acesso publica em `audit.access` com confirmação do broker antes da resposta. Se a publicação
+     falhar, o acesso é **negado** — a garantia regulatória continua absoluta, só mudou onde ela é obtida.
+  2. **Prova (esta semana):** job diário que reconcilia a contagem de acessos publicados com as linhas gravadas no
+     `audit-db`, com alerta em qualquer divergência. Auditoria da auditoria.
+  3. **Banco (este mês):** particionar `access_log` por mês, com pruning nas consultas por paciente e período.
+  4. **Retenção (este trimestre):** partições com mais de 24 meses vão para camada fria, recuperáveis sob demanda,
+     preservando os 20 anos exigidos.
+  5. **Detecção:** alerta de latência de escrita do `audit-db` **antes** de o prontuário sentir, e alarme de extração
+     rodando no primário.
+
+  Blameless: a auditoria síncrona foi a decisão certa quando a tabela era pequena e a regra precisava ser inequívoca.
+  O que faltou foi revisitar essa escolha quando o volume cresceu três ordens de grandeza.
+scenario:
+  kind: incident
+  params:
+    rootCause: LONG_LOCK
+    service: ehr-service
+    datastore: audit-db
+    endpoint: "GET /ehr/patients/{id}/summary"
+    table: access_log
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    deployAt: "{{onsetMinutesAgoAt}}"
+    deployService: audit-service
+    deployVersion: "2026.37.2"
+    deployAuthor: "squad-plataforma"
+    deployDescription: "ajuste de configuração do audit-service"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: async-audit
+  rules:
+    - { param: consultationsNow, op: ">=", value: 3400, path: isolate-audit-db, reason: "com {{consultationsNow|number}} consultas em andamento, mudar o fluxo regulatório no meio do incidente é risco demais; encerre a carga que está no primário agora e faça a mudança de arquitetura na semana seguinte" }

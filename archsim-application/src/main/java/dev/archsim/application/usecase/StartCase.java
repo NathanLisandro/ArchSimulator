@@ -23,7 +23,11 @@ import java.util.List;
 
 /** "Próximo caso": picks a template matching company/type/level (random when omitted), generates the case and opens an attempt. */
 public class StartCase {
-    public record Command(UserId userId, String companyId, String caseType, Level level) {}
+    public record Command(UserId userId, String companyId, String caseType, Level level, String templateId) {
+        public Command(UserId userId, String companyId, String caseType, Level level) {
+            this(userId, companyId, caseType, level, null);
+        }
+    }
 
     private final CompanyRepository companies;
     private final CaseTemplateRepository templates;
@@ -44,12 +48,22 @@ public class StartCase {
         SeededRandom random = new SeededRandom(seed);
         Level level = cmd.level() == null ? Level.JUNIOR : cmd.level();
         CompanyId companyId = cmd.companyId() != null ? new CompanyId(cmd.companyId()) : random.fork("company").pick(companies.findAll()).id();
-        companies.findById(companyId).orElseThrow(() -> new NotFoundException("Empresa não encontrada: " + companyId.value()));
         CaseType type = cmd.caseType() == null ? null : CaseType.valueOf(cmd.caseType());
 
-        List<CaseTemplate> candidates = templates.find(companyId, type, level);
-        if (candidates.isEmpty()) throw new NotFoundException("Nenhum template para empresa=" + companyId.value() + " tipo=" + type + " nível=" + level);
-        CaseTemplate template = random.fork("template").pick(candidates);
+        CaseTemplate template;
+        if (cmd.templateId() != null) {
+            // caso de acompanhamento: o template é escolhido, e a empresa vem dele
+            template = templates.findById(cmd.templateId())
+                    .orElseThrow(() -> new NotFoundException("Template não encontrado: " + cmd.templateId()));
+            if (!template.supports(level)) level = template.levels().getFirst();
+            companyId = template.companyId();
+        } else {
+            List<CaseTemplate> candidates = templates.find(companyId, type, level);
+            if (candidates.isEmpty()) throw new NotFoundException("Nenhum template para empresa=" + companyId.value() + " tipo=" + type + " nível=" + level);
+            template = random.fork("template").pick(candidates);
+        }
+        CompanyId resolvedCompany = companyId;
+        companies.findById(resolvedCompany).orElseThrow(() -> new NotFoundException("Empresa não encontrada: " + resolvedCompany.value()));
 
         Case theCase = generator.generate(template, level, random, clock.now());
         cases.save(theCase);

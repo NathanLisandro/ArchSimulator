@@ -58,8 +58,14 @@ public final class LogGenerator {
     /** Incident lines for one service between onset and the end of the window, at the given rate per minute. */
     public List<LogEntry> incidentLines(String service, Instant onset, int linesPerMinute, String level, List<String> messages,
                                         long latencyBase, Map<String, String> extraFields, List<String> traceIds) {
+        return incidentLines(service, onset, window.to(), linesPerMinute, level, messages, latencyBase, extraFields, traceIds);
+    }
+
+    /** Same, but stopping at {@code until} — used when the responder mitigated and the errors stop. */
+    public List<LogEntry> incidentLines(String service, Instant onset, Instant until, int linesPerMinute, String level,
+                                        List<String> messages, long latencyBase, Map<String, String> extraFields, List<String> traceIds) {
         List<LogEntry> out = new ArrayList<>();
-        long minutes = Math.max(1, java.time.Duration.between(onset, window.to()).toMinutes());
+        long minutes = Math.max(1, java.time.Duration.between(onset, until).toMinutes());
         for (long m = 0; m < minutes; m++) {
             for (int i = 0; i < linesPerMinute; i++) {
                 Instant at = onset.plusSeconds(m * 60 + random.nextLong(0, 59));

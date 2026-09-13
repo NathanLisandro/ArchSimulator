@@ -1,0 +1,289 @@
+id: logistics-slow-query-sla-apuration
+type: SLOW_QUERY
+company: logistica
+levels: [PLENO, SENIOR, STAFF]
+competencies: [databases, capacity, observability]
+tools: [SQL, METRICS]
+parameters:
+  p99: { range: [12000, 48000], step: 1000 }
+  sinceHoursAgo: { range: [4, 20] }
+  shippers: { range: [180, 2400], step: 20 }
+  closingDay: { choice: ["1", "2", "3"] }
+  trigger:
+    group:
+      - { trigger: "o time financeiro passou a abrir o relatório de glosa por embarcador durante o dia, e não só no fechamento", triggerNote: "são 40 aberturas por hora em horário comercial" }
+      - { trigger: "um embarcador grande pediu API para consultar a própria apuração, e o time expôs a mesma consulta do relatório", triggerNote: "o parceiro consulta a cada 5 minutos, em polling" }
+      - { trigger: "o dashboard interno de SLA passou a atualizar sozinho a cada minuto depois de um pedido da diretoria", triggerNote: "são 34 hubs abrindo o painel ao mesmo tempo" }
+derived:
+  p99Seconds: "round(p99 / 1000)"
+  eventsScanned: "shippers * 3700000"
+narrative:
+  title: "Apuração de SLA em {{p99Seconds}}s: o financeiro não fecha o mês"
+  symptom: |
+    Desde {{sinceLabel}}, o endpoint `GET /sla/breaches?shipper={id}&month=` do **sla-engine** leva
+    **{{p99}}ms no p99** (baseline: 900ms). Dois embarcadores já abriram chamado dizendo que o relatório "trava".
+
+    O gatilho: {{trigger}} — {{triggerNote}}.
+
+    A consulta reconstrói o prazo de cada pacote a partir de `parcel_events` para decidir se houve descumprimento.
+    O fechamento do mês é no dia {{closingDay}} e depende dessa mesma rota.
+  businessContext: |
+    São {{shippers|number}} embarcadores ativos e `parcel_events` tem 8,9 bilhões de linhas sem particionamento.
+    A multa por SLA é apurada mensalmente e é auditável: o número precisa bater com o evento de entrega, não com
+    uma aproximação. O `parcel-db` também sustenta `parcel-api` e `hub-scanner`, que recebem bipagem em tempo real.
+  hints:
+    - "Veja quantas linhas a consulta precisa ler para responder uma pergunta por embarcador."
+    - "A resposta muda depois que o mês fecha? Se não muda, ela pode ser calculada uma vez."
+    - "`pg_stat_user_tables` mostra se a tabela está sendo varrida."
+checkpoints:
+  - id: shape
+    question: "Antes de otimizar: qual é o formato dessa pergunta?"
+    options:
+      - id: analytical
+        label: "É analítica: agrega milhões de eventos para produzir um número por embarcador e por mês"
+        verdict: GOOD
+        feedback: "Certo, e isso muda tudo. Uma pergunta analítica sobre {{eventsScanned|compact}} eventos não se resolve com índice: ou você pré-calcula, ou tira a carga do banco transacional que atende bipagem em tempo real."
+      - id: transactional
+        label: "É transacional: falta um índice em parcel_events"
+        verdict: BAD
+        feedback: "Índice ajuda a achar poucas linhas entre muitas. Aqui a consulta precisa de quase todas as linhas do embarcador no mês: com {{eventsScanned|compact}} eventos, qualquer índice vira varredura com passos extras."
+      - id: cache
+        label: "É questão de cache: guardar a resposta no Redis"
+        verdict: RISKY
+        feedback: "Cache ajuda no polling do parceiro, mas o primeiro acesso de cada combinação ainda custa {{p99}}ms e a apuração precisa ser reproduzível para auditoria. Trate o cálculo, não só a repetição."
+  - id: immutability
+    question: "A apuração de um mês já fechado pode mudar depois?"
+    options:
+      - id: immutable
+        label: "Não: passado o prazo de contestação, o número é definitivo e pode ser materializado"
+        verdict: GOOD
+        feedback: "Exato. Isso libera a solução mais barata: gravar o resultado da apuração em `sla_breaches` quando o mês fecha e servir o relatório dali, em vez de recalcular a cada leitura."
+      - id: always-recalculate
+        label: "Sim: sempre recalcular garante que o número está correto"
+        verdict: BAD
+        feedback: "Recalcular a cada leitura não torna o número mais correto, só mais caro — e mais frágil, porque uma mudança no código de cálculo altera silenciosamente um mês já faturado. Auditoria quer o número congelado com o critério da época."
+      - id: unsure
+        label: "Não sei; vou otimizar a consulta do jeito que está"
+        verdict: RISKY
+        feedback: "Essa é a pergunta que define a solução. Confirme com o financeiro antes de investir em otimização: se o passado é imutável, materializar resolve por ordens de grandeza."
+  - id: protect-realtime
+    question: "O `parcel-db` também recebe bipagem em tempo real. O que isso impõe?"
+    options:
+      - id: isolate
+        label: "A carga analítica precisa sair do primário: réplica, instância dedicada ou pré-cálculo"
+        verdict: GOOD
+        feedback: "Sim. Bipagem parada é pacote que some do rastreio, e isso vira chamado do destinatário. A apuração pode esperar; a bipagem, não."
+      - id: same-db
+        label: "Tudo bem manter no mesmo banco, é só uma consulta"
+        verdict: BAD
+        feedback: "Uma consulta que lê {{eventsScanned|compact}} linhas satura o cache de páginas e o IOPS do `parcel-db`, e a bipagem que estava em 30ms passa a competir com ela."
+      - id: throttle
+        label: "Limitar a taxa do relatório resolve"
+        verdict: RISKY
+        feedback: "Rate limit contém o estrago e é defensável como primeira ação, mas não resolve o fechamento do mês, quando o relatório é exatamente o que precisa rodar."
+solutionPaths:
+  - id: materialize-closing
+    name: "Materializar a apuração no fechamento"
+    summary: "Calcular o descumprimento por pacote quando o evento de entrega chega e consolidar por embarcador e mês em `sla_breaches`, servindo o relatório da tabela consolidada."
+    pros: ["Resposta em milissegundos", "Número congelado e auditável", "Tira a carga analítica do primário"]
+    cons: ["Exige recalcular quando houver contestação", "Mais um caminho de escrita para manter correto", "Backfill dos meses antigos"]
+    bestWhen: "a resposta é estável depois do fechamento e precisa ser auditável — o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [ANALYTICAL_ON_OLTP] }
+          missing: "O problema não é índice: é carga analítica sobre {{eventsScanned|compact}} eventos rodando no banco transacional a cada leitura."
+          present: "Diagnóstico correto: consulta analítica no banco transacional."
+        - id: evidence
+          name: "Evidência"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: SQL_QUERY, target: pg_stat }
+            - { type: investigation, kind: EXPLAIN, target: parcel_events }
+          missing: "Comprove com `pg_stat_user_tables` (varredura) e `EXPLAIN` (linhas lidas contra linhas retornadas)."
+          present: "Evidência coletada no console."
+        - id: design
+          name: "Desenho da materialização"
+          weight: 25
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["sla_breaches", "materializ", "consolidad", "por evento", "no fechamento"], min: 1 }
+            - { type: keyword, field: explanation, anyOf: ["backfill", "histórico", "historico", "meses antigos", "reprocess"], min: 1 }
+          missing: "Descreva onde o número passa a ser gravado, em que momento, e como os meses antigos são preenchidos."
+          present: "Materialização e backfill descritos."
+        - id: correction
+          name: "Contestação e correção"
+          weight: 15
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["contesta", "recalcul", "correção", "correcao", "auditoria", "versão", "versao"], min: 1 }
+          missing: "Número congelado precisa de caminho de correção: como uma contestação do embarcador reabre e recalcula o mês."
+          present: "Caminho de correção definido."
+        - id: isolation
+          name: "Proteção do tempo real"
+          weight: 15
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["réplica", "replica", "bipagem", "isolar", "primário", "primario", "tempo real"], min: 1 }
+          missing: "Enquanto a materialização não existe, proteja a bipagem: réplica para o relatório, rate limit ou janela."
+          present: "Caminho de tempo real protegido."
+  - id: read-replica-window
+    name: "Réplica de leitura com janela reduzida"
+    summary: "Servir o relatório pela réplica e limitar a consulta a um mês por vez, com índice de cobertura por embarcador e período."
+    pros: ["Entrega rápida", "Sem mudança no modelo de dados", "Alivia o primário imediatamente"]
+    cons: ["A consulta continua cara, só muda de nó", "Lag da réplica aparece no número", "Não resolve o fechamento"]
+    bestWhen: "é preciso aliviar hoje e ainda não há acordo sobre a imutabilidade da apuração"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 25
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [ANALYTICAL_ON_OLTP] }
+          missing: "O diagnóstico é carga analítica no transacional."
+          present: "Diagnóstico correto."
+        - id: replica-cost
+          name: "Custo reconhecido"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["lag", "continua cara", "mesma consulta", "não resolve", "nao resolve", "paliativ"], min: 1 }
+          missing: "A réplica executa o mesmo plano: reconheça que isso protege o primário sem baratear a consulta, e que o lag entra no número."
+          present: "Custo e limite da réplica reconhecidos."
+        - id: index
+          name: "Índice de cobertura"
+          weight: 25
+          evidence:
+            - { type: regex, field: proposedSql, pattern: "(?is)create\\s+index.*concurrently" }
+          missing: "Se vai manter a consulta, proponha o índice que reduz a leitura, criado com CONCURRENTLY."
+          present: "Índice proposto corretamente."
+        - id: next
+          name: "Caminho definitivo"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["materializ", "consolidad", "pré-calcul", "pre-calcul"], min: 1 }
+          missing: "Registre o plano definitivo: materializar a apuração no fechamento."
+          present: "Plano definitivo registrado."
+  - id: partition-and-archive
+    name: "Particionar `parcel_events` e arquivar o frio"
+    summary: "Particionar por mês, manter no primário apenas a janela quente e mover o histórico para camada fria consultada sob demanda."
+    pros: ["Resolve também manutenção, backup e retenção", "Partition pruning reduz a leitura por mês", "Ataca dívida técnica conhecida"]
+    cons: ["Projeto de semanas sobre 8,9 bilhões de linhas", "Não deixa a consulta barata sozinho", "Exige mudança nos consumidores"]
+    bestWhen: "a manutenção da tabela já é o gargalo maior e a apuração é apenas o sintoma mais visível"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Diagnóstico correto"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [ANALYTICAL_ON_OLTP] }
+          missing: "O diagnóstico é carga analítica no transacional."
+          present: "Diagnóstico correto."
+        - id: partition-key
+          name: "Chave de particionamento"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["por mês", "por mes", "occurred_at", "range", "pruning"], min: 1 }
+          missing: "Diga por qual coluna particiona e como as consultas passam a descartar partições (pruning)."
+          present: "Chave e pruning definidos."
+        - id: migration
+          name: "Como migrar sem parar"
+          weight: 30
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["attach", "sem downtime", "gradual", "dupla escrita", "janela"], min: 1 }
+          missing: "Particionar 8,9 bilhões de linhas exige estratégia: tabela nova com ATTACH, migração gradual, dupla escrita ou janela combinada."
+          present: "Estratégia de migração descrita."
+        - id: short-term
+          name: "Alívio imediato"
+          weight: 20
+          evidence:
+            - { type: keyword, field: explanation, anyOf: ["enquanto", "imediat", "réplica", "replica", "rate limit", "materializ"], min: 1 }
+          missing: "O projeto leva semanas: descreva o que segura o problema até lá."
+          present: "Alívio imediato definido."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: ANALYTICAL_ON_OLTP, label: "Consulta analítica rodando no banco transacional a cada leitura" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: NON_SARGABLE_PREDICATE, label: "Predicado não-sargável" }
+        - { value: LOCK_CONTENTION, label: "Contenção por lock" }
+        - { value: BLOAT, label: "Bloat e autovacuum atrasado" }
+    - id: solutionPath
+      label: "Caminho de solução"
+      type: SELECT
+      required: true
+      options:
+        - { value: materialize-closing, label: "Materializar a apuração no fechamento" }
+        - { value: read-replica-window, label: "Réplica com janela reduzida" }
+        - { value: partition-and-archive, label: "Particionar e arquivar" }
+    - id: proposedSql
+      label: "SQL ou DDL proposto"
+      type: SQL
+      required: false
+    - id: explanation
+      label: "Diagnóstico, solução, migração e proteção do tempo real"
+      type: MARKDOWN
+      required: true
+      help: "Use seções: ## Diagnóstico, ## Solução, ## Migração, ## Proteção do tempo real"
+reference: |
+  ## Diagnóstico
+  `EXPLAIN` da consulta do relatório mostra agregação sobre `parcel_events` com `rows` na casa de
+  {{eventsScanned|compact}} por embarcador e mês — a consulta lê quase tudo para produzir uma linha.
+  `pg_stat_user_tables` confirma `seq_scan` crescendo em `parcel_events` desde {{sinceLabel}}, junto com o IOPS de
+  leitura do `parcel-db`. O baseline de 900ms era aceitável quando o relatório rodava uma vez por mês; com
+  {{triggerNote}}, virou carga contínua.
+
+  A pergunta não é de índice: é analítica. Índice serve para achar poucas linhas entre muitas; aqui todas as linhas
+  do embarcador no mês participam da resposta.
+
+  ## Solução
+  A apuração de um mês fechado é **imutável** (confirmado com o financeiro: após o prazo de contestação, o número
+  é definitivo e auditado). Então ela é calculada uma vez, não a cada leitura:
+
+  1. Quando o evento de entrega chega, o `sla-engine` compara `delivered_at` com `promised_at` e grava a linha em
+     `sla_breaches` — que já existe, com `idx_breaches_shipper_month`.
+  2. O relatório passa a ler `sla_breaches` por `(shipper_id, billing_month)`: milissegundos, com índice.
+  3. Backfill: job por partição de mês reconstrói o histórico uma vez, em horário de baixa, gravando o resultado
+     com o critério vigente na época.
+
+  ```sql
+  -- relatório passa a ser isto
+  SELECT shipper_id, billing_month, count(*) AS atrasos, sum(penalty_cents) AS multa_cents
+    FROM sla_breaches
+   WHERE shipper_id = $1 AND billing_month = $2
+   GROUP BY shipper_id, billing_month;
+  ```
+
+  ## Migração
+  - Semana 1: gravação em `sla_breaches` no caminho do evento de entrega, com o relatório ainda lendo do cálculo antigo.
+  - Semana 2: comparação diária entre os dois números (execução em sombra); critério de corte é divergência zero em valor por 14 dias.
+  - Semana 3: relatório passa a ler a tabela consolidada, com flag e rollback.
+  - Semana 4: backfill do histórico e desligamento do cálculo antigo.
+
+  ## Proteção do tempo real
+  Enquanto a materialização não sobe: relatório roteado para a réplica, rate limit de 10 req/min por embarcador na API
+  do parceiro, e alerta de `seq_scan` em `parcel_events`. Bipagem parada aparece como pacote sumido no rastreio, e isso
+  custa mais que um relatório lento.
+
+  ## Contestação
+  Quando o embarcador contesta, o mês é reaberto por um job que recalcula apenas aquele `(shipper_id, billing_month)`
+  e grava uma nova versão da apuração, preservando a anterior para auditoria.
+scenario:
+  kind: slow-query
+  params:
+    service: sla-engine
+    endpoint: "GET /sla/breaches"
+    table: parcel_events
+    slowSql: "SELECT p.shipper_id, count(*) FILTER (WHERE e.occurred_at > p.promised_at) AS atrasos FROM parcels p JOIN parcel_events e ON e.parcel_id = p.id WHERE p.shipper_id = $1 AND p.created_at >= $2 AND e.event_type = 'DELIVERED' GROUP BY p.shipper_id"
+    p99Before: "900"
+    p99After: "{{p99}}"
+    sinceAt: "{{sinceHoursAgoAt}}"
+    datastore: parcel-db
+recommendation:
+  default: materialize-closing
+  rules:
+    - { param: shippers, op: ">=", value: 1800, path: partition-and-archive, reason: "com {{shippers|number}} embarcadores a tabela de eventos já não cabe na janela de manutenção; particionar deixa de ser opcional e resolve apuração, backup e retenção de uma vez" }

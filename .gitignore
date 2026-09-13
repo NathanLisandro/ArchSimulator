@@ -6,3 +6,6 @@ frontend/dist/
 .vscode/
 .env
 *.pdf
+*.tsbuildinfo
+dist/
+.vite/

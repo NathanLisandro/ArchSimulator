@@ -1,0 +1,291 @@
+id: ecommerce-adr-semantic-search
+type: ADR
+company: ecommerce
+levels: [PLENO, SENIOR, STAFF]
+competencies: [adr, rag, llm-cost, system-design, caching, characteristics]
+tools: []
+parameters:
+  searchesPerDay: { range: [3000000, 14000000], step: 500000 }
+  zeroResultRate: { range: [6, 22] }
+  costPerThousandCalls: { range: [4, 18] }
+  latencyBudgetMs: { range: [250, 900], step: 50 }
+  sponsor:
+    group:
+      - { sponsor: "a diretoria de produto", trigger: "a busca não entende intenção: quem digita 'presente para quem gosta de café' não encontra nada, e a taxa de resultado vazio é de {{zeroResultRate}}%" }
+      - { sponsor: "o time de growth", trigger: "um concorrente lançou busca conversacional e o tráfego orgânico de cauda longa caiu 12% em dois meses" }
+      - { sponsor: "a área comercial", trigger: "sellers reclamam que produtos bons não aparecem para buscas que deveriam encontrá-los, e {{zeroResultRate}}% das buscas terminam sem resultado" }
+derived:
+  monthlyCalls: "searchesPerDay * 30"
+  monthlyCostReais: "round(searchesPerDay * 30 * costPerThousandCalls / 1000)"
+  searchesPerSecond: "round(searchesPerDay / 86400)"
+narrative:
+  title: "ADR: busca semântica para {{searchesPerDay|compact}} buscas por dia"
+  symptom: |
+    {{sponsor}} pediu **busca semântica** no catálogo: {{trigger}}
+
+    A proposta que chegou é usar um modelo de linguagem para interpretar a consulta e reescrevê-la, com busca
+    vetorial sobre os produtos. Você precisa escrever o **ADR**: contexto, opções consideradas, decisão e
+    consequências, incluindo custo e latência.
+  businessContext: |
+    São {{searchesPerDay|number}} buscas por dia (~{{searchesPerSecond|number}} por segundo no pico), sobre 4,8
+    milhões de SKUs que mudam de preço a cada 15 minutos pelo `pricing-batch`. O orçamento de latência da busca é de
+    **{{latencyBudgetMs}}ms** no p99, porque a busca alimenta a vitrine. Chamar um modelo por busca custaria cerca de
+    R$ {{costPerThousandCalls}} por mil chamadas, o que dá R$ {{monthlyCostReais|number}} por mês. O OpenSearch atual
+    tem 6 nós e indexa o catálogo inteiro.
+  hints:
+    - "Nem toda busca precisa de interpretação: qual é a distribuição entre cauda longa e termos repetidos?"
+    - "Latência e custo de um modelo entram no caminho síncrono ou podem sair dele?"
+    - "Embedding de produto muda quando o produto muda, ou quando o modelo muda?"
+checkpoints:
+  - id: distribution
+    question: "Antes de decidir a arquitetura: como as buscas se distribuem?"
+    options:
+      - id: head-and-tail
+        label: "Poucos termos concentram a maior parte do volume, e a cauda longa é onde estão os {{zeroResultRate}}% sem resultado"
+        verdict: GOOD
+        feedback: "Certo, e isso é o que torna a conta viável. Se a maior parte do volume é repetida, o resultado dela pode ser pré-calculado ou cacheado, e o modelo só é chamado na cauda — onde ele resolve o problema real."
+      - id: uniform
+        label: "As buscas são bem distribuídas, cada uma é diferente"
+        verdict: BAD
+        feedback: "Em catálogo de marketplace isso praticamente nunca é verdade: alguns milhares de termos dominam o volume. Assumir distribuição uniforme leva a dimensionar para {{monthlyCalls|compact}} chamadas ao modelo, quando a fração necessária é muito menor."
+      - id: skip
+        label: "Não importa: chamar o modelo em todas garante qualidade uniforme"
+        verdict: BAD
+        feedback: "Custa R$ {{monthlyCostReais|number}} por mês e coloca a latência do modelo no caminho de todas as buscas, inclusive das que já funcionam bem. É pagar caro para piorar o caso comum."
+  - id: latency
+    question: "O orçamento de latência da busca é {{latencyBudgetMs}}ms. Onde o modelo cabe?"
+    options:
+      - id: offline-embeddings
+        label: "Fora do caminho síncrono: embeddings dos produtos são gerados em lote, e o caminho quente só faz busca vetorial"
+        verdict: GOOD
+        feedback: "Exato. O custo do modelo vai para a indexação, que é assíncrona e acontece uma vez por produto. Na busca sobra a parte barata: transformar a consulta em vetor e procurar vizinhos."
+      - id: sync-rewrite
+        label: "No caminho síncrono, reescrevendo a consulta antes de buscar"
+        verdict: RISKY
+        feedback: "É uma opção legítima para a cauda longa, mas some com o orçamento: uma chamada a modelo raramente responde abaixo de {{latencyBudgetMs}}ms de forma consistente. Se fizer, faça com timeout curto e fallback para a busca atual."
+      - id: no-budget
+        label: "Ampliar o orçamento de latência para 2 segundos"
+        verdict: BAD
+        feedback: "Busca de vitrine com 2 segundos derruba conversão muito mais do que resultado vazio. O orçamento é requisito de negócio, não uma preferência técnica."
+  - id: freshness
+    question: "Os preços mudam a cada 15 minutos e o catálogo muda o dia todo. O que isso impõe ao índice vetorial?"
+    options:
+      - id: separate-concerns
+        label: "Embedding descreve o produto, não o preço: reindexar só quando título, descrição ou categoria mudam, e buscar preço na leitura"
+        verdict: GOOD
+        feedback: "Certo. Misturar preço no vetor obrigaria reindexar 4,8 milhões de SKUs a cada 15 minutos, o que custa caro e não melhora a semântica. O vetor é sobre o que o produto é; preço e estoque entram como filtro e ordenação na consulta."
+      - id: reindex-all
+        label: "Reindexar tudo a cada ciclo de preço para manter consistência"
+        verdict: BAD
+        feedback: "São 4,8 milhões de embeddings a cada 15 minutos. Além do custo, você reintroduz no caminho de dados o problema que a busca vetorial deveria resolver."
+      - id: ignore
+        label: "Ignorar: o índice pode ficar desatualizado"
+        verdict: RISKY
+        feedback: "Para texto, tolerável; para preço e disponibilidade, não. Produto esgotado no topo do resultado é a reclamação número um de busca em marketplace."
+solutionPaths:
+  - id: hybrid-offline-embeddings
+    name: "Busca híbrida com embeddings gerados em lote"
+    summary: "Manter a busca léxica atual, somar um índice vetorial alimentado por embeddings gerados de forma assíncrona quando o produto muda, e combinar os dois resultados na leitura."
+    pros: ["Custo do modelo sai do caminho síncrono", "Cauda longa passa a encontrar resultado", "A busca léxica continua servindo o caso comum e serve de fallback"]
+    cons: ["Dois índices para manter consistentes", "Reindexação quando o modelo de embedding muda de versão", "Combinar os dois rankings exige calibração"]
+    bestWhen: "o volume é alto, o orçamento de latência é apertado e o problema está na cauda — o caso aqui"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções: Contexto, Opções consideradas, Decisão e Consequências."
+          present: "ADR com estrutura completa."
+        - id: cost
+          name: "Custo enfrentado com número"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["r$", "custo", "por mil", "mensal", "orçamento", "orcamento"], min: 1 }
+            - { type: number, field: monthlyCostEstimate, expected: "monthlyCostReais", tolerance: 0.4 }
+          missing: "Decisão com modelo de linguagem sem conta de custo não é decisão: estime o gasto mensal do desenho escolhido."
+          present: "Custo estimado e comparado."
+        - id: latency
+          name: "Latência tratada"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["latência", "latencia", "p99", "caminho síncrono", "caminho sincrono", "assíncron", "assincron"], min: 1 }
+          missing: "Diga onde o modelo entra em relação ao orçamento de {{latencyBudgetMs}}ms e o que acontece se ele demorar."
+          present: "Latência tratada explicitamente."
+        - id: freshness
+          name: "Frescor do índice"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["reindex", "embedding", "preço", "preco", "estoque", "filtro"], min: 2 }
+          missing: "Explique o que dispara reindexação e como preço e disponibilidade entram sem reindexar o catálogo."
+          present: "Frescor e separação de responsabilidades definidos."
+        - id: fallback
+          name: "Degradação e reversibilidade"
+          weight: 20
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["fallback", "degrada", "léxic", "lexic", "desligar", "flag", "reverter"], min: 1 }
+          missing: "Consequência obrigatória: o que a busca faz quando o índice vetorial ou o provedor de embedding falha."
+          present: "Degradação e reversão previstas."
+  - id: rag-on-tail
+    name: "Modelo só na cauda, com cache de interpretação"
+    summary: "Manter a busca atual e chamar o modelo apenas quando ela retorna vazio ou poucos resultados, guardando a interpretação da consulta em cache por termo."
+    pros: ["Gasta modelo só onde há problema", "Mudança pequena na arquitetura", "Cache derruba o custo da repetição na cauda"]
+    cons: ["Latência alta justamente para quem já não achou nada", "Qualidade desigual entre cabeça e cauda", "Cache de interpretação envelhece com o catálogo"]
+    bestWhen: "o orçamento é curto, o time é pequeno e a taxa de resultado vazio é o único problema medido"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções."
+          present: "ADR estruturado."
+        - id: trigger
+          name: "Critério de acionamento"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["vazio", "poucos resultados", "limiar", "threshold", "gatilho"], min: 1 }
+          missing: "Defina exatamente quando o modelo é chamado: resultado vazio, abaixo de N itens, ou baixa confiança."
+          present: "Critério de acionamento definido."
+        - id: latency
+          name: "Latência na cauda assumida"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["timeout", "segundo passo", "assume", "mais lento", "spinner", "progressiv"], min: 1 }
+          missing: "Quem cai na cauda já está frustrado e vai esperar mais: assuma esse custo e descreva a experiência (timeout, resposta progressiva)."
+          present: "Custo de latência na cauda assumido."
+        - id: cost
+          name: "Custo estimado"
+          weight: 20
+          evidence:
+            - { type: number, field: monthlyCostEstimate, expected: "monthlyCostReais * 0.2", tolerance: 0.6 }
+          missing: "Estime o custo mensal considerando apenas a fração da cauda, não o volume total."
+          present: "Custo estimado com a fração correta."
+        - id: cache
+          name: "Cache de interpretação"
+          weight: 10
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["cache", "por termo", "normaliz", "reaproveit"], min: 1 }
+          missing: "A cauda também repete: descreva o cache da interpretação por termo normalizado."
+          present: "Cache de interpretação previsto."
+  - id: improve-lexical
+    name: "Melhorar a busca léxica antes de adicionar modelo"
+    summary: "Investir em sinônimos, correção ortográfica, stemming em português e sinais de comportamento no ranking, medindo quanto dos {{zeroResultRate}}% isso resolve."
+    pros: ["Custo marginal próximo de zero", "Sem nova dependência nem novo fornecedor", "Resultado mensurável em semanas"]
+    cons: ["Não resolve consulta por intenção", "Dicionário de sinônimos é manutenção contínua", "Pode não ser suficiente para o pedido do negócio"]
+    bestWhen: "boa parte do resultado vazio vem de erro de digitação, sinônimo e flexão, e não de intenção — o que é comum e raramente medido antes"
+    rubric:
+      criteria:
+        - id: structure
+          name: "Estrutura do ADR"
+          weight: 20
+          evidence:
+            - { type: section, headings: ["Contexto", "Opções", "Decisão", "Consequências"] }
+          missing: "O ADR precisa das quatro seções."
+          present: "ADR estruturado."
+        - id: measurement
+          name: "Medida antes do investimento"
+          weight: 30
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["amostra", "classific", "medir", "quanto", "análise", "analise"], min: 1 }
+          missing: "A defesa desta opção depende de medida: classifique uma amostra dos {{zeroResultRate}}% para mostrar quanto é digitação, sinônimo e quanto é intenção."
+          present: "Decisão embasada em amostra medida."
+        - id: expectation
+          name: "Expectativa renegociada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["renegoci", "expectativa", "não resolve", "nao resolve", "intenção", "intencao", "etapa"], min: 1 }
+          missing: "{{sponsor}} pediu busca semântica: se a decisão é outra, a renegociação da expectativa faz parte do ADR."
+          present: "Expectativa renegociada com o solicitante."
+        - id: next-step
+          name: "Gatilho para a etapa seguinte"
+          weight: 25
+          evidence:
+            - { type: keyword, field: adr, anyOf: ["se não", "se nao", "gatilho", "critério", "criterio", "próxima etapa", "proxima etapa"], min: 1 }
+          missing: "Defina o número que dispara a etapa seguinte: se o resultado vazio não cair abaixo de X, avançar para busca vetorial."
+          present: "Gatilho definido."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: solutionPath
+      label: "Decisão"
+      type: SELECT
+      required: true
+      options:
+        - { value: hybrid-offline-embeddings, label: "Busca híbrida com embeddings em lote" }
+        - { value: rag-on-tail, label: "Modelo só na cauda, com cache" }
+        - { value: improve-lexical, label: "Melhorar a busca léxica primeiro" }
+    - id: modelPlacement
+      label: "Onde o modelo é chamado"
+      type: SELECT
+      required: true
+      options:
+        - { value: offline, label: "Fora do caminho síncrono, na indexação" }
+        - { value: sync-all, label: "No caminho síncrono, em todas as buscas" }
+        - { value: sync-tail, label: "No caminho síncrono, só na cauda" }
+        - { value: none, label: "Não é chamado" }
+    - id: monthlyCostEstimate
+      label: "Custo mensal estimado do desenho escolhido (R$)"
+      type: NUMBER
+      required: true
+    - id: adr
+      label: "ADR"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Contexto, ## Opções consideradas, ## Decisão, ## Consequências"
+reference: |
+  # ADR-00X: Busca híbrida com embeddings gerados em lote
+
+  ## Contexto
+  {{sponsor}} pediu busca semântica: {{trigger}} São {{searchesPerDay|number}} buscas por dia
+  (~{{searchesPerSecond|number}}/s no pico) sobre 4,8 milhões de SKUs, com orçamento de latência de
+  {{latencyBudgetMs}}ms no p99 e preços que mudam a cada 15 minutos.
+
+  Duas medidas que orientaram a decisão:
+  - A distribuição de buscas é fortemente concentrada: poucos milhares de termos respondem pela maior parte do volume,
+    e o resultado vazio se concentra na cauda longa.
+  - Chamar um modelo em todas as buscas custaria cerca de **R$ {{monthlyCostReais|number}} por mês** e colocaria uma
+    dependência externa no caminho de cada requisição da vitrine.
+
+  ## Opções consideradas
+  1. **Modelo síncrono em todas as buscas.** Descartada: custo mensal na casa de R$ {{monthlyCostReais|number}} e
+     latência incompatível com {{latencyBudgetMs}}ms, para melhorar também as buscas que já funcionam.
+  2. **Modelo só na cauda, com cache de interpretação.** Descartada como solução principal, mantida como complemento:
+     resolve o resultado vazio mas entrega a pior latência justamente a quem já está frustrado.
+  3. **Melhorar a busca léxica.** Não descartada: entra como primeira etapa. Uma amostra de 500 buscas sem resultado
+     mostrou que parte relevante é erro de digitação e sinônimo, que sinônimos e correção resolvem sem modelo.
+  4. **Busca híbrida com embeddings em lote (escolhida).**
+
+  ## Decisão
+  - **Indexação (assíncrona):** quando título, descrição ou categoria de um produto mudam, um evento em
+    `catalog.updated` dispara a geração do embedding. O custo do modelo acontece uma vez por produto, não por busca.
+  - **Consulta (síncrona):** a consulta do usuário é transformada em vetor por um modelo pequeno hospedado
+    internamente, com p99 abaixo de 40ms, e a busca combina o resultado léxico do OpenSearch com os vizinhos
+    vetoriais. Preço, estoque e disponibilidade entram como **filtro e ordenação na leitura**, nunca dentro do vetor.
+  - **Fallback:** falha ou lentidão no caminho vetorial devolve o resultado léxico puro, com timeout de 80ms.
+
+  ## Consequências
+  **Positivas:** a cauda longa passa a encontrar resultado; o custo por busca fica praticamente constante com o
+  crescimento; a busca léxica continua como caminho de degradação conhecido.
+
+  **Negativas, assumidas:**
+  - **Dois índices.** Léxico e vetorial precisam de reconciliação: um job diário compara a contagem de SKUs ativos em
+    cada um e alerta na divergência.
+  - **Versão do modelo de embedding.** Trocar o modelo invalida todos os vetores. Reindexar 4,8 milhões de SKUs leva
+    dias e custa; por isso a versão do modelo é gravada junto com cada vetor e a migração é feita com os dois índices
+    convivendo, nunca com uma virada.
+  - **Custo de indexação.** Cerca de R$ 6 mil na carga inicial e um valor pequeno por mês para o delta, contra
+    R$ {{monthlyCostReais|number}} mensais da opção síncrona.
+  - **Calibração do ranking.** Combinar dois rankings exige teste A/B com métrica de conversão, não só de relevância.
+  - **Mais uma dependência no caminho da vitrine**, mitigada pelo fallback léxico.
+
+  **Etapa zero, antes de tudo:** subir sinônimos, correção ortográfica e stemming em português, e medir quanto dos
+  {{zeroResultRate}}% isso resolve. Se resolver a maior parte, o escopo da etapa seguinte diminui — e isso é bom.
+scenario:
+  kind: none
+recommendation:
+  default: hybrid-offline-embeddings
+  rules:
+    - { param: searchesPerDay, op: "<=", value: 4000000, path: rag-on-tail, reason: "com {{searchesPerDay|compact}} buscas por dia o custo do modelo na cauda cabe no orçamento, e manter dois índices e um pipeline de embedding é peso demais para o ganho" }

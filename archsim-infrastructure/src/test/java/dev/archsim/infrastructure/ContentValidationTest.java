@@ -82,6 +82,13 @@ class ContentValidationTest {
                     });
                     c.stakeholderMessages().forEach(sm -> assertThat(sm.text()).as(t.id()).doesNotContain("{{"));
                     c.artifacts().forEach(art -> assertThat(art.content()).as(t.id()).doesNotContain("{{"));
+                    c.followUps().forEach(followUp -> {
+                        assertThat(followUp.teaser()).as(t.id()).doesNotContain("{{");
+                        assertThat(templates.findById(followUp.templateId())).as(t.id() + ": follow-up aponta para template inexistente")
+                                .isPresent();
+                        assertThat(c.solutionPath(followUp.pathId())).as(t.id() + ": follow-up aponta para caminho inexistente")
+                                .isPresent();
+                    });
                     if (!c.scenario().kind().equals("none")) {
                         ObservabilityDataset ds = datasets.generate(c, company, new SeededRandom(c.seed()));
                         assertThat(ds.metrics()).as(t.id()).isNotEmpty();

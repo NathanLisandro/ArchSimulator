@@ -47,6 +47,20 @@ public interface Shape {
         };
     }
 
+    /**
+     * A partir de {@code at}, transita desta forma de volta para {@code normal} ao longo de {@code duration}.
+     * É o que faz a mitigação aplicada pelo usuário aparecer nos gráficos como recuperação, e não como corte seco.
+     */
+    default Shape recoveringTo(Shape normal, Instant at, Duration duration) {
+        Instant end = at.plus(duration);
+        return t -> {
+            if (t.isBefore(at)) return valueAt(t);
+            if (!t.isBefore(end)) return normal.valueAt(t);
+            double f = (double) (t.toEpochMilli() - at.toEpochMilli()) / Math.max(1, end.toEpochMilli() - at.toEpochMilli());
+            return valueAt(t) * (1 - f) + normal.valueAt(t) * f;
+        };
+    }
+
     default Shape plus(Shape other) { return t -> valueAt(t) + other.valueAt(t); }
     default Shape times(Shape other) { return t -> valueAt(t) * other.valueAt(t); }
     default Shape clamp(double min, double max) { return t -> Math.max(min, Math.min(max, valueAt(t))); }

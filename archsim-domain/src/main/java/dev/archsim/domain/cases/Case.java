@@ -14,7 +14,18 @@ public record Case(CaseId id, CompanyId companyId, String templateId, CaseType t
                    Narrative narrative, List<Checkpoint> checkpoints, List<SolutionPath> solutionPaths, AnswerForm answerForm,
                    ReferenceAnswer referenceAnswer, ScenarioSpec scenario, PathRecommendation recommendation,
                    List<String> competencies, Set<ConsoleTool> tools, Map<String, String> params, Instant generatedAt,
-                   List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages, List<CaseArtifact> artifacts) {
+                   List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages, List<CaseArtifact> artifacts,
+                   List<FollowUp> followUps) {
+
+    /** Cases without second-order follow-up. */
+    public Case(CaseId id, CompanyId companyId, String templateId, CaseType type, Level level, long seed, Narrative narrative,
+                List<Checkpoint> checkpoints, List<SolutionPath> solutionPaths, AnswerForm answerForm, ReferenceAnswer referenceAnswer,
+                ScenarioSpec scenario, PathRecommendation recommendation, List<String> competencies, Set<ConsoleTool> tools,
+                Map<String, String> params, Instant generatedAt, List<Mitigation> mitigations,
+                List<StakeholderMessage> stakeholderMessages, List<CaseArtifact> artifacts) {
+        this(id, companyId, templateId, type, level, seed, narrative, checkpoints, solutionPaths, answerForm, referenceAnswer,
+                scenario, recommendation, competencies, tools, params, generatedAt, mitigations, stakeholderMessages, artifacts, List.of());
+    }
 
     /** Incident cases without artifacts. */
     public Case(CaseId id, CompanyId companyId, String templateId, CaseType type, Level level, long seed, Narrative narrative,
@@ -22,7 +33,7 @@ public record Case(CaseId id, CompanyId companyId, String templateId, CaseType t
                 ScenarioSpec scenario, PathRecommendation recommendation, List<String> competencies, Set<ConsoleTool> tools,
                 Map<String, String> params, Instant generatedAt, List<Mitigation> mitigations, List<StakeholderMessage> stakeholderMessages) {
         this(id, companyId, templateId, type, level, seed, narrative, checkpoints, solutionPaths, answerForm, referenceAnswer,
-                scenario, recommendation, competencies, tools, params, generatedAt, mitigations, stakeholderMessages, List.of());
+                scenario, recommendation, competencies, tools, params, generatedAt, mitigations, stakeholderMessages, List.of(), List.of());
     }
 
     /** Cases without incident response (slow query, ADR, design...) have no mitigations nor stakeholder pressure. */
@@ -50,6 +61,11 @@ public record Case(CaseId id, CompanyId companyId, String templateId, CaseType t
     }
 
     public SolutionPath recommendedPath() { return solutionPath(recommendation.pathId()).orElseThrow(); }
+
+    /** O caso de acompanhamento do caminho seguido, quando o template declara um. */
+    public Optional<FollowUp> followUpFor(String pathId) {
+        return followUps.stream().filter(f -> f.pathId().equals(pathId)).findFirst();
+    }
 
     public Optional<CaseArtifact> artifact(String artifactId) {
         return artifacts.stream().filter(a -> a.id().equals(artifactId)).findFirst();

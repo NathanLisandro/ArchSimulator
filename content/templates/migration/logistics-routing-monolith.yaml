@@ -1,0 +1,348 @@
+id: logistics-migration-routing-monolith
+type: MIGRATION
+company: logistica
+levels: [SENIOR, STAFF]
+competencies: [legacy, system-design, capacity, sre, communication]
+tools: [METRICS, SQL]
+parameters:
+  runtimeMinutes: { range: [140, 260], step: 10 }
+  hubs: { range: [26, 34], step: 2 }
+  failuresLastMonth: { range: [2, 9] }
+  teamSize: { range: [3, 7] }
+  pressure:
+    group:
+      - { pressure: "na semana passada o job caiu no hub 21 às 5h40 e as rotas de nove hubs saíram às 9h; 14 mil pacotes furaram o prazo", pressureNote: "a multa contratual do mês já passou do orçamento do trimestre" }
+      - { pressure: "a operação passou a rodar o job mais cedo para ter margem, e agora ele começa antes de metade dos pacotes chegarem ao hub", pressureNote: "pacote que chega depois do job fica um dia parado" }
+      - { pressure: "a expansão para mais {{newHubs}} hubs está contratada e o job cresce linearmente com o número de hubs", pressureNote: "no ritmo atual, a janela estoura no primeiro mês da expansão" }
+  newHubs: { range: [6, 14], step: 2 }
+derived:
+  runtimeHours: "round(runtimeMinutes / 60)"
+  minutesPerHub: "round(runtimeMinutes / hubs)"
+  hubsAfter: "hubs + newHubs"
+narrative:
+  title: "Roteirização: {{runtimeHours}}h em um único processo que não pode falhar"
+  symptom: |
+    O `routing-service` monta as rotas do dia em **um processo único** que percorre os {{hubs}} hubs em sequência.
+    Leva **{{runtimeMinutes}} minutos** e precisa terminar até as 6h, quando os motoristas chegam. Se falhar no hub
+    20, recomeça do zero.
+
+    {{pressure}} — {{pressureNote}}. Foram **{{failuresLastMonth}} falhas no último mês**.
+
+    Desenhe a estratégia de migração: como sair daqui, em que ordem, como provar que as rotas novas são tão boas
+    quanto as antigas, e qual o plano de rollout.
+  businessContext: |
+    Cada hub leva em média {{minutesPerHub}} minutos de otimização (OR-Tools sobre as paradas do dia). A rota define
+    a ordem de entrega e o prazo prometido; rota pior significa menos entregas no dia e mais quilômetro rodado pelo
+    motorista parceiro, que é pago por entrega. A squad tem {{teamSize}} pessoas e mantém o job atual rodando
+    enquanto migra. Expansão contratada leva a operação para {{hubsAfter}} hubs.
+  hints:
+    - "Os hubs dependem uns dos outros no cálculo, ou só compartilham o mesmo processo?"
+    - "Rota 'boa' precisa de definição numérica antes de qualquer comparação."
+    - "O que acontece se um hub falhar e os outros 33 estiverem prontos?"
+artifacts:
+  - id: routing-job
+    title: "Trecho do job atual (RoutingJob.py)"
+    kind: CODE
+    language: python
+    content: |
+      def run_daily(route_date):
+          hubs = db.query("SELECT id FROM hubs WHERE active = true ORDER BY id")
+          db.execute("DELETE FROM routes WHERE route_date = %s", route_date)   # limpa tudo antes de comecar
+
+          for hub in hubs:                                   # 34 hubs, em sequencia, no mesmo processo
+              parcels = db.query("""
+                  SELECT p.id, a.latitude, a.longitude
+                    FROM parcels p JOIN addresses a ON a.id = p.address_id
+                   WHERE p.hub_id = %s AND p.status = 'AT_HUB'
+              """, hub.id)
+
+              drivers = db.query("SELECT id, vehicle_type FROM drivers WHERE hub_id = %s AND active = true", hub.id)
+
+              # otimizacao: 3 a 8 minutos por hub, dependendo do volume
+              solution = ortools_solve(parcels, drivers, time_limit_seconds=420)
+
+              for route in solution.routes:                  # uma transacao para o hub inteiro
+                  route_id = db.insert("routes", hub_id=hub.id, driver_id=route.driver_id,
+                                       route_date=route_date, stops=len(route.stops))
+                  for i, stop in enumerate(route.stops):
+                      db.insert("route_stops", route_id=route_id, parcel_id=stop.parcel_id,
+                                sequence=i, eta=stop.eta)
+
+              db.commit()                                    # commit por hub, mas DELETE inicial ja apagou tudo
+
+          kafka.publish("routing.assigned", {"date": str(route_date)})   # um evento no fim, para todos os hubs
+checkpoints:
+  - id: coupling
+    question: "Primeira pergunta antes de propor qualquer coisa: os hubs dependem uns dos outros?"
+    options:
+      - id: independent
+        label: "Não: cada hub tem seus pacotes, seus motoristas e sua otimização. Estão juntos por acidente de implementação"
+        verdict: GOOD
+        feedback: "Essa é a descoberta que destrava tudo. Se os hubs são independentes, o job não precisa ser um processo: pode ser {{hubs}} execuções paralelas e isoladas, e a falha de uma deixa de derrubar as outras."
+      - id: coupled
+        label: "Sim: o resultado de um hub alimenta o próximo"
+        verdict: RISKY
+        feedback: "Vale conferir antes de assumir. Lendo o job, cada iteração consulta pacotes e motoristas **daquele hub** e grava rotas **daquele hub**. Não há estado compartilhado entre iterações — exceto o DELETE inicial, que apaga tudo de todos."
+      - id: unknown
+        label: "Não dá para saber sem estudar o OR-Tools"
+        verdict: BAD
+        feedback: "Dá, e em minutos: leia o que entra e o que sai de cada iteração. A otimização é caixa-preta, mas o acoplamento entre hubs está no código em volta dela, não dentro do solver."
+  - id: parity
+    question: "Como provar que as rotas novas são tão boas quanto as antigas?"
+    options:
+      - id: metric-first
+        label: "Definir a métrica antes: quilômetro rodado, paradas por rota e entregas dentro do prazo prometido"
+        verdict: GOOD
+        feedback: "Certo. Sem métrica, 'rota boa' é opinião, e a discussão trava na primeira divergência. Com ela, a execução em sombra vira um número comparável todo dia."
+      - id: same-output
+        label: "Comparar se as rotas saem idênticas às do job antigo"
+        verdict: BAD
+        feedback: "O solver é heurístico: duas execuções sobre os mesmos dados já dão rotas diferentes. Exigir saída idêntica congela a versão antiga para sempre."
+      - id: driver-feedback
+        label: "Perguntar aos motoristas se a rota ficou melhor"
+        verdict: RISKY
+        feedback: "A percepção deles importa e deve entrar como sinal qualitativo. Mas como critério de corte é lento e enviesado: quem recebeu rota pior reclama, quem recebeu melhor não escreve."
+  - id: failure-unit
+    question: "Um hub falha e os outros {{hubs}} terminaram. O que deveria acontecer?"
+    options:
+      - id: isolated-retry
+        label: "Só aquele hub é reprocessado; os demais já publicaram suas rotas"
+        verdict: GOOD
+        feedback: "Sim, e isso muda a natureza do incidente: de 'a operação inteira atrasou' para 'um hub saiu 20 minutos depois'. O evento de rota pronta passa a ser por hub, não um único no fim."
+      - id: rerun-all
+        label: "Reprocessar tudo, para garantir consistência"
+        verdict: BAD
+        feedback: "É exatamente o comportamento atual, e é a origem do problema: {{runtimeMinutes}} minutos perdidos por causa de um hub. Não há consistência a preservar entre hubs independentes."
+      - id: skip-hub
+        label: "Seguir sem aquele hub e resolver depois"
+        verdict: BAD
+        feedback: "Seguir sem rota significa motorista parado e pacote no hub o dia inteiro. O hub precisa ser reprocessado, só não precisa levar os outros junto."
+solutionPaths:
+  - id: parallel-by-hub
+    name: "Paralelizar por hub, com isolamento e retomada"
+    summary: "Transformar o job em {{hubs}} execuções independentes, cada uma com sua transação, seu evento e seu retry, orquestradas por fila."
+    pros: ["Falha deixa de ser total: o raio de explosão vira um hub", "Tempo de parede cai para o hub mais lento, não a soma", "Escala com a expansão para {{hubsAfter}} hubs"]
+    cons: ["Concorrência no banco durante a janela", "Orquestração e observabilidade novas", "O DELETE global precisa sair antes de qualquer paralelismo"]
+    bestWhen: "as unidades de trabalho são independentes e a janela é a restrição — o caso aqui"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [PARALLELIZE] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: delete-first
+          name: "O DELETE global tratado"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["delete", "apaga", "escopo por hub", "por hub", "idempot"], min: 1 }
+          missing: "O `DELETE FROM routes WHERE route_date` apaga as rotas de todos os hubs no início. Paralelizar sem tratar isso faz um hub apagar o trabalho do outro."
+          present: "Escopo de limpeza corrigido antes do paralelismo."
+        - id: parity
+          name: "Prova de paridade com métrica"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["quilômetr", "quilometr", "paradas por rota", "no prazo", "métrica", "metrica"], min: 1 }
+            - { type: keyword, field: plan, anyOf: ["sombra", "shadow", "paralelo", "compar"], min: 1 }
+          missing: "Defina a métrica de qualidade de rota e rode em sombra comparando o número todo dia antes do corte."
+          present: "Paridade medida por métrica objetiva."
+        - id: rollout
+          name: "Rollout com rollback"
+          weight: 20
+          evidence:
+            - { type: choice, field: rolloutStrategy, anyOf: [FEATURE_FLAG] }
+            - { type: keyword, field: plan, anyOf: ["hub piloto", "por hub", "rollback", "voltar"], min: 1 }
+          missing: "Corte hub a hub, com flag e rollback: o hub é a unidade natural de risco aqui."
+          present: "Rollout por hub com rollback."
+        - id: contention
+          name: "Concorrência no banco"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["concorrên", "concorren", "conexões", "conexoes", "lote", "limite de paralelismo", "pool"], min: 1 }
+          missing: "Trinta e quatro execuções ao mesmo tempo mudam o perfil de escrita no `routing-db`: defina o limite de paralelismo e o tamanho das transações."
+          present: "Concorrência dimensionada."
+  - id: checkpoint-resume
+    name: "Manter sequencial, com checkpoint e retomada"
+    summary: "Guardar o progresso por hub e permitir que uma falha retome do ponto em vez de recomeçar."
+    pros: ["Mudança pequena e rápida", "Elimina o pior sintoma sem reescrever", "Baixo risco"]
+    cons: ["O tempo total continua sendo a soma dos hubs", "Não escala para {{hubsAfter}} hubs", "Uma falha no início ainda atrasa tudo"]
+    bestWhen: "a janela ainda tem folga e o time precisa parar o sangramento antes de um projeto maior"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [CHECKPOINT] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: checkpoint
+          name: "Checkpoint correto"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["checkpoint", "retoma", "progresso", "último hub", "ultimo hub", "idempot"], min: 1 }
+          missing: "Descreva onde o progresso é gravado e como a retomada evita reprocessar ou duplicar o hub interrompido."
+          present: "Checkpoint e retomada descritos."
+        - id: delete-first
+          name: "O DELETE global tratado"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["delete", "apaga", "escopo", "por hub"], min: 1 }
+          missing: "Retomar do meio não funciona se o job apaga as rotas de todos os hubs no início."
+          present: "Escopo de limpeza corrigido."
+        - id: horizon
+          name: "Horizonte assumido"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["expansão", "expansao", "não escala", "nao escala", "próximo", "proximo", "limite"], min: 1 }
+          missing: "Com {{hubsAfter}} hubs contratados, diga por quanto tempo isso resolve e o que vem depois."
+          present: "Horizonte assumido."
+        - id: parity
+          name: "Paridade"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["sombra", "compar", "métrica", "metrica", "regressão", "regressao"], min: 1 }
+          missing: "Mesmo sem mudar o algoritmo, compare o resultado antes e depois da mudança de controle de fluxo."
+          present: "Paridade verificada."
+  - id: extract-service
+    name: "Extrair a otimização como serviço sob demanda"
+    summary: "Transformar a otimização em um serviço que recebe um hub e devolve rotas, chamado por um orquestrador que também serve replanejamento durante o dia."
+    pros: ["Permite replanejar um hub no meio do dia", "Escala elástica por demanda", "Separa orquestração de algoritmo"]
+    cons: ["Projeto maior que os outros dois", "Contrato e versionamento do serviço", "Custo de infraestrutura elástica"]
+    bestWhen: "além da janela, existe a necessidade real de replanejar durante o dia (pacote que chega tarde, motorista que falta)"
+    rubric:
+      criteria:
+        - id: strategy
+          name: "Estratégia declarada"
+          weight: 15
+          evidence:
+            - { type: choice, field: strategy, anyOf: [EXTRACT_SERVICE] }
+          missing: "Declare a estratégia no campo estruturado."
+          present: "Estratégia declarada."
+        - id: justification
+          name: "Justificativa além da janela"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["replanej", "durante o dia", "sob demanda", "motorista que falta", "pacote atrasado"], min: 1 }
+          missing: "Extrair serviço custa mais que paralelizar: justifique com a capacidade nova que isso destrava, não só com a janela."
+          present: "Ganho além da janela justificado."
+        - id: contract
+          name: "Contrato do serviço"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["contrato", "timeout", "assíncron", "assincron", "idempot", "versão", "versao"], min: 1 }
+          missing: "Otimização leva minutos: defina se a chamada é assíncrona, qual o timeout e como o resultado volta."
+          present: "Contrato definido."
+        - id: rollout
+          name: "Rollout"
+          weight: 15
+          evidence:
+            - { type: choice, field: rolloutStrategy, anyOf: [FEATURE_FLAG] }
+          missing: "Corte gradual com flag, hub a hub."
+          present: "Rollout gradual."
+        - id: parity
+          name: "Paridade"
+          weight: 15
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["sombra", "compar", "métrica", "metrica"], min: 1 }
+          missing: "Compare a qualidade das rotas em sombra antes do corte."
+          present: "Paridade medida."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: strategy
+      label: "Estratégia de migração"
+      type: SELECT
+      required: true
+      options:
+        - { value: PARALLELIZE, label: "Paralelizar por hub, com isolamento" }
+        - { value: CHECKPOINT, label: "Manter sequencial com checkpoint" }
+        - { value: EXTRACT_SERVICE, label: "Extrair a otimização como serviço" }
+        - { value: BIG_BANG, label: "Reescrever e trocar de uma vez" }
+    - id: rolloutStrategy
+      label: "Estratégia de rollout"
+      type: SELECT
+      required: true
+      options:
+        - { value: FEATURE_FLAG, label: "Feature flag por hub, com rollback" }
+        - { value: DUAL_WRITE, label: "Execução dupla gravando nos dois caminhos" }
+        - { value: WINDOW_CUTOVER, label: "Corte em uma janela de manutenção" }
+    - id: qualityMetric
+      label: "Métrica que define rota boa"
+      type: SELECT
+      required: true
+      options:
+        - { value: km-and-ontime, label: "Quilômetro rodado e entregas no prazo" }
+        - { value: identical-output, label: "Rotas idênticas às do job antigo" }
+        - { value: driver-opinion, label: "Percepção do motorista" }
+    - id: solutionPath
+      label: "Destino"
+      type: SELECT
+      required: true
+      options:
+        - { value: parallel-by-hub, label: "Paralelizar por hub" }
+        - { value: checkpoint-resume, label: "Checkpoint e retomada" }
+        - { value: extract-service, label: "Serviço de otimização sob demanda" }
+    - id: plan
+      label: "Plano de migração"
+      type: MARKDOWN
+      required: true
+      help: "Diagnóstico, estratégia, prova de paridade, rollout, riscos e desligamento do legado."
+reference: |
+  ## Diagnóstico
+  Três problemas somados no job atual:
+
+  1. **Acoplamento por acidente.** Cada iteração lê pacotes e motoristas de um hub e grava rotas daquele hub. Não há
+     estado compartilhado entre hubs. Eles estão no mesmo processo por como o código foi escrito, não por necessidade.
+  2. **`DELETE` de escopo global.** A primeira linha apaga as rotas do dia de **todos** os hubs. Isso torna qualquer
+     paralelismo ou retomada perigoso e transforma uma falha no meio em "nenhum hub tem rota".
+  3. **Um único evento no fim.** `routing.assigned` é publicado uma vez para todos. Quem consome não sabe que o hub 3
+     está pronto há duas horas.
+
+  Com {{minutesPerHub}} minutos por hub e {{hubs}} hubs em sequência, o tempo de parede é a **soma**; paralelizado,
+  passa a ser o **máximo**.
+
+  ## Estratégia: paralelizar por hub, em quatro passos
+  **Passo 1 (semana 1) — corrigir o escopo.** `DELETE ... WHERE route_date = ? AND hub_id = ?`, e o evento passa a ser
+  por hub. Sozinho, isso já permite reprocessar um hub sem tocar nos outros, e é a mudança de menor risco.
+
+  **Passo 2 (semanas 2 e 3) — medir qualidade.** Antes de mudar o cálculo, definir o número:
+  quilômetro total por rota, paradas por rota e percentual de paradas com ETA dentro do prazo prometido. Coletado do
+  job atual por 10 dias para virar a linha de base.
+
+  **Passo 3 (semanas 3 e 4) — paralelizar.** O orquestrador enfileira um trabalho por hub em `routing.assigned`;
+  workers consomem com paralelismo limitado (começar em 4, subir medindo o `routing-db`). Cada worker tem sua
+  transação, seu retry com backoff e seu evento de conclusão. Execução em **sombra** durante todo o período: o job
+  antigo continua sendo a verdade, o novo grava em tabelas espelho e a comparação diária publica as três métricas.
+
+  **Passo 4 (semana 5) — corte por hub.** Flag por hub: um hub piloto pequeno por 5 dias, depois 20%, depois o resto.
+  Rollback é desligar a flag, porque o job antigo nunca foi removido. Desligamento definitivo 30 dias após o último hub.
+
+  ## Concorrência
+  Trinta e quatro execuções simultâneas mudam o perfil do `routing-db`: as inserções em `route_stops` passam a
+  concorrer. Limite inicial de 4 workers, transações por rota em vez de por hub, e `lock_timeout` no role do job.
+  Meta: tempo de parede abaixo de {{minutesPerHub}} minutos mais folga, com a expansão para {{hubsAfter}} hubs
+  absorvida por mais workers e não por mais tempo.
+
+  ## Riscos assumidos
+  - Dois caminhos convivendo por cerca de seis semanas, com custo de manutenção dobrado e data de fim definida.
+  - O solver é heurístico: as rotas **não** serão idênticas, e isso precisa estar combinado com a operação antes do
+    primeiro corte, senão a primeira diferença vira desconfiança.
+  - Paralelismo alto demais pode degradar o `routing-db` durante a janela; por isso começa em 4 e sobe medindo.
+scenario:
+  kind: capacity
+  params:
+    service: routing-service
+    datastore: routing-db
+    growthPercentPerMonth: "7"
+    currentPeakRps: "60"
+    headroomMetric: write_iops
+    headroomLimit: "9000"
+    headroomNow: "4100"
+    storageNowGb: "2400"
+recommendation:
+  default: parallel-by-hub
+  rules:
+    - { param: failuresLastMonth, op: ">=", value: 6, path: checkpoint-resume, reason: "com {{failuresLastMonth}} falhas no mês o sangramento é agora; o checkpoint entra em dias e compra a folga necessária para fazer a paralelização com calma" }

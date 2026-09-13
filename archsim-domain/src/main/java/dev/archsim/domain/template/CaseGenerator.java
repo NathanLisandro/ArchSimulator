@@ -38,11 +38,13 @@ public final class CaseGenerator {
                 r(sm.from(), params), sm.atElapsedSeconds(), r(sm.text(), params), sm.expectsUpdate())).toList();
         List<CaseArtifact> artifacts = template.artifacts().stream().map(a -> new CaseArtifact(a.id(), r(a.title(), params),
                 a.kind(), a.language(), r(a.content(), params))).toList();
+        List<FollowUp> followUps = template.followUps().stream()
+                .map(f -> new FollowUp(f.pathId(), f.templateId(), r(f.teaser(), params))).toList();
         Map<String, String> scenarioParams = new LinkedHashMap<>();
         template.scenario().params().forEach((k, v) -> scenarioParams.put(k, r(v, params)));
         return new Case(CaseId.random(), template.companyId(), template.id(), template.type(), level, random.seed(), narrative, checkpoints, paths, form,
                 new ReferenceAnswer(r(template.referenceMarkdown(), params)), new ScenarioSpec(template.scenario().kind(), scenarioParams),
-                recommendation, template.competencies(), template.tools(), Map.copyOf(params), now, mitigations, messages, artifacts);
+                recommendation, template.competencies(), template.tools(), Map.copyOf(params), now, mitigations, messages, artifacts, followUps);
     }
 
     private Map<String, String> sample(CaseTemplate template, RandomSource random, Instant now) {

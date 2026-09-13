@@ -47,7 +47,7 @@ public class RunSql {
         if (!READ_ONLY.matcher(sql).find()) return SqlResult.error("Console somente leitura: use SELECT, WITH ou EXPLAIN.");
 
         Company company = companies.findById(loaded.theCase().companyId()).orElseThrow();
-        ObservabilityDataset dataset = datasets.datasetFor(loaded.theCase());
+        ObservabilityDataset dataset = datasets.datasetFor(loaded.theCase(), loaded.attempt().resolvedAt().orElse(null));
         String target = String.join(",", tableNames(sql));
         boolean isExplain = sql.toLowerCase(Locale.ROOT).startsWith("explain");
 

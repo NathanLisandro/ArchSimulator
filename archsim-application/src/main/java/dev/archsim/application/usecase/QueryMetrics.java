@@ -29,7 +29,7 @@ public class QueryMetrics {
 
     public MetricsView execute(Command cmd) {
         var loaded = AttemptAccess.load(attempts, cases, cmd.userId(), cmd.attemptId());
-        ObservabilityDataset ds = datasets.datasetFor(loaded.theCase());
+        ObservabilityDataset ds = datasets.datasetFor(loaded.theCase(), loaded.attempt().resolvedAt().orElse(null));
         Instant from = cmd.from() == null ? ds.window().from() : cmd.from();
         Instant to = cmd.to() == null ? ds.window().to() : cmd.to();
         List<MetricSeries> series = ds.metrics().stream()

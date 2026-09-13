@@ -1,0 +1,360 @@
+id: bank-followup-cache-stale-statement
+type: INCIDENT
+company: banco-digital
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, caching, eda, observability, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS]
+parameters:
+  ttlMinutes: { range: [5, 30], step: 5 }
+  complaintsPerHour: { range: [40, 420], step: 20 }
+  onsetMinutesAgo: { range: [20, 50], step: 5 }
+  weeksSince: { range: [2, 5] }
+  gap:
+    group:
+      - { gap: "o consumidor que invalida a chave do extrato foi implementado, mas ninguém ligou o alarme de lag, e ele está parado há 40 minutos sem que nada apitasse", gapSource: "consumidor de invalidação parado" }
+      - { gap: "a invalidação por evento cobre PIX recebido, mas ninguém lembrou de estorno e de tarifa, que continuam servindo valor velho", gapSource: "eventos não cobertos" }
+      - { gap: "o TTL de {{ttlMinutes}} minutos virou a única defesa depois que a publicação do evento passou a falhar em silêncio no relay do outbox", gapSource: "relay do outbox falhando em silêncio" }
+derived:
+  p99Now: "180"
+  p99Before: "180"
+narrative:
+  title: "Duas semanas depois do cache: extrato mostra saldo que não existe mais"
+  symptom: |
+    Há {{weeksSince}} semanas o extrato foi colocado atrás de um cache com TTL de **{{ttlMinutes}} minutos** para
+    aguentar a janela em que o índice era reconstruído. O p99 está ótimo: **{{p99Now}}ms**. Nenhum alerta de latência
+    disparou.
+
+    O problema é outro. Desde **{{onsetLabel}}**, o suporte recebe ~**{{complaintsPerHour}} reclamações por hora** de
+    clientes dizendo que receberam um PIX e o extrato não mostra, ou que o saldo exibido não bate com o do topo da
+    tela. Alguns viram lançamentos que já tinham sido estornados.
+
+    {{gap}}
+  businessContext: |
+    O extrato foi cacheado para sobreviver às 6 horas de construção do índice em `ledger_entries`. A mitigação
+    funcionou: o serviço aguentou. O que ficou pendente foi a invalidação por evento, que é o que impede o cache de
+    servir valor velho. Saldo errado em banco digital é chamado no PROCON, não só ticket de suporte.
+  hints:
+    - "Todos os painéis de latência estão verdes. O que mais você olharia?"
+    - "Cache não avisa quando está errado; ele avisa quando está lento — e aqui ele não está lento."
+    - "Qual evento deveria ter apagado essa chave, e por que não apagou?"
+checkpoints:
+  - id: no-alert
+    question: "Nenhum alerta disparou e os gráficos de latência estão normais. Por onde começa?"
+    options:
+      - id: correctness-signal
+        label: "Pelos sinais de correção, não de desempenho: reclamações, divergência entre saldo e extrato, lag do consumidor de invalidação"
+        verdict: GOOD
+        feedback: "Certo. Este é um incidente de **correção**, não de disponibilidade. A instrumentação do time foi toda construída para latência e erro, e por isso {{complaintsPerHour}} reclamações por hora chegaram antes de qualquer alarme."
+      - id: latency-dashboards
+        label: "Pelos painéis de latência, para confirmar que está tudo bem"
+        verdict: RISKY
+        feedback: "Já estão verdes, e é justamente isso que engana. Confirmar o que você já sabe gasta tempo; procure o sinal que ninguém está olhando."
+      - id: wait
+        label: "Esperar mais relatos para entender o padrão"
+        verdict: BAD
+        feedback: "Com {{complaintsPerHour}} reclamações por hora sobre saldo, esperar é deixar o problema crescer em um dado que tem consequência regulatória. O padrão já está claro: extrato desatualizado."
+  - id: which-gap
+    question: "O cache serve dado velho. Onde exatamente está a falha?"
+    options:
+      - id: invalidation-path
+        label: "No caminho de invalidação: o evento que deveria apagar a chave não chega, não cobre todos os casos, ou o consumidor está parado"
+        verdict: GOOD
+        feedback: "Exato. O TTL é a última linha de defesa, não a primeira. Quando a invalidação falha, o TTL de {{ttlMinutes}} minutos define quanto tempo o cliente vê um número errado — e {{ttlMinutes}} minutos é uma eternidade para quem acabou de receber um PIX."
+      - id: cache-size
+        label: "O Redis está sem memória e despejando chaves"
+        verdict: RISKY
+        feedback: "Despejo causaria o oposto: mais misses e dados mais frescos, com mais carga no banco. Vale descartar olhando `evictions`, mas o sintoma é dado velho, não dado ausente."
+      - id: ledger-wrong
+        label: "O ledger está gravando errado"
+        verdict: BAD
+        feedback: "A consulta direta ao banco mostra o lançamento correto. O erro está entre o banco e a tela, que é onde o cache foi colocado."
+  - id: right-fix
+    question: "Qual a correção certa aqui?"
+    options:
+      - id: fix-invalidation-and-alarm
+        label: "Consertar a invalidação, colocar alarme no que a sustenta e reduzir o TTL enquanto isso"
+        verdict: GOOD
+        feedback: "Sim, e a ordem importa: reduzir o TTL contém o dano agora, consertar a invalidação resolve, e o alarme é o que evita descobrir de novo pelo suporte. Sem o alarme, você conserta e volta a ficar cego."
+      - id: remove-cache
+        label: "Remover o cache e voltar a consultar o banco"
+        verdict: RISKY
+        feedback: "Resolve a correção e é reversível, então é defensável como último recurso. Mas o índice já está pronto: vale medir se o banco aguenta antes de remover, porque voltar atrás sem medir é trocar um incidente por outro."
+      - id: lower-ttl-only
+        label: "Baixar o TTL para 30 segundos e encerrar"
+        verdict: BAD
+        feedback: "Reduz a janela de erro, não a elimina, e multiplica a carga no banco por {{ttlMinutes}}. Pior: deixa a causa intacta, então o próximo problema de invalidação volta igual e igualmente silencioso."
+mitigations:
+  - id: lower-ttl
+    label: "Reduzir o TTL do extrato de {{ttlMinutes}} minutos para 30 segundos"
+    description: "Muda a configuração do cache, sem deploy"
+    verdict: RISKY
+    effect: PARTIAL
+    requiresDiagnosis: false
+    feedback: "Contém o dano: a janela de dado velho cai de {{ttlMinutes}} minutos para meio minuto. Em troca, a carga de leitura no `core-db` sobe bastante — aceitável agora que o índice existe, mas precisa ser acompanhado."
+  - id: restart-invalidation-consumer
+    label: "Religar o consumidor de invalidação e drenar o lag"
+    description: "Sobe o consumidor parado e processa a fila acumulada"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "As chaves acumuladas são invalidadas e o extrato volta a refletir o ledger em segundos. Registre o horário: o intervalo entre a parada e agora é a janela em que clientes viram número errado, e o jurídico vai perguntar."
+  - id: purge-cache
+    label: "Limpar todas as chaves de extrato no Redis"
+    description: "FLUSH do padrão `extrato:*`"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Corrige o que está errado agora ao custo de mandar todo mundo ao banco de uma vez. Com o índice já construído isso é sobrevivível, mas faça com jitter, senão você troca dado velho por um stampede."
+  - id: disable-cache
+    label: "Desligar o cache do extrato por feature flag"
+    description: "Todo acesso volta a consultar o core-db"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Garante correção imediata e é reversível. O risco é a carga: meça o p99 e o IOPS por alguns minutos antes de deixar assim, porque foi exatamente isso que motivou o cache."
+  - id: notify-affected
+    label: "Levantar os clientes afetados e avisar"
+    description: "Cruza a janela do incidente com quem acessou o extrato"
+    verdict: GOOD
+    effect: PARTIAL
+    feedback: "Não corrige o sistema, mas é a parte que o cliente sente. Saldo errado visto e não explicado vira reclamação formal; avisado e explicado, costuma virar só um susto."
+  - id: scale-redis
+    label: "Escalar o cluster do Redis"
+    description: "Troca para uma classe maior de ElastiCache"
+    verdict: BAD
+    effect: NONE
+    feedback: "O Redis não está sobrecarregado: ele está fazendo exatamente o que foi mandado, servindo o que tem. O problema é o que foi guardado nele, não a capacidade."
+stakeholders:
+  - id: suporte
+    from: "Camila (Suporte)"
+    afterSeconds: 180
+    text: "São {{complaintsPerHour}} ligações por hora sobre saldo errado. Preciso de um texto para dizer aos clientes, e preciso saber se o dinheiro deles está seguro."
+  - id: juridico
+    from: "Marcos (Jurídico)"
+    afterSeconds: 600
+    text: "Saldo incorreto exibido ao cliente tem exposição regulatória. Preciso saber a janela exata e quantas pessoas viram número errado."
+  - id: arquitetura
+    from: "Dani (Arquitetura)"
+    afterSeconds: 1080
+    text: "Esse cache foi a mitigação que a gente aprovou há {{weeksSince}} semanas, durante o incidente do índice. O que ficou pendente da época?"
+    expectsUpdate: false
+solutionPaths:
+  - id: fix-invalidation
+    name: "Consertar a invalidação e instrumentar a correção"
+    summary: "Religar e completar o caminho de invalidação, reduzir o TTL enquanto isso, e criar alarme sobre o que sustenta a correção do cache."
+    pros: ["Mantém o ganho de desempenho", "Resolve a causa, não o sintoma", "Cria o sinal que faltava"]
+    cons: ["Exige cobrir todos os eventos que mudam o extrato", "Mais uma peça a monitorar", "A janela já ocorrida precisa ser comunicada"]
+    bestWhen: "o cache ainda é necessário e a invalidação é corrigível — o caso aqui, com o índice já pronto mas o volume ainda alto"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [STALE_CACHE] }
+          missing: "A causa raiz é a invalidação incompleta ou parada: {{gapSource}}. O TTL só define o tamanho do estrago."
+          present: "Causa raiz correta: invalidação falhando."
+        - id: second-order
+          name: "Ligação com a decisão anterior"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["mitigação", "mitigacao", "índice", "indice", "semanas", "pendente", "dívida", "divida"], min: 1 }
+          missing: "Este incidente é consequência da mitigação de {{weeksSince}} semanas atrás: registre essa ligação, senão a lição se perde."
+          present: "Consequência da decisão anterior reconhecida."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 15
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: SQL_QUERY }
+          missing: "Compare o que o banco diz com o que o cache serve, e mostre o sinal que denuncia a invalidação parada."
+          present: "Divergência comprovada."
+        - id: mitigation
+          name: "Mitigação informada"
+          weight: 15
+          evidence:
+            - { type: mitigation, effect: RESOLVES, informed: true }
+          missing: "Faltou a ação que restabelece a invalidação, aplicada depois de entender onde ela falhou."
+          present: "Invalidação restabelecida."
+        - id: observability
+          name: "Sinal de correção criado"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["alarme", "alerta", "lag do consumidor", "divergência", "divergencia", "amostragem", "canário", "canario"], min: 1 }
+          missing: "A ação mais importante daqui é o sinal que faltava: alarme de lag da invalidação e verificação periódica de divergência entre cache e banco."
+          present: "Observabilidade de correção criada."
+        - id: communication
+          name: "Comunicação e janela declarada"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 480 }
+            - { type: keyword, field: postMortem, anyOf: ["janela", "afetad", "clientes", "período", "periodo"], min: 1 }
+          missing: "Suporte e jurídico precisam da janela exata e do número de afetados: informe e registre."
+          present: "Janela e afetados comunicados."
+  - id: remove-cache
+    name: "Remover o cache agora que o índice existe"
+    summary: "Desligar o cache do extrato, medir a carga com o índice já construído e manter assim se o banco aguentar."
+    pros: ["Elimina a classe inteira de problema", "Menos uma peça para operar", "Correção garantida por construção"]
+    cons: ["Devolve toda a carga de leitura ao core-db", "Perde a proteção para o próximo pico", "Pode ser irreversível na prática se a equipe esquecer o assunto"]
+    bestWhen: "o motivo original do cache desapareceu e o banco comprovadamente aguenta a carga"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [STALE_CACHE] }
+          missing: "A causa raiz é a invalidação falhando; remover o cache elimina o problema, não o explica."
+          present: "Causa raiz correta."
+        - id: measurement
+          name: "Carga medida antes"
+          weight: 30
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: keyword, field: postMortem, anyOf: ["medir", "iops", "p99", "carga", "gradual", "percentual"], min: 1 }
+          missing: "Remover o cache sem medir é repetir o incidente do índice ao contrário: descreva a medição e o desligamento gradual."
+          present: "Carga medida antes de remover."
+        - id: second-order
+          name: "Ligação com a decisão anterior"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["mitigação", "mitigacao", "índice", "indice", "temporár", "temporar", "pendente"], min: 1 }
+          missing: "O cache era temporário por decisão anterior: registre isso, é o que justifica removê-lo."
+          present: "Natureza temporária resgatada."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 480 }
+          missing: "Faltaram status updates com suporte e jurídico cobrando."
+          present: "Stakeholders informados."
+        - id: rollback
+          name: "Reversão preparada"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["flag", "reverter", "voltar", "gatilho"], min: 1 }
+          missing: "Se o banco não aguentar, você precisa religar o cache em segundos: descreva a flag e o gatilho."
+          present: "Reversão preparada."
+  - id: change-read-model
+    name: "Trocar o cache por um modelo de leitura atualizado por evento"
+    summary: "Substituir o cache de resultado por uma projeção do extrato mantida por eventos do ledger, servida diretamente."
+    pros: ["Frescor deixa de depender de invalidação", "Leitura barata e previsível", "Serve também outras telas"]
+    cons: ["Projeto de semanas", "Não resolve o incidente de agora", "Mais um caminho de escrita para manter correto"]
+    bestWhen: "como destino depois de estabilizar, quando o extrato virou uma leitura crítica e frequente o bastante"
+    rubric:
+      criteria:
+        - id: immediate
+          name: "Resposta imediata também definida"
+          weight: 30
+          evidence:
+            - { type: mitigation, effect: RESOLVES }
+          missing: "A projeção leva semanas; o cliente está vendo saldo errado agora e precisa de uma ação hoje."
+          present: "Ação imediata aplicada."
+        - id: design
+          name: "Desenho da projeção"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["projeção", "projecao", "outbox", "cdc", "evento", "modelo de leitura"], min: 1 }
+          missing: "Descreva como a projeção é alimentada e o que acontece quando o consumidor atrasa."
+          present: "Projeção desenhada."
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [STALE_CACHE] }
+          missing: "A causa raiz é a invalidação falhando em silêncio."
+          present: "Causa raiz correta."
+        - id: communication
+          name: "Comunicação"
+          weight: 25
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 480 }
+          missing: "Faltaram status updates."
+          present: "Stakeholders informados."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: STALE_CACHE, label: "Cache servindo dado velho por falha na invalidação" }
+        - { value: MISSING_INDEX, label: "Índice ausente" }
+        - { value: LEDGER_BUG, label: "Erro de gravação no ledger" }
+        - { value: CACHE_EVICTION, label: "Despejo por falta de memória no Redis" }
+        - { value: CLOCK_SKEW, label: "Clock skew" }
+    - id: incidentClass
+      label: "Que tipo de incidente é este"
+      type: SELECT
+      required: true
+      options:
+        - { value: correctness, label: "De correção: o sistema responde rápido e responde errado" }
+        - { value: availability, label: "De disponibilidade" }
+        - { value: performance, label: "De desempenho" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: fix-invalidation, label: "Consertar a invalidação e instrumentar" }
+        - { value: remove-cache, label: "Remover o cache" }
+        - { value: change-read-model, label: "Trocar por modelo de leitura por evento" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Inclua a ligação com a decisão anterior."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até a correção, clientes viram extrato e saldo desatualizados em até {{ttlMinutes}} minutos, com
+  ~{{complaintsPerHour}} reclamações por hora. Nenhum alerta disparou: **todo** o monitoramento do serviço media
+  latência e erro, e este incidente não produziu nem um nem outro. Exposição regulatória por exibir saldo incorreto.
+
+  ## Linha do tempo
+  - **Há {{weeksSince}} semanas** — durante o incidente do índice removido, o extrato foi colocado atrás de cache com
+    TTL de {{ttlMinutes}} minutos. Decisão correta para aquele momento, com a invalidação por evento registrada como
+    pendência.
+  - **{{onsetLabel}}** — {{gap}}
+  - **+ ~25min** — primeiras reclamações chegam ao suporte; os painéis de latência seguem verdes.
+  - **+ ~45min** — comparação entre a consulta direta ao `core-db` e o que o cache serve confirma a divergência.
+  - **+ ~55min** — invalidação restabelecida e TTL reduzido enquanto isso; extrato volta a refletir o ledger.
+
+  ## Causa raiz
+  Cache servindo dado velho porque o caminho de invalidação falhou: {{gapSource}}. O TTL nunca foi mecanismo de
+  correção, só o limite superior do erro. Quando a invalidação parou, {{ttlMinutes}} minutos viraram a janela em que
+  o cliente via um número que não existia mais.
+
+  A causa de fundo é outra, e é a lição de verdade: **uma mitigação virou permanente sem a instrumentação que ela
+  exigia**. O cache foi aprovado como ponte para as 6 horas de construção do índice. A ponte ficou, a pendência não
+  foi cobrada, e o sistema passou a depender de um mecanismo que ninguém observava.
+
+  ## Ações
+  1. **Imediata:** religar o consumidor de invalidação, drenar o lag e reduzir o TTL para 30s até a confiança voltar.
+  2. **Cobertura (hoje):** revisar **todos** os eventos que mudam o extrato — PIX recebido e enviado, estorno, tarifa,
+     lançamento de cartão, antecipação — e garantir que cada um invalida a chave.
+  3. **Sinal que faltava (esta semana):** alarme de lag do consumidor de invalidação e verificação periódica que
+     compara uma amostra de chaves do cache com o banco, alertando em qualquer divergência.
+  4. **Comunicação (hoje):** levantar os clientes que abriram o extrato na janela e enviar mensagem explicando.
+  5. **Processo (este mês):** toda mitigação aprovada durante um incidente entra no backlog com dono, prazo e o
+     alarme que ela exige. Mitigação sem data de revisão é dívida sem cobrança.
+  6. **Destino (este trimestre):** avaliar substituir o cache por uma projeção do extrato mantida por evento, onde o
+     frescor não depende de invalidação.
+
+  Blameless: a decisão do cache foi certa no contexto em que foi tomada, e quem a tomou registrou a pendência. O que
+  falhou foi o processo que deveria transformar pendência de incidente em trabalho com dono — e a ausência de qualquer
+  métrica de **correção** ao lado das de desempenho.
+scenario:
+  kind: incident
+  params:
+    rootCause: CACHE_STAMPEDE
+    service: account-api
+    datastore: core-db
+    cache: redis-cache
+    endpoint: "GET /accounts/{id}/statement"
+    table: ledger_entries
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    p99Before: "{{p99Before}}"
+    p99After: "260"
+recommendation:
+  default: fix-invalidation
+  rules:
+    - { param: complaintsPerHour, op: ">=", value: 300, path: remove-cache, reason: "com {{complaintsPerHour}} reclamações por hora sobre saldo, cada minuto de dado velho é exposição regulatória; o índice já existe, então desligar o cache e medir é mais rápido e mais seguro que caçar todos os eventos de invalidação agora" }

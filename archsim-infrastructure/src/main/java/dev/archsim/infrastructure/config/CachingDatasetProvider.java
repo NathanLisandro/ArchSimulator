@@ -7,6 +7,7 @@ import dev.archsim.domain.observability.ObservabilityDataset;
 import dev.archsim.domain.observability.ObservabilityDatasetFactory;
 import dev.archsim.domain.shared.SeededRandom;
 
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -21,8 +22,11 @@ public class CachingDatasetProvider implements ObservabilityDatasetProvider {
 
     public CachingDatasetProvider(ObservabilityDatasetFactory factory, CompanyRepository companies) { this.factory = factory; this.companies = companies; }
 
+    /** A chave inclui o instante da mitigação: antes e depois dela o cenário é outro. */
     @Override
-    public synchronized ObservabilityDataset datasetFor(Case c) {
-        return cache.computeIfAbsent(c.id().value(), k -> factory.generate(c, companies.findById(c.companyId()).orElseThrow(), new SeededRandom(c.seed())));
+    public synchronized ObservabilityDataset datasetFor(Case c, Instant recoveredAt) {
+        String key = c.id().value() + "@" + (recoveredAt == null ? "open" : recoveredAt.toString());
+        return cache.computeIfAbsent(key, k ->
+                factory.generate(c, companies.findById(c.companyId()).orElseThrow(), new SeededRandom(c.seed()), recoveredAt));
     }
 }

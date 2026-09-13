@@ -168,7 +168,11 @@ const splitRow = (line: string) =>
     .split('|')
     .map((cell) => cell.trim())
 
-const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\n]+\*)|(_[^_\n]+_)|(\[[^\]]+\]\([^)]+\))/g
+/**
+ * Ênfase com sublinhado só vale fora de palavra: `pg_stat_user_indexes` é um identificador, não itálico.
+ * Por isso `_..._` exige limite de palavra antes e depois, enquanto `*...*` não precisa.
+ */
+const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(?<![A-Za-z0-9])(__[^_]+__)(?![A-Za-z0-9])|(\*[^*\n]+\*)|(?<![A-Za-z0-9])(_[^_\n]+_)(?![A-Za-z0-9])|(\[[^\]]+\]\([^)]+\))/g
 
 function inline(text: string): ReactNode[] {
   const out: ReactNode[] = []

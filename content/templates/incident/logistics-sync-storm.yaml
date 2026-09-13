@@ -1,0 +1,359 @@
+id: logistics-incident-sync-storm
+type: INCIDENT
+company: logistica
+levels: [PLENO, SENIOR, STAFF]
+competencies: [incident, eda, kafka, sre, observability, communication]
+tools: [LOGS, METRICS, TRACES, SQL, DEPLOYS, INFRA]
+parameters:
+  p99: { range: [3000, 11000], step: 500 }
+  onsetMinutesAgo: { range: [15, 45], step: 5 }
+  driversOffline: { range: [1800, 7400], step: 200 }
+  cause:
+    group:
+      - { causeText: "uma falha de rede de uma operadora deixou 40% dos motoristas sem dados por 50 minutos, e todos reconectaram quase juntos quando o serviço voltou", causeSource: "operadora" }
+      - { causeText: "o app do motorista subiu uma versão que trocou a sincronização incremental por envio do dia inteiro a cada reconexão", causeSource: "app-motorista 4.18" }
+      - { causeText: "um hub grande ficou sem internet durante a tarde e os leitores acumularam bipagens que foram despejadas de uma vez quando o link voltou", causeSource: "hub-guarulhos" }
+derived:
+  p99Before: "round(p99 / 25)"
+  eventsBacklog: "driversOffline * 190"
+narrative:
+  title: "Rastreio parado: {{eventsBacklog|compact}} eventos chegando de uma vez"
+  symptom: |
+    **{{onsetLabel}}** — o `tracking-api` está com p99 de **{{p99}}ms** (baseline ~{{p99Before}}ms) e o consumidor do
+    tópico `tracking.raw` acumula lag. O destinatário abre o rastreio e vê o pacote parado em "saiu para entrega"
+    há horas, mesmo já entregue.
+
+    {{causeText}}
+
+    São ~{{driversOffline|number}} motoristas sincronizando ao mesmo tempo, cerca de {{eventsBacklog|compact}} eventos
+    represados. O `parcel-api` e o `hub-scanner` seguem normais.
+  businessContext: |
+    O rastreio errado gera chamado do destinatário e do embarcador, e o evento de entrega é a base da apuração de SLA:
+    evento que chega tarde ou fora de ordem vira multa indevida no faturamento. O app do motorista é offline-first
+    por projeto — sincronizar em lote é comportamento esperado, não defeito.
+  hints:
+    - "Lag de consumidor com produção alta é fila, não falha: veja se a distribuição entre partições está uniforme."
+    - "Evento que chega fora de ordem e evento duplicado são problemas diferentes; qual está acontecendo?"
+    - "A chave da mensagem decide a partição e, com ela, o paralelismo possível."
+checkpoints:
+  - id: scope
+    question: "O rastreio degradou mas o resto está normal. Por onde começa?"
+    options:
+      - id: lag-by-partition
+        label: "Ver o lag do consumidor por partição, não só o total"
+        verdict: GOOD
+        feedback: "Certo. O lag total esconde o formato do problema: se uma partição concentra a fila e as outras estão zeradas, o gargalo é distribuição, não capacidade. Com {{driversOffline|number}} motoristas voltando juntos, isso é bem provável."
+      - id: scale-consumer
+        label: "Escalar o consumidor imediatamente"
+        verdict: RISKY
+        feedback: "Escalar é resposta legítima quando o gargalo é capacidade. Mas o paralelismo do Kafka é limitado pelo número de partições: se o problema for concentração em uma partição, pods novos ficam ociosos enquanto a fila continua."
+      - id: restart-consumer
+        label: "Reiniciar o consumidor para 'destravar'"
+        verdict: BAD
+        feedback: "Reiniciar dispara rebalance, pausa o consumo inteiro e você perde as métricas de heap que diriam se há problema de processamento. Com {{eventsBacklog|compact}} eventos na fila, a pausa custa caro."
+  - id: partition-key
+    question: "O lag está concentrado em três partições. Qual é a chave da mensagem?"
+    options:
+      - id: hub-key
+        label: "A chave é o hub: 34 valores possíveis, e os hubs grandes concentram quase tudo"
+        verdict: GOOD
+        feedback: "Essa é a raiz. Chave com poucos valores distintos e distribuição desigual gera hot partition. Trocar a chave para o pacote ou compor hub + faixa espalha a carga, mas muda a garantia de ordem: é preciso decidir por qual chave a ordem realmente importa."
+      - id: random-key
+        label: "A chave é aleatória, então a distribuição está uniforme"
+        verdict: BAD
+        feedback: "Se fosse aleatória, o lag estaria espalhado. A concentração em três partições é a evidência de que a chave tem poucos valores e são desiguais."
+      - id: no-key
+        label: "Não há chave: o Kafka distribui em round-robin"
+        verdict: RISKY
+        feedback: "Sem chave haveria distribuição uniforme e nenhuma garantia de ordem por pacote — o que criaria outro problema. Confira o produtor antes de assumir."
+  - id: ordering
+    question: "Os eventos chegam fora de ordem depois de horas offline. O que isso exige do consumidor?"
+    options:
+      - id: idempotent-and-timestamped
+        label: "Aplicar por `occurred_at`, não por ordem de chegada, e ser idempotente por chave do evento"
+        verdict: GOOD
+        feedback: "Exato. O app é offline-first: ordem de chegada nunca foi garantia. O estado do pacote deve avançar pelo instante do evento, ignorando evento antigo que chega depois, e `uq_events_idempotency` já existe para deduplicar."
+      - id: strict-ordering
+        label: "Forçar ordenação global antes de aplicar"
+        verdict: BAD
+        feedback: "Ordem global é a garantia mais cara que existe, e aqui é impossível: um motorista pode ficar cinco horas offline. O caminho é tornar a aplicação do evento insensível à ordem, não tentar restaurá-la."
+      - id: discard-late
+        label: "Descartar eventos que chegam muito atrasados"
+        verdict: BAD
+        feedback: "Descartar evento de entrega atrasado é apagar a prova de que o pacote foi entregue no prazo — e isso vira multa de SLA indevida contra a própria empresa."
+mitigations:
+  - id: increase-partitions
+    label: "Aumentar as partições de `tracking.raw` de 48 para 144"
+    description: "Amplia o paralelismo possível do consumer group"
+    verdict: RISKY
+    effect: PARTIAL
+    requiresDiagnosis: true
+    feedback: "Ajuda no médio prazo, mas não hoje: mensagens já produzidas continuam nas partições antigas, e a chave atual continua concentrando. Sem mudar a chave, partições novas ficam vazias."
+  - id: rekey-by-parcel
+    label: "Republicar com chave por pacote em um tópico paralelo"
+    description: "Um serviço ponte lê `tracking.raw` e republica por `parcel_id` em `tracking.enriched`"
+    verdict: GOOD
+    effect: RESOLVES
+    requiresDiagnosis: true
+    feedback: "Espalha a carga por 1,4 bilhão de chaves possíveis e preserva a ordem onde ela importa: por pacote. O lag drena em minutos e o rastreio volta a acompanhar a realidade."
+  - id: scale-consumer
+    label: "Triplicar os pods do consumidor"
+    description: "Escala horizontal do consumer group"
+    verdict: BAD
+    effect: NONE
+    feedback: "Sem efeito: o paralelismo é limitado pelas partições, e o lag está em três delas. Os pods novos ficam sem partição atribuída enquanto a fila continua."
+  - id: throttle-gateway
+    label: "Limitar a sincronização no `driver-app-gateway` a 200 eventos por motorista por minuto"
+    description: "Backpressure na borda, com o app reenviando o restante depois"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Contém a avalanche e protege o consumidor, mas alonga o tempo até o rastreio ficar correto — e o app precisa mesmo reenviar o resto, senão você perde evento."
+  - id: pause-notifications
+    label: "Pausar as notificações ao destinatário"
+    description: "Desliga o consumo de `notifications.outbound` temporariamente"
+    verdict: RISKY
+    effect: PARTIAL
+    feedback: "Evita avisar 'saiu para entrega' de um pacote entregue há três horas, o que hoje está acontecendo. Não conserta o rastreio, mas para de piorar a percepção do cliente."
+  - id: restart-consumer
+    label: "Reiniciar os pods do consumidor"
+    description: "Rollout restart"
+    verdict: BAD
+    effect: HARMFUL
+    feedback: "Dispara rebalance, pausa o consumo inteiro por dezenas de segundos e aumenta o lag que você está tentando reduzir."
+stakeholders:
+  - id: ops
+    from: "Cris (Operações)"
+    afterSeconds: 240
+    text: "Os hubs estão ligando: o painel mostra pacote em rota que o motorista já entregou. Posso dizer que é atraso de sistema?"
+  - id: comercial
+    from: "Bruno (Comercial)"
+    afterSeconds: 660
+    text: "Dois embarcadores viram o rastreio parado. Isso conta como descumprimento de SLA no fechamento?"
+  - id: app
+    from: "Lia (squad App do motorista)"
+    afterSeconds: 900
+    text: "Confirmo: a versão 4.18 manda o dia inteiro a cada reconexão. Posso reverter, mas 6 mil motoristas já atualizaram."
+    expectsUpdate: false
+solutionPaths:
+  - id: rekey-and-idempotency
+    name: "Rechavear por pacote e tornar a aplicação idempotente"
+    summary: "Republicar os eventos com chave por pacote, aplicar pelo instante do evento e deduplicar pela chave de idempotência que já existe."
+    pros: ["Resolve a concentração e a ordem ao mesmo tempo", "Preserva a ordem onde ela importa", "Aproveita a restrição de unicidade existente"]
+    cons: ["Um serviço ponte a mais no caminho", "Reprocessamento precisa ser seguro", "Não impede a avalanche na origem"]
+    bestWhen: "a chave atual tem poucos valores desiguais e a ordem só importa por entidade — o caso aqui"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [HOT_PARTITION] }
+          missing: "A causa raiz é hot partition: a chave por hub concentra a carga em poucas partições quando {{driversOffline|number}} motoristas sincronizam juntos."
+          present: "Causa raiz correta: hot partition por chave de hub."
+        - id: evidence
+          name: "Evidência da investigação"
+          weight: 20
+          evidence:
+            - { type: investigation, kind: METRICS_VIEW }
+            - { type: investigation, kind: LOG_SEARCH }
+          missing: "Mostre o lag por partição nas métricas e as linhas de log do consumidor durante a avalanche."
+          present: "Concentração comprovada por métrica e log."
+        - id: rekey
+          name: "Nova chave escolhida com critério"
+          weight: 20
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["parcel_id", "por pacote", "chave", "rechave", "partição", "particao"], min: 1 }
+            - { type: keyword, field: postMortem, anyOf: ["ordem", "ordenação", "ordenacao", "garantia"], min: 1 }
+          missing: "Diga qual passa a ser a chave e o que acontece com a garantia de ordem ao trocá-la."
+          present: "Chave nova com efeito sobre a ordem declarado."
+        - id: idempotency
+          name: "Idempotência e ordem por instante"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["idempot", "occurred_at", "uq_events", "dedup", "instante do evento"], min: 1 }
+          missing: "Com sincronização offline, aplique o evento pelo `occurred_at` e deduplique pela chave de idempotência."
+          present: "Aplicação idempotente e por instante descrita."
+        - id: mitigation
+          name: "Mitigação informada"
+          weight: 10
+          evidence:
+            - { type: mitigation, effect: RESOLVES, informed: true }
+          missing: "Faltou aplicar a ação que drena o lag, depois de confirmar a concentração."
+          present: "Lag drenado com diagnóstico."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 600 }
+          missing: "Operações e comercial cobraram posição: dois status updates, o primeiro em até 10 minutos."
+          present: "Stakeholders informados."
+  - id: backpressure-first
+    name: "Backpressure na borda e drenagem controlada"
+    summary: "Limitar a sincronização no gateway, drenar a fila em ritmo sustentável e só depois mudar a chave."
+    pros: ["Protege o consumidor sem mudar contrato de tópico", "Efeito imediato", "Reduz o risco de derrubar o banco junto"]
+    cons: ["Alonga o tempo até o rastreio ficar correto", "Exige que o app reenvie o restante", "Não corrige a concentração"]
+    bestWhen: "a avalanche ameaça derrubar também o banco e é preciso estabilizar antes de mudar qualquer coisa"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [HOT_PARTITION] }
+          missing: "A causa raiz é a concentração em poucas partições."
+          present: "Causa raiz correta."
+        - id: mitigation
+          name: "Contenção aplicada"
+          weight: 25
+          evidence:
+            - { type: mitigation, effect: PARTIAL }
+          missing: "Aplique a contenção de fato (limite no gateway ou pausa das notificações), não apenas descreva."
+          present: "Contenção aplicada."
+        - id: no-data-loss
+          name: "Garantia de que nada se perde"
+          weight: 25
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["reenvi", "retenção", "retencao", "não perde", "nao perde", "fila local", "buffer"], min: 1 }
+          missing: "Limitar a borda só é aceitável se o app guarda e reenvia: explicite onde o evento fica enquanto espera."
+          present: "Ausência de perda garantida."
+        - id: follow-up
+          name: "Correção estrutural"
+          weight: 15
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["chave", "partição", "particao", "rechave"], min: 1 }
+          missing: "Registre a correção da chave como próximo passo, com dono e prazo."
+          present: "Correção estrutural registrada."
+        - id: communication
+          name: "Comunicação"
+          weight: 15
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 600 }
+          missing: "Faltaram status updates no ritmo da cobrança."
+          present: "Stakeholders informados."
+  - id: rollback-app
+    name: "Reverter a versão do app e tratar o acúmulo"
+    summary: "Voltar o app à sincronização incremental, drenar o que já chegou e corrigir a chave depois."
+    pros: ["Ataca a origem do volume", "Reduz a recorrência amanhã"]
+    cons: ["Seis mil motoristas já atualizaram e nem todos revertem rápido", "Não resolve a fila atual", "A concentração por chave continua"]
+    bestWhen: "a mudança de comportamento do app é recente e reversível, e o volume represado ainda é pequeno"
+    rubric:
+      criteria:
+        - id: root-cause
+          name: "Causa raiz"
+          weight: 20
+          evidence:
+            - { type: choice, field: rootCause, anyOf: [HOT_PARTITION] }
+          missing: "O volume é gatilho; a causa da parada é a concentração por chave."
+          present: "Causa raiz correta."
+        - id: reach
+          name: "Alcance do rollback avaliado"
+          weight: 30
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["já atualizaram", "ja atualizaram", "alcance", "gradual", "loja", "força", "forca"], min: 1 }
+          missing: "Rollback de app não é instantâneo: avalie quantos já atualizaram e em quanto tempo a versão anterior chega a eles."
+          present: "Alcance do rollback avaliado."
+        - id: queue
+          name: "O que fazer com a fila atual"
+          weight: 30
+          evidence:
+            - { type: keyword, field: postMortem, anyOf: ["drenar", "fila", "lag", "acumul", "reprocess"], min: 1 }
+          missing: "Reverter o app não drena o que já está na fila: descreva como o acúmulo é processado."
+          present: "Tratamento da fila descrito."
+        - id: communication
+          name: "Comunicação"
+          weight: 20
+          evidence:
+            - { type: status_update, min: 2, firstWithin: 600 }
+          missing: "Faltaram status updates."
+          present: "Stakeholders informados."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: rootCause
+      label: "Causa raiz"
+      type: SELECT
+      required: true
+      options:
+        - { value: HOT_PARTITION, label: "Hot partition: chave concentra a carga em poucas partições" }
+        - { value: RETRY_STORM, label: "Retry storm" }
+        - { value: POOL_EXHAUSTION, label: "Saturação do pool de conexões" }
+        - { value: N_PLUS_ONE, label: "N+1 no consumidor" }
+        - { value: TRAFFIC_SPIKE, label: "Pico de tráfego sem concentração" }
+    - id: orderingStrategy
+      label: "Como o consumidor deve aplicar os eventos"
+      type: SELECT
+      required: true
+      options:
+        - { value: by-timestamp, label: "Pelo instante do evento, de forma idempotente" }
+        - { value: by-arrival, label: "Na ordem de chegada" }
+        - { value: global-order, label: "Com ordenação global antes de aplicar" }
+    - id: solutionPath
+      label: "Estratégia de resposta"
+      type: SELECT
+      required: true
+      options:
+        - { value: rekey-and-idempotency, label: "Rechavear por pacote e aplicar idempotente" }
+        - { value: backpressure-first, label: "Backpressure e drenagem controlada" }
+        - { value: rollback-app, label: "Reverter a versão do app" }
+    - id: postMortem
+      label: "Post-mortem"
+      type: MARKDOWN
+      required: true
+      help: "Seções obrigatórias: ## Impacto, ## Linha do tempo, ## Causa raiz, ## Ações. Tom blameless."
+reference: |
+  ## Impacto
+  De {{onsetLabel}} até a drenagem: rastreio desatualizado para os pacotes de ~{{driversOffline|number}} motoristas,
+  p99 do `tracking-api` em {{p99}}ms contra baseline de {{p99Before}}ms, e ~{{eventsBacklog|compact}} eventos
+  represados. Efeito colateral: notificações de "saiu para entrega" disparadas para pacotes já entregues.
+
+  ## Linha do tempo
+  - **{{onsetLabel}}** — {{causeText}}
+  - **+3min** — lag de `tracking.raw` começa a subir; o total esconde que está concentrado em três partições.
+  - **+8min** — alerta de lag dispara; `parcel-api` e `hub-scanner` seguem normais, o que descarta problema de banco.
+  - **+15min** — lag por partição confirma a concentração; a chave do produtor é o `hub_id`, com 34 valores e
+    distribuição muito desigual.
+  - **+~25min** — eventos republicados com chave por `parcel_id`; a fila drena e o rastreio alcança a realidade.
+
+  ## Causa raiz
+  Hot partition. A chave da mensagem era o hub, com 34 valores possíveis e concentração natural nos hubs grandes.
+  Enquanto o fluxo é contínuo isso não aparece; quando {{driversOffline|number}} motoristas sincronizam ao mesmo
+  tempo, três partições recebem quase tudo e o paralelismo do consumer group deixa de existir na prática.
+
+  Dois agravantes de projeto, não de operação:
+  - O consumidor aplicava o evento na **ordem de chegada**, e não pelo `occurred_at`. Com sincronização offline-first,
+    ordem de chegada nunca foi garantia.
+  - As notificações são disparadas por evento aplicado, sem checar se o pacote já avançou de estado.
+
+  ## Ações
+  1. **Imediata:** republicar com chave por `parcel_id`, preservando ordem por pacote em vez de por hub.
+  2. **Consumidor (esta semana):** aplicar transição de estado pelo `occurred_at`, ignorando evento anterior ao estado
+     atual, e deduplicar por `uq_events_idempotency`.
+  3. **Notificação (esta semana):** só avisar o destinatário quando o estado realmente mudar, comparando com o atual.
+  4. **Detecção (esta semana):** alerta de lag **por partição** e da razão entre a partição mais cheia e a mediana.
+  5. **Borda (este mês):** o `driver-app-gateway` passa a espalhar a sincronização em janela aleatória de alguns
+     minutos, para que uma reconexão em massa não vire avalanche simultânea.
+
+  Blameless: o app é offline-first por projeto e sincronizar em lote é o comportamento correto. O que faltava era o
+  outro lado estar preparado para receber assim — e um alerta que mostrasse a concentração antes do impacto.
+scenario:
+  kind: incident
+  params:
+    rootCause: KAFKA_HOT_PARTITION
+    service: tracking-api
+    datastore: tracking-db
+    endpoint: "POST /tracking/events:batch"
+    broker: kafka
+    topic: tracking.raw
+    table: parcel_events
+    onsetAt: "{{onsetMinutesAgoAt}}"
+    deployAt: "{{onsetMinutesAgoAt}}"
+    deployService: driver-app-gateway
+    deployVersion: "4.18"
+    deployAuthor: "squad-app"
+    deployDescription: "sincronização do app do motorista"
+    p99Before: "{{p99Before}}"
+    p99After: "{{p99}}"
+recommendation:
+  default: rekey-and-idempotency
+  rules:
+    - { param: driversOffline, op: ">=", value: 6000, path: backpressure-first, reason: "com {{driversOffline|number}} motoristas voltando juntos, a avalanche ameaça o banco antes de qualquer mudança de chave surtir efeito; estabilize a borda primeiro" }

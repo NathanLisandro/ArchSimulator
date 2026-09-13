@@ -26,6 +26,7 @@ class ConsoleUseCasesTest {
     private final StartCase startCase = new StartCase(companies, templates, cases, attempts, new dev.archsim.domain.template.CaseGenerator(), new InMemory.Seeds(), clock);
     private final SearchLogs searchLogs = new SearchLogs(attempts, cases, datasets, clock);
     private final GetTraces getTraces = new GetTraces(attempts, cases, datasets, clock);
+    private final QueryMetrics queryMetrics = new QueryMetrics(attempts, cases, datasets, clock);
     private final GetTimeline getTimeline = new GetTimeline(attempts, cases, companies, datasets, clock);
     private final ApplyMitigation applyMitigation = new ApplyMitigation(attempts, cases, clock);
     private final PostStatusUpdate postStatusUpdate = new PostStatusUpdate(attempts, cases, clock);
@@ -105,6 +106,34 @@ class ConsoleUseCasesTest {
 
         assertThatThrownBy(() -> applyMitigation.execute(new ApplyMitigation.Command(user, id, "nope")))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void metricsRecoverAfterTheMitigationIsApplied() {
+        String id = startAttempt();
+        double degraded = latestLatency(id);
+        double peakWhileBroken = peakLatency(id);
+        assertThat(degraded).as("o incidente começa degradado").isGreaterThan(2000);
+
+        searchLogs.execute(new SearchLogs.Command(user, id, "level=ERROR", null, null));
+        applyMitigation.execute(new ApplyMitigation.Command(user, id, "rollback-deploy"));
+
+        assertThat(latestLatency(id)).as("depois da mitigação o p99 volta ao normal").isLessThan(degraded / 3);
+        assertThat(peakLatency(id)).as("o passado não muda: o pico do incidente continua no gráfico")
+                .isCloseTo(peakWhileBroken, org.assertj.core.data.Percentage.withPercentage(5));
+    }
+
+    private double latestLatency(String attemptId) {
+        return series(attemptId).points().getLast().value();
+    }
+
+    private double peakLatency(String attemptId) {
+        return series(attemptId).points().stream().mapToDouble(p -> p.value()).max().orElseThrow();
+    }
+
+    private dev.archsim.domain.observability.MetricSeries series(String attemptId) {
+        MetricsView view = queryMetrics.execute(new QueryMetrics.Command(user, attemptId, "account-api", List.of("latency_p99"), null, null));
+        return view.series().getFirst();
     }
 
     @Test

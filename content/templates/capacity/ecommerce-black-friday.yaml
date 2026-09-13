@@ -1,0 +1,305 @@
+id: ecommerce-capacity-black-friday
+type: CAPACITY_PLANNING
+company: ecommerce
+levels: [PLENO, SENIOR, STAFF]
+competencies: [capacity, cloud, sre, characteristics, caching]
+tools: [METRICS, SQL, INFRA]
+parameters:
+  lastPeakOrdersPerMinute: { range: [3200, 11000], step: 200 }
+  expectedGrowth: { range: [20, 90], step: 5 }
+  weeksToEvent: { range: [3, 10] }
+  budgetThousandReais: { range: [40, 260], step: 10 }
+  memory:
+    group:
+      - { memory: "no ano passado o checkout caiu por 22 minutos às 21h do primeiro dia, quando o pool do orders-db saturou", memoryNote: "a perda estimada foi de R$ 1,8 milhão em pedidos não realizados" }
+      - { memory: "no ano passado a busca aguentou, mas o inventory-service virou gargalo e 4% dos pedidos ficaram sem reserva de estoque", memoryNote: "o cancelamento em massa no dia seguinte gerou 11 mil chamados" }
+      - { memory: "no ano passado o pico foi absorvido, mas a conta da AWS do mês veio 3,4 vezes maior que o previsto", memoryNote: "o financeiro pediu previsão de custo antes de qualquer provisionamento" }
+derived:
+  expectedPeak: "round(lastPeakOrdersPerMinute * (100 + expectedGrowth) / 100)"
+  expectedPeakPerSecond: "round(lastPeakOrdersPerMinute * (100 + expectedGrowth) / 6000)"
+  connectionsNeeded: "round(lastPeakOrdersPerMinute * (100 + expectedGrowth) / 100 / 12)"
+narrative:
+  title: "Black Friday em {{weeksToEvent}} semanas: {{expectedPeak|number}} pedidos por minuto no pico"
+  symptom: |
+    A Black Friday começa em **{{weeksToEvent}} semanas**. O pico do ano passado foi de
+    **{{lastPeakOrdersPerMinute|number}} pedidos por minuto**, e a projeção de marketing é de
+    **{{expectedGrowth}}% a mais**, o que dá cerca de **{{expectedPeak|number}} por minuto**
+    (~{{expectedPeakPerSecond}} por segundo).
+
+    {{memory}} — {{memoryNote}}.
+
+    Entregue o plano de capacidade: onde bate primeiro, quanto custa provisionar, o que degrada de propósito se ainda
+    assim faltar, e como se sabe que o plano funciona antes do dia.
+  businessContext: |
+    O `orders-db` é RDS db.r6g.4xlarge com limite de 3.000 conexões; hoje há 30 pods de `checkout-api` com pool de 25
+    cada. O `inventory-service` roda em 12 pods. O orçamento aprovado para infraestrutura extra é de
+    R$ {{budgetThousandReais}} mil. A Black Friday concentra 40% do faturamento do trimestre, e o checkout fora do ar
+    por 20 minutos no pico é o pior resultado possível.
+  hints:
+    - "Projete cada dependência do caminho do pedido, não só o serviço de entrada."
+    - "Capacidade que não foi testada não é capacidade: é esperança."
+    - "Decida agora o que vai ser desligado se faltar, e não durante o incidente."
+checkpoints:
+  - id: chain
+    question: "Por onde começa a projeção?"
+    options:
+      - id: whole-chain
+        label: "Pelo caminho completo do pedido: checkout, estoque, pagamento e o banco de cada um"
+        verdict: GOOD
+        feedback: "Certo. O gargalo vai estar no elo mais fraco da cadeia, não no serviço de entrada. Com {{expectedPeak|number}} pedidos por minuto, cada salto precisa ter a própria conta — inclusive o adquirente, que tem limite contratual."
+      - id: checkout-only
+        label: "Pelo `checkout-api`, que é a porta de entrada"
+        verdict: RISKY
+        feedback: "É por onde o tráfego entra, mas {{memory}}: o gargalo do ano passado não foi ele. Projete a cadeia inteira antes de dimensionar."
+      - id: scale-everything
+        label: "Escalar tudo três vezes e monitorar no dia"
+        verdict: BAD
+        feedback: "Custa muito, não cabe no orçamento de R$ {{budgetThousandReais}} mil, e ainda assim pode não resolver: escalar pods multiplica conexões no `orders-db`, que tem limite fixo de 3.000."
+  - id: connections
+    question: "Você triplica os pods de `checkout-api`. O que acontece com o `orders-db`?"
+    options:
+      - id: connection-math
+        label: "90 pods × 25 conexões = 2.250 só do checkout, perto do limite de 3.000 com os outros serviços competindo"
+        verdict: GOOD
+        feedback: "Exato, e essa é a conta que o ano passado não fez. Escalar o serviço de entrada sem tratar o pool empurra o limite para o banco, que não escala com a mesma facilidade. Pooler externo ou pool menor por pod vem antes de escalar."
+      - id: rds-scales
+        label: "O RDS aguenta: é só subir a classe da instância"
+        verdict: RISKY
+        feedback: "Subir a classe leva failover de 60 a 120 segundos e precisa ser feito **antes** do evento, nunca durante. E o `max_connections` do RDS não cresce linearmente com a classe: o teto prático chega antes."
+      - id: no-issue
+        label: "Conexão ociosa não custa nada"
+        verdict: BAD
+        feedback: "Cada conexão no PostgreSQL custa memória e trabalho do gerenciador. Foi exatamente a saturação do pool que derrubou o checkout no ano passado."
+  - id: degradation
+    question: "A capacidade provisionada não é suficiente no pico. O que você desliga?"
+    options:
+      - id: planned-degradation
+        label: "O que já foi decidido antes: recomendação vira lista fixa, frete estimado vira faixa, e o pedido continua entrando"
+        verdict: GOOD
+        feedback: "Certo. Degradação é decisão de produto tomada com calma, escrita e testada antes. Durante o pico, ninguém tem tempo nem cabeça para decidir o que sacrificar."
+      - id: decide-later
+        label: "Decidir na hora, com o time de plantão"
+        verdict: BAD
+        feedback: "Às 21h da Black Friday, com o checkout em 8 segundos, a decisão sai pior e mais devagar. Além disso, desligar algo que ninguém testou desligado costuma quebrar outra coisa."
+      - id: nothing
+        label: "Nada: se faltar capacidade, a gente aguenta"
+        verdict: BAD
+        feedback: "Sem degradação planejada, a falta de capacidade vira indisponibilidade total, que é o cenário de R$ 1,8 milhão do ano passado. Perder a recomendação é infinitamente melhor que perder o checkout."
+solutionPaths:
+  - id: pooler-and-load-test
+    name: "Pooler, ajuste de pool e teste de carga com o alvo real"
+    summary: "Reduzir conexões por pod com PgBouncer, dimensionar cada elo da cadeia para o pico projetado e validar com teste de carga no ambiente de produção reduzido antes do evento."
+    pros: ["Ataca o gargalo que derrubou o ano passado", "Cabe no orçamento", "Teste transforma esperança em evidência"]
+    cons: ["Transaction mode exige revisar prepared statements", "Teste de carga ocupa o time por uma semana", "Não elimina a necessidade de degradação"]
+    bestWhen: "o gargalo é conexão e há semanas suficientes para testar — o caso aqui"
+    rubric:
+      criteria:
+        - id: chain
+          name: "Cadeia inteira projetada"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["inventory", "payment", "adquirente", "kafka", "cadeia", "cada elo"], min: 2 }
+            - { type: number, field: projectedPeakPerSecond, expected: "expectedPeakPerSecond", tolerance: 0.3 }
+          missing: "Projete cada dependência do caminho do pedido, com o número de pico por segundo."
+          present: "Cadeia inteira projetada com números."
+        - id: connections
+          name: "Conta de conexões"
+          weight: 25
+          evidence:
+            - { type: number, field: connectionsAtPeak, expected: "connectionsNeeded", tolerance: 0.5 }
+            - { type: keyword, field: plan, anyOf: ["pgbouncer", "pooler", "pool por pod", "transaction mode", "conexões", "conexoes"], min: 1 }
+          missing: "Faça a conta de conexões no pico e diga como ela cabe no limite de 3.000 do `orders-db`."
+          present: "Conta de conexões feita e resolvida."
+        - id: validation
+          name: "Teste de carga com alvo declarado"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["teste de carga", "ensaio", "simula", "k6", "gatling", "jmeter"], min: 1 }
+            - { type: keyword, field: plan, anyOf: ["critério", "criterio", "aprovado se", "p99", "erro abaixo"], min: 1 }
+          missing: "Capacidade não testada é esperança: descreva o teste, o alvo de carga e o critério que reprova o plano."
+          present: "Validação com critério objetivo."
+        - id: degradation
+          name: "Degradação decidida antes"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["degrada", "desliga", "flag", "recomendação", "recomendacao", "fila"], min: 1 }
+          missing: "Liste o que é desligado, em que ordem e por qual gatilho, com as flags já testadas."
+          present: "Degradação planejada e testada."
+        - id: cost
+          name: "Custo dentro do orçamento"
+          weight: 10
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["r$", "custo", "orçamento", "orcamento", "por hora", "mensal"], min: 1 }
+          missing: "Compare o custo do provisionamento com o orçamento de R$ {{budgetThousandReais}} mil."
+          present: "Custo dentro do orçamento."
+  - id: scale-and-queue
+    name: "Escalar o que dá e enfileirar o resto"
+    summary: "Provisionar o máximo que o orçamento permite e absorver o excedente com fila de pedidos, confirmando de forma assíncrona."
+    pros: ["Nenhum pedido é recusado", "Absorve pico imprevisto", "Independe de acertar a projeção"]
+    cons: ["Muda a promessa ao cliente: confirmação deixa de ser imediata", "Exige idempotência e comunicação clara", "Fila longa vira cancelamento em massa depois"]
+    bestWhen: "o pico é imprevisível e é preferível aceitar o pedido e confirmar depois a recusar na hora"
+    rubric:
+      criteria:
+        - id: promise
+          name: "Promessa ao cliente"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["confirmação", "confirmacao", "em processamento", "aviso", "expectativa", "e-mail"], min: 1 }
+          missing: "Aceitar e confirmar depois muda o que o cliente espera: descreva a mensagem e o prazo prometido."
+          present: "Promessa ao cliente explicitada."
+        - id: drain
+          name: "Drenagem controlada"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["vazão", "vazao", "drenar", "gradual", "limite", "estoque"], min: 1 }
+          missing: "Fila que drena rápido demais derruba o estoque e o pagamento: descreva a vazão controlada."
+          present: "Drenagem controlada descrita."
+        - id: connections
+          name: "Conta de conexões"
+          weight: 25
+          evidence:
+            - { type: number, field: connectionsAtPeak, expected: "connectionsNeeded", tolerance: 0.5 }
+          missing: "Mesmo enfileirando, faça a conta de conexões do que continua síncrono."
+          present: "Conta de conexões feita."
+        - id: cancel-risk
+          name: "Risco de cancelamento em massa"
+          weight: 20
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["cancel", "estoque", "reserva", "chamado"], min: 1 }
+          missing: "Pedido aceito sem estoque vira cancelamento no dia seguinte: diga como isso é evitado."
+          present: "Risco de cancelamento tratado."
+  - id: shed-and-protect
+    name: "Proteger o núcleo e recusar cedo"
+    summary: "Dimensionar apenas o caminho crítico do pedido, desligar o que é acessório desde o início do evento e recusar excedente com mensagem clara."
+    pros: ["Custo mínimo", "Previsibilidade alta para quem consegue entrar", "Núcleo protegido de ponta a ponta"]
+    cons: ["Recusa clientes de propósito no maior dia do ano", "Exige alinhamento difícil com marketing", "Reputação em rede social"]
+    bestWhen: "o orçamento é curto e a alternativa realista é indisponibilidade total no pico"
+    rubric:
+      criteria:
+        - id: core
+          name: "Núcleo definido"
+          weight: 30
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["caminho crítico", "caminho critico", "núcleo", "nucleo", "checkout", "pagamento"], min: 1 }
+          missing: "Diga exatamente o que é o núcleo protegido e o que fica de fora dele."
+          present: "Núcleo bem delimitado."
+        - id: message
+          name: "Mensagem da recusa"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["mensagem", "429", "fila de espera", "avisar", "orienta"], min: 1 }
+          missing: "Recusar exige mensagem que não pareça erro do cliente e que diga o que fazer."
+          present: "Mensagem definida."
+        - id: alignment
+          name: "Alinhamento com o negócio"
+          weight: 25
+          evidence:
+            - { type: keyword, field: plan, anyOf: ["marketing", "diretoria", "alinh", "acordo", "antes do evento"], min: 1 }
+          missing: "Recusar cliente na Black Friday é decisão de negócio: registre o alinhamento prévio."
+          present: "Alinhamento registrado."
+        - id: connections
+          name: "Conta de conexões"
+          weight: 20
+          evidence:
+            - { type: number, field: connectionsAtPeak, expected: "connectionsNeeded", tolerance: 0.5 }
+          missing: "Faça a conta de conexões do núcleo protegido."
+          present: "Conta feita."
+answerForm:
+  pathField: solutionPath
+  fields:
+    - id: bottleneck
+      label: "Primeiro gargalo do caminho do pedido"
+      type: SELECT
+      required: true
+      options:
+        - { value: orders-db-connections, label: "Conexões do orders-db" }
+        - { value: inventory-service, label: "Capacidade do inventory-service" }
+        - { value: acquirer, label: "Limite contratual do adquirente" }
+        - { value: checkout-cpu, label: "CPU dos pods de checkout" }
+        - { value: kafka-partitions, label: "Partições do Kafka" }
+    - id: projectedPeakPerSecond
+      label: "Pico projetado em pedidos por segundo"
+      type: NUMBER
+      required: true
+    - id: connectionsAtPeak
+      label: "Conexões simultâneas necessárias no pico"
+      type: NUMBER
+      required: true
+    - id: solutionPath
+      label: "Plano principal"
+      type: SELECT
+      required: true
+      options:
+        - { value: pooler-and-load-test, label: "Pooler, ajuste de pool e teste de carga" }
+        - { value: scale-and-queue, label: "Escalar e enfileirar o excedente" }
+        - { value: shed-and-protect, label: "Proteger o núcleo e recusar cedo" }
+    - id: plan
+      label: "Plano de capacidade"
+      type: MARKDOWN
+      required: true
+      help: "Projeção por elo, gargalo, provisionamento, degradação planejada, teste e custo."
+reference: |
+  ## Projeção por elo da cadeia
+  Pico projetado: {{expectedPeak|number}} pedidos por minuto, ou ~{{expectedPeakPerSecond}} por segundo.
+
+  | Elo | Hoje | Necessário no pico | Folga |
+  |---|---|---|---|
+  | `checkout-api` | 30 pods | ~{{expectedPeakPerSecond}} req/s, cabe em 60 pods | escala horizontal, mas puxa conexões |
+  | `orders-db` conexões | 750 em uso, limite 3.000 | ~{{connectionsNeeded|number}} sem pooler | **este é o gargalo** |
+  | `inventory-service` | 12 pods | reserva por SKU, com hot key no item em oferta | contenção na linha, não CPU |
+  | `payment-api` e adquirente | — | limite contratual por segundo | precisa de confirmação do parceiro |
+  | Kafka `orders.placed` | 36 partições | paralelismo suficiente | ok |
+
+  ## Gargalo
+  Conexões do `orders-db`, exatamente como no ano passado. Escalar `checkout-api` de 30 para 90 pods com pool de 25
+  levaria a 2.250 conexões só desse serviço, sem contar `order-service`, `payment-api` e o `pricing-batch`. O limite
+  de 3.000 é do banco, e não cresce escalando pods.
+
+  ## Plano
+  **Semanas 1 e 2 — tirar o gargalo.** PgBouncer em transaction mode entre os serviços e o `orders-db`, com pool por
+  pod caindo de 25 para 8. Revisar prepared statements (`prepareThreshold=0` no JDBC) e qualquer uso de advisory lock.
+  Custo: duas instâncias pequenas, muito abaixo do orçamento de R$ {{budgetThousandReais}} mil.
+
+  **Semana 2 — hot key do estoque.** O SKU em oferta concentra a reserva em uma linha. Contador com decremento
+  atômico e sharding do contador para os SKUs da campanha, definidos pelo time comercial com antecedência.
+
+  **Semana 3 — degradação escrita e testada.** Em ordem de desligamento, por gatilho:
+
+  | Gatilho | O que desliga | Efeito |
+  |---|---|---|
+  | p99 do checkout > 1,5s por 3 min | recomendação vira lista curada fixa | tira carga do `catalog-api` |
+  | conexões > 70% do limite | frete estimado vira faixa em vez de cálculo | tira carga do `shipping-api` |
+  | conexões > 85% | histórico de pedidos do perfil fica indisponível | protege a escrita |
+  | erro do checkout > 2% | fila de espera com posição e mensagem | preserva quem já está dentro |
+
+  Cada flag é testada em produção, fora do pico, pelo menos uma vez. Flag que nunca foi ligada não é plano.
+
+  **Semana 4 — teste de carga com alvo.** Ensaio com {{expectedPeakPerSecond}} pedidos por segundo sustentados por 30
+  minutos em ambiente espelho. Critério de aprovação: p99 do checkout abaixo de 1,2s, erro abaixo de 0,5%, conexões
+  abaixo de 70% do limite e nenhuma reserva de estoque perdida. Se reprovar, o plano volta para a semana 1.
+
+  **Véspera — congelamento.** Nenhum deploy nos três dias anteriores, exceto correção de incidente. Escala provisionada
+  com antecedência, não sob demanda: autoscaling reage tarde demais para um pico que sobe em 90 segundos.
+
+  ## Custo
+  Provisionamento extra por 5 dias, dentro do orçamento aprovado. O maior item não é computação: é a réplica adicional
+  do `orders-db` e o tráfego entre zonas de disponibilidade, que é o que estourou a conta no ano passado.
+
+  ## O que fica combinado com o negócio
+  Se ainda assim faltar capacidade, a ordem de sacrifício está na tabela acima e já foi aprovada. Ninguém decide isso
+  às 21h.
+scenario:
+  kind: capacity
+  params:
+    service: checkout-api
+    datastore: orders-db
+    growthPercentPerMonth: "8"
+    currentPeakRps: "{{expectedPeakPerSecond}}"
+    headroomMetric: active_connections
+    headroomLimit: "3000"
+    headroomNow: "1750"
+    storageNowGb: "9000"
+recommendation:
+  default: pooler-and-load-test
+  rules:
+    - { param: weeksToEvent, op: "<=", value: 4, path: shed-and-protect, reason: "com {{weeksToEvent}} semanas não há tempo para introduzir pooler, revisar prepared statements e ainda testar; proteger o núcleo e combinar a recusa antes é o plano que cabe no prazo" }
